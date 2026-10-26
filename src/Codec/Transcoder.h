@@ -119,6 +119,25 @@ public:
      */
     bool inputFrame(const FFmpegFrame::Ptr &frame, bool async);
 
+    /**
+     * 编码一帧静音（全零 PCM），供转码轨在源端断流时兜底
+     *
+     * 静音负载必须由编码器真实产出，不能硬编码字节数组：Opus 的 TOC 字节由
+     * 带宽/立体声/帧长共同决定，写死的负载与真实编码器配置不一致，解码端会
+     * 报错或丢掉这一帧。时间戳留空(AV_NOPTS_VALUE)，由编码器自维护的毫秒
+     * 时钟从上一帧继续推进，保证与前面已输出的帧严格连续、单调。
+     *
+     * Encode one frame of digital silence (all-zero PCM) so a transcoded track can
+     * keep producing frames after the upstream stalls. The payload must come from
+     * the real encoder: the Opus TOC byte depends on bandwidth/stereo/frame size,
+     * so a hard-coded blob would not match and decoders would reject the frame.
+     * The timestamp is left unset (AV_NOPTS_VALUE) so the encoder's own millisecond
+     * clock continues from the previous frame and stays strictly monotonic.
+     *
+     * @return false 表示编码器未就绪或不是音频编码器
+     */
+    bool inputSilence();
+
     /** 冲刷编码器内部缓冲，流结束时必须调用，否则尾部若干帧丢失 */
     void flush();
 
@@ -167,6 +186,7 @@ public:
 private:
     void onEncode(AVPacket *packet);
     bool encodeFrame(AVFrame *frame);
+    bool encodeAudio_l(AVFrame *converted);
     bool inputFrame_l(const FFmpegFrame::Ptr &frame);
     bool drainEncoder();
 
@@ -206,6 +226,23 @@ private:
     int64_t _last_src_ms = AV_NOPTS_VALUE;
     /** 最近一次已输出帧的时间戳，保证严格单调 */
     int64_t _emitted_ms = -1;
+    /**
+     * 本次编码的是静音兜底帧：强制走 _emitted_ms 单调时钟，忽略源时间轴。
+     *
+     * 静音帧的"源时间轴"是我们自己虚拟推进的，与真实源 dts 的步长不一致
+     * （AAC 一帧 23.2ms，Opus 一帧 20ms），混用会让 dts 偶发倒退，
+     * 实测观众端报 "Non-monotonous DTS"。静音帧只保证"紧跟上一帧、严格递增"，
+     * 源端恢复后真实帧再靠 _emitted_ms 守卫接回去，不会出现时间回退。
+     *
+     * True while encoding a silence padding frame: forces the monotonic
+     * _emitted_ms clock and ignores the source timeline. The virtual source clock
+     * we advance for silence does not match real source steps (AAC 23.2ms vs Opus
+     * 20ms per frame), and mixing them made dts occasionally go backwards
+     * (observers reported "Non-monotonous DTS"). Silence frames only guarantee
+     * "follow the previous frame, strictly increasing"; real frames rejoin later
+     * through the _emitted_ms guard.
+     */
+    bool _silence_encoding = false;
     bool _flush_done = false;
     int64_t _frame_index = 0;
 };

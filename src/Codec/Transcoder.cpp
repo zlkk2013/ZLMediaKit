@@ -487,6 +487,123 @@ bool FFmpegEncoder::inputFrame(const FFmpegFrame::Ptr &frame, bool async) {
     return inputFrame_l(frame);
 }
 
+/**
+ * 把一帧已符合编码器格式的 PCM 送进编码器。
+ *
+ * 可变帧长的编码器直接编码；固定帧长的走 FIFO 攒够 frame_size 再编。
+ * 真实帧与静音帧共用这条路径，保证两者在 PCM 层面完全等价：
+ * 若静音绕过 FIFO，FIFO 里残留的采样会与静音帧错位，Opus 输出虽然能解，
+ * 但时间轴会出现几十毫秒的空洞。
+ *
+ * Feed one PCM frame already in the encoder's format. Variable-frame encoders
+ * encode directly; fixed-frame encoders buffer through the FIFO. Real frames and
+ * silence frames share this path so they are PCM-equivalent: bypassing the FIFO
+ * for silence would misalign its leftover samples and punch a gap in the timeline.
+ */
+bool FFmpegEncoder::encodeAudio_l(AVFrame *converted) {
+    if (_variable_frame_size) {
+        return encodeFrame(converted);
+    }
+
+    if (!_fifo) {
+        _fifo.reset(new TranscodeAudioFifo());
+    }
+    if (!_fifo->write(converted)) {
+        return false;
+    }
+
+    auto frame_size = _context->frame_size > 0 ? _context->frame_size : 1024;
+    bool ret = true;
+    while (true) {
+        auto out = av_frame_alloc();
+        if (!out) {
+            return false;
+        }
+        out->format = _context->sample_fmt;
+        out->sample_rate = _context->sample_rate;
+        out->nb_samples = frame_size;
+        av_channel_layout_copy(&out->ch_layout, &_context->ch_layout);
+        auto alloc_ret = av_frame_get_buffer(out, 0);
+        if (alloc_ret < 0) {
+            WarnL << "av_frame_get_buffer failed:" << ffmpeg_err_str(alloc_ret);
+            av_frame_free(&out);
+            return false;
+        }
+        if (!_fifo->read(out, frame_size)) {
+            av_frame_free(&out);
+            break;
+        }
+        // 送进编码器的 pts 是采样计数（time_base = 1/sample_rate），
+        // 毫秒换算统一放在 onEncode 出口做，避免单位混用
+        // The pts fed to the encoder counts samples (time_base = 1/sample_rate);
+        // conversion to ms happens once at the onEncode exit
+        out->pts = _frame_index;
+        _frame_index += frame_size;
+        if (!encodeFrame(out)) {
+            ret = false;
+        }
+        av_frame_free(&out);
+    }
+    return ret;
+}
+
+bool FFmpegEncoder::inputSilence() {
+    if (!_context || _context->codec_type != AVMEDIA_TYPE_AUDIO) {
+        return false;
+    }
+    _flush_done = false;
+
+    // 一帧的采样数与时长由编码器自身决定（libopus: 960 @48k = 20ms；
+    // AAC: 1024 @44.1k ≈ 23.2ms），不能用固定值，否则时间轴会漂。
+    // The frame's sample count and duration come from the encoder itself
+    // (libopus: 960 @48k = 20ms; AAC: 1024 @44.1k ≈ 23.2ms).
+    int rate = _context->sample_rate > 0 ? _context->sample_rate : 48000;
+    int frame_size = _context->frame_size > 0 ? _context->frame_size : (rate / 50);
+
+    // 虚拟推进源时钟：静音帧在时间轴上紧跟上一帧，不产生空洞也不压缩。
+    // 注意这里推进的是"若源端恢复后真实帧应落在哪里"的参考值，实际输出时间戳
+    // 由 onEncode 的单调时钟给出（见 _silence_encoding）。
+    // Advance the virtual source clock: silence follows the previous frame on the
+    // timeline with no hole and no compression. This only tracks where a resumed
+    // real frame "should" land; the actual output timestamp comes from the
+    // monotonic clock in onEncode (see _silence_encoding).
+    if (_last_src_ms != AV_NOPTS_VALUE) {
+        _last_src_ms += (int64_t) (frame_size * 1000LL / rate);
+    } else {
+        _last_src_ms = 0;
+    }
+
+    auto frame = av_frame_alloc();
+    if (!frame) {
+        return false;
+    }
+    frame->format = _context->sample_fmt;
+    frame->sample_rate = rate;
+    frame->nb_samples = frame_size;
+    av_channel_layout_copy(&frame->ch_layout, &_context->ch_layout);
+    auto ret = av_frame_get_buffer(frame, 0);
+    if (ret < 0) {
+        WarnL << "av_frame_get_buffer failed for silence:" << ffmpeg_err_str(ret);
+        av_frame_free(&frame);
+        return false;
+    }
+    // av_frame_get_buffer 不保证清零，必须显式填静音，否则"静音"里会带随机噪声
+    // av_frame_get_buffer does not zero the buffer; fill explicit silence or the
+    // "silence" carries random noise
+    av_samples_set_silence(frame->data, 0, frame_size, frame->ch_layout.nb_channels,
+                           (AVSampleFormat) frame->format);
+
+    // 与真实帧走完全相同的编码路径（含 FIFO 对齐）；
+    // 期间置 _silence_encoding，让 onEncode 走单调时钟而不是源时间轴
+    // Same encode path as real frames (FIFO included); _silence_encoding makes
+    // onEncode use the monotonic clock instead of the source timeline
+    _silence_encoding = true;
+    auto ok = encodeAudio_l(frame);
+    _silence_encoding = false;
+    av_frame_free(&frame);
+    return ok;
+}
+
 bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     TimeTicker2(30, TraceL);
 
@@ -559,51 +676,15 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
         return encodeFrame(converted->get());
     }
 
-    // 固定帧长：攒够 frame_size 再编码
-    if (!_fifo) {
-        _fifo.reset(new TranscodeAudioFifo());
-    }
+    // 固定帧长：攒够 frame_size 再编码；与静音兜底共用 encodeAudio_l，
+    // 保证两条路径的 FIFO/pts 记账完全一致
+    // Fixed frame size: accumulate frame_size samples first. Shares encodeAudio_l
+    // with the silence fallback so both paths agree on FIFO/pts bookkeeping
     auto converted = formatFrame(frame);
     if (!converted) {
         return false;
     }
-    if (!_fifo->write(converted->get())) {
-        return false;
-    }
-
-    auto frame_size = _context->frame_size > 0 ? _context->frame_size : 1024;
-    bool ret = true;
-    while (true) {
-        auto out = av_frame_alloc();
-        if (!out) {
-            return false;
-        }
-        out->format = _context->sample_fmt;
-        out->sample_rate = _context->sample_rate;
-        out->nb_samples = frame_size;
-        av_channel_layout_copy(&out->ch_layout, &_context->ch_layout);
-        auto alloc_ret = av_frame_get_buffer(out, 0);
-        if (alloc_ret < 0) {
-            WarnL << "av_frame_get_buffer failed:" << ffmpeg_err_str(alloc_ret);
-            av_frame_free(&out);
-            return false;
-        }
-        if (!_fifo->read(out, frame_size)) {
-            av_frame_free(&out);
-            break;
-        }
-        // 送进编码器的 pts 是采样计数（time_base = 1/sample_rate），
-        // 毫秒换算统一放在 onEncode 出口做，避免单位混用
-        // The pts fed to the encoder counts samples (time_base = 1/sample_rate);
-        // conversion to ms happens once at the onEncode exit
-        out->pts = _frame_index;
-        _frame_index += frame_size;
-        if (!encodeFrame(out)) {
-            ret = false;
-        }
-        av_frame_free(&out);
-    }
-    return ret;
+    return encodeAudio_l(converted->get());
 }
 
 bool FFmpegEncoder::warmup(const Track::Ptr &target, int width, int height) {
@@ -791,19 +872,17 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     int64_t next_ms;
     if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
         // 视频时间轴完全由 inputFrame_l 按帧率匀速决定（见那里的说明），
-        // 这里直接把那个 pts 换算成毫秒透传，不再另起时钟。
+        // 这里直接用包序号 × 帧间隔，不再另起时钟。
         // The video timeline is fully decided by inputFrame_l advancing at the frame
-        // rate (see the note there); simply convert that pts to milliseconds here
+        // rate (see the note there); use packet index times the frame interval here
         // instead of running a second clock.
         // 不用 packet->pts 也不用编码器 time_base：libx265 会把时基重新缩放
         // （实测输入 6600 ticks/1ms 时基，输出算出 5280ms，恰好 0.8 倍），
         // 换算结果与源帧率不符，下游按源流时间判定就会大量丢帧。
-        // 转码是恒帧率输出，直接用包序号 × 帧间隔最稳。
         // Neither packet->pts nor the encoder time_base can be trusted: libx265 rescales
         // the timebase (an input of 6600 ticks on a 1ms base measured out as 5280ms,
         // exactly 0.8x), so the converted timeline disagrees with the source frame rate
-        // and downstream drops most frames as stale. Transcoding is constant-frame-rate,
-        // so packet index times the frame interval is the reliable timeline.
+        // and downstream drops most frames as stale.
         int64_t vstep = (_frame_interval_ms > 0)
                         ? _frame_interval_ms
                         : (int64_t) (1000.0 / (_video_fps > 0 ? _video_fps : 25.0));
@@ -812,11 +891,13 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
         }
         next_ms = _video_pkt_index * vstep;
         _video_pkt_index++;
-    } else if (_last_src_ms != AV_NOPTS_VALUE && _src_base_ms > 0) {
+    } else if (!_silence_encoding && _last_src_ms != AV_NOPTS_VALUE && _src_base_ms > 0) {
         // 音频跟随源流时间轴
         // Audio follows the source timeline
         next_ms = _last_src_ms - _src_base_ms;
     } else {
+        // 静音兜底帧：只跟随自家的单调时钟（见 _silence_encoding 注释）
+        // Silence padding frames follow our own monotonic clock only
         next_ms = _next_pts_ms;
     }
     // 无论如何都保持严格单调，防止解码器输出乱序导致下游报 Non-monotonic DTS
