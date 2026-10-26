@@ -126,6 +126,14 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
                                             audio->getAudioChannel(), audio->getAudioSampleBit());
     } else {
         target = Factory::getTrackByCodecId(_option.video_codec);
+        if (target) {
+            // H265Track 无参构造时宽高为 0，但它会在 inputFrame 里解析 SPS 自动补齐。
+            // 前提是传进去的帧带正确的 prefixSize（见 FFmpegEncoder::setNaluPrefixSize）。
+            // H265Track starts with width/height 0 and fills them by parsing SPS in
+            // inputFrame, provided the frames carry the right prefixSize (see
+            // FFmpegEncoder::setNaluPrefixSize).
+            target->setIndex(track->getIndex());
+        }
     }
     if (!target) {
         WarnL << "cannot create target track, codec=" << getCodecName(
@@ -143,7 +151,48 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
 
     try {
         ctx.decoder = std::make_shared<FFmpegDecoder>(track);
-        ctx.encoder = std::make_shared<FFmpegEncoder>(target);
+        // 帧率必须在构造 encoder 之前传给目标轨：FFmpegEncoder 的构造函数里就会
+        // avcodec_open2，之后再 setVideoFps 已经无效。
+        // The frame rate must be handed to the target track BEFORE constructing the
+        // encoder: FFmpegEncoder opens the codec inside its constructor, so setting
+        // the frame rate afterwards has no effect.
+        float src_fps = 0;
+        if (!is_audio) {
+            // 帧率和宽高都从源轨读：H265Track 是空构造（宽高为 0，_fps 无 setter），
+            // 而编码器必须在 open2 时就拿到尺寸和帧率。
+            // Read frame rate and dimensions from the source track: H265Track is
+            // default-constructed (width/height 0, no _fps setter) while the encoder
+            // needs both at open2 time.
+            auto video = static_pointer_cast<VideoTrack>(track);
+            src_fps = video->getVideoFps();
+            InfoL << "video encoder params: src_fps=" << src_fps
+                  << ", src_size=" << video->getVideoWidth() << "x" << video->getVideoHeight()
+                  << ", bitrate=" << (int) target->getBitRate();
+        }
+        // thread_num 传 0：不开异步线程。onDecoded 已经是同步调用（解码器线程内），
+        // 再叠加编码线程会让 warmup 与真实帧竞争同一个编码器实例，
+        // 表现为只有首帧输出、后续帧全部丢失。视频解码本身就是逐帧同步的，
+        // 编码留在同一线程更可控。
+        // thread_num 0 disables the async encoder thread: onDecoded is already called
+        // synchronously on the decoder thread, and layering another thread on top makes
+        // warmup race the real frames on the same encoder instance, which showed up as
+        // only the first frame being emitted and everything after it lost.
+        ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
+                                                      is_audio ? nullptr : track);
+        if (!is_audio) {
+            // 关键：转码轨必须在 addTrack 之前 ready。
+            // RtspMuxer/MP4Muxer 的 addTrack 见到 ready()==false 的轨会直接丢弃
+            // （日志 "H265 unready!"），而那时代码还没喂过任何帧，SPS 还没解析到。
+            // Critical: the transcoded track must be ready before addTrack.
+            // RtspMuxer/MP4Muxer discard tracks whose ready() is false
+            // ("H265 unready!"), and at this point no frame has been fed yet,
+            // so the SPS has not been parsed.
+            auto video = static_pointer_cast<VideoTrack>(track);
+            bool warmed = ctx.encoder->warmup(target, video->getVideoWidth(), video->getVideoHeight());
+            if (!warmed) {
+                WarnL << "warmup failed, target track not ready, video will be dropped by muxers";
+            }
+        }
     } catch (std::exception &ex) {
         WarnL << "transcode setup failed for " << getCodecName(src_codec) << " -> "
               << getCodecName(is_audio ? _option.audio_codec : _option.video_codec)
