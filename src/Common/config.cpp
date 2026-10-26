@@ -430,6 +430,16 @@ const string kPassPhrase = "passPhrase";
 const string kCustomHeader = "custom_header";
 } // namespace Client
 
+#if defined(ENABLE_FFMPEG)
+#define TRANSCODE_FIELD "transcode."
+const string kTranscodeEnable = TRANSCODE_FIELD "enable";
+const string kTranscodeAudioCodec = TRANSCODE_FIELD "audio_codec";
+const string kTranscodeVideoCodec = TRANSCODE_FIELD "video_codec";
+const string kTranscodeBitrate = TRANSCODE_FIELD "bitrate";
+const string kTranscodeSampleRate = TRANSCODE_FIELD "sample_rate";
+const string kTranscodeOnDemand = TRANSCODE_FIELD "on_demand";
+#endif//ENABLE_FFMPEG
+
 } // namespace mediakit
 
 #ifdef ENABLE_MEM_DEBUG

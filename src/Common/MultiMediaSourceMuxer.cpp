@@ -11,6 +11,9 @@
 #include <math.h>
 #include "Common/config.h"
 #include "MultiMediaSourceMuxer.h"
+#if defined(ENABLE_FFMPEG)
+#include "Common/TranscodeSink.h"
+#endif//ENABLE_FFMPEG
 #include "Thread/WorkThreadPool.h"
 
 using namespace std;
@@ -702,7 +705,52 @@ std::shared_ptr<MultiMediaSourceMuxer> MultiMediaSourceMuxer::getMuxer(MediaSour
     return const_cast<MultiMediaSourceMuxer*>(this)->shared_from_this();
 }
 
-bool MultiMediaSourceMuxer::onTrackReady(const Track::Ptr &track) {
+bool MultiMediaSourceMuxer::onTrackReady(const Track::Ptr &track_ref) {
+    // 取一份可改写的副本：转码需要换轨
+    // Take a mutable copy: transcoding needs to swap the track
+    Track::Ptr track = track_ref;
+#if defined(ENABLE_FFMPEG)
+    // 懒创建：首条 track 到达时按配置决定是否启用转码
+    // Lazy init: decide on transcoding when the first track arrives
+    if (!_transcode && TranscodeOption::loadFromIni().enable) {
+        auto option = TranscodeOption::loadFromIni();
+        std::weak_ptr<MultiMediaSourceMuxer> weak_self = shared_from_this();
+        _transcode = std::make_shared<TranscodeSink>(option, [weak_self]() -> size_t {
+            if (auto strong_self = weak_self.lock()) {
+                return (size_t) strong_self->totalReaderCount();
+            }
+            return 0;
+        });
+        _transcode->setOnOutput([weak_self](const Frame::Ptr &frame) {
+            if (auto strong_self = weak_self.lock()) {
+                // 转码出来的帧走完整下游：时间戳修正 + 平滑 + 协议分发 + GOP 缓存
+                // Transcoded frames take the full downstream path
+                auto stamped = frame;
+                if (strong_self->_option.modify_stamp != ProtocolOption::kModifyStampOff) {
+                    stamped = std::make_shared<FrameStamp>(
+                        frame, strong_self->_stamps[frame->getIndex()], strong_self->_option.modify_stamp);
+                }
+                if (strong_self->_paced_sender) {
+                    strong_self->_paced_sender->inputFrame(stamped);
+                } else {
+                    strong_self->onTrackFrame_l(stamped);
+                }
+            }
+        });
+        InfoL << "transcode enabled for stream: " << shortUrl()
+              << ", audio " << ::mediakit::getCodecName(option.audio_codec)
+              << ", video " << ::mediakit::getCodecName(option.video_codec)
+              << ", on_demand=" << option.on_demand;
+    }
+    // 转码：换轨不换流。_transcode 为空时 track 原样不变
+    // Transcode: swap the track, keep the stream. Unchanged when _transcode is null
+    if (_transcode) {
+        auto transcode_track = _transcode->addTrack(track);
+        if (transcode_track) {
+            track = transcode_track;
+        }
+    }
+#endif//ENABLE_FFMPEG
     auto &stamp = _stamps[track->getIndex()];
     if (_dur_sec > 0.01) {
         // 点播  [AUTO-TRANSLATED:f0b0f74a]
@@ -794,6 +842,22 @@ void MultiMediaSourceMuxer::onAllTrackReady() {
     InfoL << "stream: " << shortUrl() << " , codec info: " << getTrackInfoStr(this);
 }
 
+#if defined(ENABLE_FFMPEG)
+void MultiMediaSourceMuxer::setTranscodeSink(const std::shared_ptr<TranscodeSink> &sink) {
+    _transcode = sink;
+    if (_transcode) {
+        // 转码结果回灌：走 onTrackFrame_l 而非 onTrackFrame，避免再次进入转码节点造成死循环
+        // Transcode output re-enters via onTrackFrame_l, not onTrackFrame, to avoid re-entering here
+        std::weak_ptr<MultiMediaSourceMuxer> weak_self = shared_from_this();
+        // 回灌逻辑在 setTranscodeSink 中统一设置，这里不重复
+        // The re-entry callback is installed in setTranscodeSink, not duplicated here
+        InfoL << "transcode sink attached to stream: " << shortUrl();
+    } else {
+        InfoL << "transcode sink detached from stream: " << shortUrl();
+    }
+}
+#endif//ENABLE_FFMPEG
+
 void MultiMediaSourceMuxer::createGopCacheIfNeed() {
     if (_ring) {
         return;
@@ -868,6 +932,17 @@ bool MultiMediaSourceMuxer::onTrackFrame(const Frame::Ptr &frame_in) {
     if (_on_frame) {
         _on_frame(frame_in);
     }
+#if defined(ENABLE_FFMPEG)
+    if (_transcode && _transcode->isTrackTranscoding(frame_in->getIndex())) {
+        // 只有正在转码的轨才被本节点接管；未转码的轨继续走下面的原路径，
+        // 否则会丢掉 modify_stamp、paced_sender 和 GOP 缓存，观众只剩首帧。
+        // Only tracks being transcoded are taken over; others continue down the
+        // original path, otherwise modify_stamp, paced_sender and the GOP cache
+        // are all lost and viewers get nothing but the first frame.
+        _transcode->inputFrame(frame_in);
+        return true;
+    }
+#endif//ENABLE_FFMPEG
     auto frame = frame_in;
     if (_option.modify_stamp != ProtocolOption::kModifyStampOff) {
         // 时间戳不采用原始的绝对时间戳  [AUTO-TRANSLATED:8beb3bf7]

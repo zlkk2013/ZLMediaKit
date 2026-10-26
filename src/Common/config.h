@@ -660,6 +660,16 @@ extern const std::string kCustomHeader;
 // 指定采用什么播放协议
 extern const std::string kSchema;
 } // namespace Client
+#if defined(ENABLE_FFMPEG)
+// 转码配置（[transcode] 段）
+// Transcode config ([transcode] section)
+extern const std::string kTranscodeEnable;
+extern const std::string kTranscodeAudioCodec;
+extern const std::string kTranscodeVideoCodec;
+extern const std::string kTranscodeBitrate;
+extern const std::string kTranscodeSampleRate;
+extern const std::string kTranscodeOnDemand;
+#endif//ENABLE_FFMPEG
 } // namespace mediakit
 
 #endif /* COMMON_CONFIG_H */

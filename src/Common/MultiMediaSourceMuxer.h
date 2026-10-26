@@ -43,6 +43,16 @@ public:
     using RingType = toolkit::RingBuffer<Frame::Ptr>;
     using onCreateMuxer = std::function<MediaSinkInterface::Ptr()>;
 
+#if defined(ENABLE_FFMPEG)
+    /**
+     * 启用转码。传入 nullptr 关闭。
+     * 不调用此方法时行为与上游完全一致。
+     * Enable transcoding. Pass nullptr to disable.
+     * Behavior is identical to upstream when this is never called.
+     */
+    void setTranscodeSink(const std::shared_ptr<class TranscodeSink> &sink);
+#endif//ENABLE_FFMPEG
+
     class Listener {
     public:
         virtual ~Listener() = default;
@@ -259,6 +269,11 @@ private:
     toolkit::EventPoller::Ptr _poller;
     RingType::Ptr _ring;
     MediaSinkInterface::Ptr _delegate;
+#if defined(ENABLE_FFMPEG)
+    // 转码节点：为 nullptr 时行为与上游完全一致
+    // Transcode node; when nullptr, behavior is identical to upstream
+    std::shared_ptr<class TranscodeSink> _transcode;
+#endif//ENABLE_FFMPEG
     // 对象个数统计  [AUTO-TRANSLATED:3b43e8c2]
     // Object count statistics
     toolkit::ObjectStatistic<MultiMediaSourceMuxer> _statistic;

@@ -49,3 +49,5 @@
 /ios/
 /cmake-build-*
 /3rdpart/ZLToolKit/cmake-build-mq/
+# ffmpeg 转码构建目录（本地）
+/build-ffmpeg/
