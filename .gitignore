@@ -8,3 +8,5 @@ config.g711.ini
 config.g8.ini
 config.e0.ini
 release/
+config.joint.ini
+config.joint.base.ini
