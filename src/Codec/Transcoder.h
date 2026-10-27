@@ -32,6 +32,23 @@ extern "C" {
 namespace mediakit {
 
 /**
+ * 视频输出目标参数
+ *
+ * 全部为 0 时表示「跟随源」，行为与此前硬编码路径完全一致。
+ * All-zero means "follow the source", identical to the previous hardcoded path.
+ */
+struct VideoTargetParams {
+    /** 输出宽；0=跟随源。与 height 必须同时设置或同时为 0 */
+    int width = 0;
+    /** 输出高；0=跟随源 */
+    int height = 0;
+    /** 输出帧率；0=跟随源。只支持降帧（抽帧），不做插帧 */
+    float fps = 0;
+    /** 输出码率(bps)；0=按分辨率/帧率自动估算 */
+    int bitrate = 0;
+};
+
+/**
  * 音频重采样 FIFO
  *
  * AAC 编码器要求固定 1024 采样点一帧，而解码出来的 PCM 长度不齐，
@@ -107,10 +124,13 @@ public:
      *                  (e.g. H265Track) is default-constructed with width/height 0
      *                  and only fills them when inputFrame parses the SPS, but the
      *                  encoder needs the size at open2 time, so take it from the source.
+     * @param video_params 输出分辨率/帧率/码率；全 0 表示跟随源。
+     *                     Output size/fps/bitrate; all-zero follows the source.
      * @throw std::runtime_error 找不到编码器或打开失败时抛出
      */
     FFmpegEncoder(const Track::Ptr &track, int thread_num = 2, float src_fps = 0,
-                  const Track::Ptr &src_video = nullptr);
+                  const Track::Ptr &src_video = nullptr,
+                  const VideoTargetParams &video_params = VideoTargetParams());
     ~FFmpegEncoder() override;
 
     /**
@@ -142,21 +162,21 @@ public:
     void flush();
 
     /**
-     * 预热：编码一帧纯色画面并把得到的 VPS/SPS/PPS 喂给目标轨，使其 ready() 变 true。
+     * 预热：编码一帧纯色画面并把得到的 config NAL（H265 的 VPS/SPS/PPS、
+     * H264 的 SPS/PPS）喂给目标轨，使其 ready() 变 true。
      * 必要性：RtspMuxer/MP4Muxer 的 addTrack 直接丢弃 ready()==false 的轨
-     * （日志 "H265 unready!"），而 H265Track 只有在 inputFrame 里解析到 SPS 后才 ready。
+     * （日志 "H265 unready!"），而 Track 只有在 inputFrame 里解析到 config NAL 后才 ready。
      * 转码轨必须在 addTrack 之前就 ready，否则整条视频轨被丢掉、观众端没有画面。
-     * Warm up: encode one solid-color frame and feed the resulting VPS/SPS/PPS into the
-     * target track so ready() becomes true. RtspMuxer/MP4Muxer drop tracks whose
-     * ready() is false ("H265 unready!") and H265Track only becomes ready after
-     * parsing an SPS in inputFrame. A transcoded track must be ready before
-     * addTrack, otherwise the whole video track is discarded and viewers see nothing.
+     * Warm up: encode one solid-color frame and feed the resulting config NALs
+     * (VPS/SPS/PPS for H265, SPS/PPS for H264 — H264 has no VPS) into the target
+     * track so ready() becomes true. RtspMuxer/MP4Muxer drop tracks whose ready()
+     * is false ("H265 unready!") and a Track only becomes ready after parsing a
+     * config NAL in inputFrame. A transcoded track must be ready before addTrack,
+     * otherwise the whole video track is discarded and viewers see nothing.
      * @param target 目标轨（会调用其 inputFrame 喂 config 帧）
-     * @param width 画面宽
-     * @param height 画面高
      * @return 目标轨是否已 ready
      */
-    bool warmup(const Track::Ptr &target, int width, int height);
+    bool warmup(const Track::Ptr &target);
 
     void setOnEncode(onEnc cb) { _cb = std::move(cb); }
 
@@ -193,6 +213,17 @@ private:
     bool openVideoCodec(int width, int height, int bitrate, const AVCodec *codec);
     bool openAudioCodec(int samplerate, int channel, int bitrate, const AVCodec *codec);
 
+    /**
+     * 估算自动码率（bitrate 传 0 时使用）
+     * bpp 按编码器效率取值：H265 比 H264 省约 30% 码率
+     * Estimate the automatic bitrate used when bitrate == 0. The bits-per-pixel
+     * factor is per-codec: H265 needs roughly 30% less than H264.
+     */
+    int estimateBitrate(int width, int height, int fps) const;
+
+    /** 按目标帧率决定这一源帧是否需要编码（降帧），返回 false 表示丢弃 */
+    bool shouldKeepFrame();
+
     /** 把 FFmpegFrame 转成编码器要求的像素格式/采样格式 */
     FFmpegFrame::Ptr formatFrame(const FFmpegFrame::Ptr &frame);
 
@@ -203,6 +234,10 @@ private:
     std::shared_ptr<AVCodecContext> _context;
 
     std::unique_ptr<FFmpegSws> _sws;
+    /** sws 当前的输出目标（尺寸/格式）；与编码器不一致时必须重建 */
+    int _sws_width = 0;
+    int _sws_height = 0;
+    AVPixelFormat _sws_format = AV_PIX_FMT_NONE;
     std::unique_ptr<FFmpegSwr> _swr;
     std::unique_ptr<TranscodeAudioFifo> _fifo;
 
@@ -218,6 +253,16 @@ private:
     size_t _nalu_prefix_size = 0;
     /** 视频帧率，0 表示未设置（回退到编码器默认） */
     float _video_fps = 0;
+    /** 源轨帧率（用于降帧抽帧判断），0 表示未知 */
+    float _src_fps = 0;
+    /** 输出目标参数（分辨率/帧率/码率），全 0 表示跟随源 */
+    VideoTargetParams _video_params;
+    /** 输出的宽高（缩放目标）；源与目标相同时等于源宽高 */
+    int _out_width = 0;
+    int _out_height = 0;
+    /** 降帧抽帧用的累计计数（按源帧序号 × 目标/源帧率比取整判断） */
+    int64_t _drop_index = 0;
+    int64_t _keep_index = 0;
     int64_t _video_frame_index = 0;
     int64_t _video_pkt_index = 0;
     /** 首个源帧时间戳（毫秒），用于把输出对齐到源时间轴 */

@@ -37,6 +37,32 @@ TranscodeOption TranscodeOption::loadFromIni() {
     option.on_demand = ini[kTranscodeOnDemand].as<bool>();
     option.enable_silence = ini[kTranscodeEnableSilence].as<bool>();
     option.silence_timeout_ms = ini[kTranscodeSilenceTimeoutMS].as<int>();
+    // 视频参数：全部 0 表示跟随源，与之前的行为一致
+    // Video params: all zero means follow the source, matching prior behavior
+    option.video_width = ini[kTranscodeVideoWidth].as<int>();
+    option.video_height = ini[kTranscodeVideoHeight].as<int>();
+    option.video_fps = (float) ini[kTranscodeVideoFps].as<double>();
+    option.video_bitrate = ini[kTranscodeVideoBitrate].as<int>();
+    if (option.video_width < 0) {
+        option.video_width = 0;
+    }
+    if (option.video_height < 0) {
+        option.video_height = 0;
+    }
+    if (option.video_fps < 0) {
+        option.video_fps = 0;
+    }
+    if (option.video_bitrate < 0) {
+        option.video_bitrate = 0;
+    }
+    // 只配了一半宽高会导致极端长宽比，按「未配置」处理并告警
+    // A half-configured size would give an extreme aspect ratio; treat as unset
+    if ((option.video_width > 0) != (option.video_height > 0)) {
+        WarnL << "transcode: video_width/video_height must be set together, ignoring ("
+              << option.video_width << "x" << option.video_height << ")";
+        option.video_width = 0;
+        option.video_height = 0;
+    }
     if (option.silence_timeout_ms <= 0) {
         option.silence_timeout_ms = 200;
     }
@@ -133,11 +159,11 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
     } else {
         target = Factory::getTrackByCodecId(_option.video_codec);
         if (target) {
-            // H265Track 无参构造时宽高为 0，但它会在 inputFrame 里解析 SPS 自动补齐。
+            // H265Track/H264Track 无参构造时宽高为 0，但会在 inputFrame 里解析 SPS 自动补齐。
             // 前提是传进去的帧带正确的 prefixSize（见 FFmpegEncoder::setNaluPrefixSize）。
-            // H265Track starts with width/height 0 and fills them by parsing SPS in
-            // inputFrame, provided the frames carry the right prefixSize (see
-            // FFmpegEncoder::setNaluPrefixSize).
+            // H265Track/H264Track start with width/height 0 and fill them by parsing
+            // SPS in inputFrame, provided the frames carry the right prefixSize
+            // (see FFmpegEncoder::setNaluPrefixSize).
             target->setIndex(track->getIndex());
         }
     }
@@ -151,7 +177,11 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
     // The target track must inherit the source index: downstream muxers dispatch
     // by frame->getIndex(), a fresh track defaults to 0 and collides with video
     target->setIndex(track->getIndex());
-    if (_option.bitrate > 0) {
+    // 目标轨码率：视频优先用 video_bitrate，音频用通用 bitrate
+    // Target track bitrate: video prefers video_bitrate, audio uses the shared one
+    if (!is_audio && _option.video_bitrate > 0) {
+        target->setBitRate(_option.video_bitrate);
+    } else if (_option.bitrate > 0) {
         target->setBitRate(_option.bitrate);
     }
 
@@ -173,7 +203,10 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
             src_fps = video->getVideoFps();
             InfoL << "video encoder params: src_fps=" << src_fps
                   << ", src_size=" << video->getVideoWidth() << "x" << video->getVideoHeight()
-                  << ", bitrate=" << (int) target->getBitRate();
+                  << ", target_size=" << (_option.video_width > 0 ? _option.video_width : video->getVideoWidth())
+                  << "x" << (_option.video_height > 0 ? _option.video_height : video->getVideoHeight())
+                  << ", target_fps=" << (_option.video_fps > 0 ? _option.video_fps : src_fps)
+                  << ", bitrate=" << _option.video_bitrate;
         }
         // thread_num 传 0：不开异步线程。onDecoded 已经是同步调用（解码器线程内），
         // 再叠加编码线程会让 warmup 与真实帧竞争同一个编码器实例，
@@ -183,8 +216,18 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         // synchronously on the decoder thread, and layering another thread on top makes
         // warmup race the real frames on the same encoder instance, which showed up as
         // only the first frame being emitted and everything after it lost.
+        VideoTargetParams video_params;
+        video_params.width = _option.video_width;
+        video_params.height = _option.video_height;
+        video_params.fps = _option.video_fps;
+        // video_bitrate 优先于通用的 bitrate：同一个进程里音频想保持 64k、
+        // 视频想给 1M 是常见需求，共用一个字段做不到。
+        // video_bitrate wins over the shared bitrate field: keeping audio at 64k while
+        // giving video 1M is a normal requirement and one shared field cannot express it.
+        video_params.bitrate = _option.video_bitrate > 0 ? _option.video_bitrate : _option.bitrate;
         ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
-                                                      is_audio ? nullptr : track);
+                                                      is_audio ? nullptr : track,
+                                                      is_audio ? VideoTargetParams() : video_params);
         if (!is_audio) {
             // 关键：转码轨必须在 addTrack 之前 ready。
             // RtspMuxer/MP4Muxer 的 addTrack 见到 ready()==false 的轨会直接丢弃
@@ -193,11 +236,18 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
             // RtspMuxer/MP4Muxer discard tracks whose ready() is false
             // ("H265 unready!"), and at this point no frame has been fed yet,
             // so the SPS has not been parsed.
-            auto video = static_pointer_cast<VideoTrack>(track);
-            bool warmed = ctx.encoder->warmup(target, video->getVideoWidth(), video->getVideoHeight());
+            bool warmed = ctx.encoder->warmup(target);
             if (!warmed) {
                 WarnL << "warmup failed, target track not ready, video will be dropped by muxers";
             }
+            // 目标轨的宽高在 warmup 喂入 config NAL 后由 SPS 解析得到，
+            // 这就是观众端能看到的尺寸，必须与配置核对。
+            // The target track's size comes from the SPS parsed during warmup config
+            // feeding — that is what viewers will see, so verify it against config.
+            auto target_video = static_pointer_cast<VideoTrack>(target);
+            InfoL << "transcoded video track ready=" << target_video->ready()
+                  << ", size=" << target_video->getVideoWidth() << "x" << target_video->getVideoHeight()
+                  << ", fps=" << target_video->getVideoFps();
         }
     } catch (std::exception &ex) {
         WarnL << "transcode setup failed for " << getCodecName(src_codec) << " -> "
@@ -231,7 +281,9 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         }
     } else {
         auto video = static_pointer_cast<VideoTrack>(track);
-        auto fps = video->getVideoFps();
+        // 用「输出」帧率算帧间隔（静音兜底不用视频，但日志与观测要一致）
+        // Use the OUTPUT frame rate (video is never padded, but logs must agree)
+        auto fps = _option.video_fps > 0 ? _option.video_fps : video->getVideoFps();
         ctx.frame_interval_ms = fps > 0.1 ? (int) (1000.0f / fps) : 40;
     }
     if (ctx.frame_interval_ms <= 0) {
@@ -295,7 +347,11 @@ bool TranscodeSink::inputFrame(const Frame::Ptr &frame) {
     if (!decoder) {
         // 不转码：直接透传出去  [AUTO-TRANSLATED:0e7b8d21]
         // Not transcoding: emit unchanged
+        // 透传与转码输出共用一把锁：两者可能在不同线程同时进入 muxer
+        // Passthrough and transcoded output share the same lock: they can enter
+        // the muxer from different threads at the same time
         if (_on_output) {
+            lock_guard<mutex> lck(_output_mtx);
             _on_output(frame);
         }
         return true;
@@ -380,6 +436,12 @@ void TranscodeSink::onEncoded(int index, const Frame::Ptr &frame) {
     if (_on_output) {
         // 关键：流 id 不变，只是这条轨的 codec 变了 → 透明转码
         // Key point: same stream id, only this track's codec changed
+        //
+        // 必须串行：音频与视频的 onEncoded 在不同线程，并发写 muxer 会把协议
+        // 缓存的链表写坏（崩在 RtspMediaSource::onWrite，约 1/3 概率）。
+        // Must serialize: onEncoded runs on different threads per track and
+        // concurrent muxer writes corrupt its packet lists
+        lock_guard<mutex> lck(_output_mtx);
         _on_output(frame);
     }
 }

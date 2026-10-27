@@ -440,6 +440,10 @@ const string kTranscodeSampleRate = TRANSCODE_FIELD "sample_rate";
 const string kTranscodeOnDemand = TRANSCODE_FIELD "on_demand";
 const string kTranscodeEnableSilence = TRANSCODE_FIELD "enable_silence";
 const string kTranscodeSilenceTimeoutMS = TRANSCODE_FIELD "silence_timeout_ms";
+const string kTranscodeVideoWidth = TRANSCODE_FIELD "video_width";
+const string kTranscodeVideoHeight = TRANSCODE_FIELD "video_height";
+const string kTranscodeVideoFps = TRANSCODE_FIELD "video_fps";
+const string kTranscodeVideoBitrate = TRANSCODE_FIELD "video_bitrate";
 
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷
@@ -457,6 +461,12 @@ static onceToken token([]() {
     // Silence fallback is on by default, padding after a 200ms stall
     mINI::Instance()[kTranscodeEnableSilence] = 1;
     mINI::Instance()[kTranscodeSilenceTimeoutMS] = 200;
+    // 视频输出参数默认全部 0（跟随源），与未引入这些配置项时的行为一致
+    // Video output params default to 0 (follow the source), matching earlier behavior
+    mINI::Instance()[kTranscodeVideoWidth] = 0;
+    mINI::Instance()[kTranscodeVideoHeight] = 0;
+    mINI::Instance()[kTranscodeVideoFps] = 0;
+    mINI::Instance()[kTranscodeVideoBitrate] = 0;
 });
 
 #endif//ENABLE_FFMPEG

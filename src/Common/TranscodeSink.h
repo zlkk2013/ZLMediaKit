@@ -35,10 +35,18 @@ struct TranscodeOption {
     CodecId audio_codec = CodecInvalid;
     /** 目标视频 codec；CodecInvalid 表示不转视频 */
     CodecId video_codec = CodecInvalid;
-    /** 目标码率，0 表示沿用源 */
+    /** 目标码率，0 表示沿用源（音视频共用；视频想单独指定用 video_bitrate） */
     int bitrate = 0;
     /** 目标采样率（音频），0 表示沿用源 */
     int sample_rate = 0;
+    /** 视频输出宽，0=跟随源；必须与 video_height 成对 */
+    int video_width = 0;
+    /** 视频输出高，0=跟随源 */
+    int video_height = 0;
+    /** 视频输出帧率，0=跟随源。只支持降帧（抽帧） */
+    float video_fps = 0;
+    /** 视频专用码率(bps)，0=沿用 bitrate/源。优先于 bitrate */
+    int video_bitrate = 0;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
     /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */
@@ -198,6 +206,21 @@ private:
     TranscodeOption _option;
     std::function<size_t()> _reader_count;
     onOutput _on_output;
+
+    /**
+     * 输出串行锁。音频与视频的编码完成回调落在不同线程（音频在推流 poller 线程、
+     * 视频在 decoder 线程），两者同时写同一个 muxer 的协议缓存会把内部链表写坏，
+     * 实测 720p 双轨转码 + 客户端连断时约 1/3 概率 SIGSEGV（崩在
+     * RtspMediaSource::onWrite 的链表插入处）。
+     *
+     * **不能复用 _mtx**：编码过程本身会回调 onEncoded 再取 _mtx，持锁调用会自锁。
+     *
+     * Serializes output. Audio and video encode callbacks land on different threads;
+     * writing the same muxer concurrently corrupts its packet lists, which showed up
+     * as a SIGSEGV in ~1 of 3 runs of dual-track 720p transcoding with client
+     * attach/detach. Must NOT reuse _mtx (encoding re-enters onEncoded).
+     */
+    mutable std::mutex _output_mtx;
     std::unordered_map<int, TrackContext> _contexts;
     size_t _failed = 0;
     /** 静音兜底定时器；只有存在转码音频轨时才创建 */
