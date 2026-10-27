@@ -13,6 +13,7 @@
 #include "TranscodeSink.h"
 #include "Extension/Factory.h"
 #include "Util/util.h"
+#include "Common/Parser.h"   // StrCaseCompare：别名表要不区分大小写
 #include "Common/config.h"
 #include <algorithm>
 #include <atomic>
@@ -310,6 +311,15 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         auto av_ctx = ctx.encoder->getContext();
         if (av_ctx && av_ctx->frame_size > 0 && av_ctx->sample_rate > 0) {
             ctx.frame_interval_ms = (int) (av_ctx->frame_size * 1000LL / av_ctx->sample_rate);
+        } else if (av_ctx && av_ctx->sample_rate > 0) {
+            // G711 这类变长帧编码器 frame_size 恒为 0，直接落回下面的 20ms 默认值就会
+            // 与实际帧长脱节：8kHz 下 160 采样 = 20ms 恰好对，但 48kHz 下同一帧长是
+            // 3.3ms，按 20ms 补帧会让静音只补到 1/6 的量。这里按编码器真实采样率算。
+            // Variable-frame encoders like G711 always report frame_size 0; falling back
+            // to the 20ms default decouples the pacing from the real frame length — 20ms
+            // happens to be right for 160 samples at 8kHz, but at 48kHz that frame spans
+            // 3.3ms, so padding on a 20ms beat only covers 1/6 of the gap.
+            ctx.frame_interval_ms = (int) (ctx.encoder->getAudioFrameMs());
         } else {
             ctx.frame_interval_ms = 20;
         }

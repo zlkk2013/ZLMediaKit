@@ -175,6 +175,14 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_height = parseInt(ini[kTranscodeVideoHeight].as<string>(), 0);
     option.video_fps = (float) parseInt(ini[kTranscodeVideoFps].as<string>(), 0);
     option.video_bitrate = parseInt(ini[kTranscodeVideoBitrate].as<string>(), 0);
+    // 静音兜底的两项：P6 引入，重构到本文件时曾漏读，导致配置文件里改它们不生效
+    // Silence fallback settings (from P6). The refactor into this file once dropped
+    // these, so editing them in the ini had no effect at all.
+    option.enable_silence = parseBool(ini[kTranscodeEnableSilence].as<string>(), true);
+    option.silence_timeout_ms = parseInt(ini[kTranscodeSilenceTimeoutMS].as<string>(), 200);
+    if (option.silence_timeout_ms <= 0) {
+        option.silence_timeout_ms = 200;
+    }
     option.on_demand = parseBool(ini[kTranscodeOnDemand].as<string>(), true);
     return option;
 }
