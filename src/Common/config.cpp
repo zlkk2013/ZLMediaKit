@@ -438,6 +438,27 @@ const string kTranscodeVideoCodec = TRANSCODE_FIELD "video_codec";
 const string kTranscodeBitrate = TRANSCODE_FIELD "bitrate";
 const string kTranscodeSampleRate = TRANSCODE_FIELD "sample_rate";
 const string kTranscodeOnDemand = TRANSCODE_FIELD "on_demand";
+const string kTranscodeEnableSilence = TRANSCODE_FIELD "enable_silence";
+const string kTranscodeSilenceTimeoutMS = TRANSCODE_FIELD "silence_timeout_ms";
+
+static onceToken token([]() {
+    // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷
+    // "unknow config" 警告；默认值必须与 TranscodeOption 一致
+    // Defaults live in mINI so a config missing these keys still behaves
+    // predictably and no "unknow config" warning is printed; must match
+    // TranscodeOption
+    mINI::Instance()[kTranscodeEnable] = 0;
+    mINI::Instance()[kTranscodeAudioCodec] = "";
+    mINI::Instance()[kTranscodeVideoCodec] = "";
+    mINI::Instance()[kTranscodeBitrate] = 0;
+    mINI::Instance()[kTranscodeSampleRate] = 0;
+    mINI::Instance()[kTranscodeOnDemand] = 1;
+    // 静音兜底默认开，200ms 断流即补帧
+    // Silence fallback is on by default, padding after a 200ms stall
+    mINI::Instance()[kTranscodeEnableSilence] = 1;
+    mINI::Instance()[kTranscodeSilenceTimeoutMS] = 200;
+});
+
 #endif//ENABLE_FFMPEG
 
 } // namespace mediakit

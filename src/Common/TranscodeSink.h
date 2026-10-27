@@ -20,6 +20,7 @@
 #include "Extension/Track.h"
 #include "Extension/Frame.h"
 #include "Codec/Transcoder.h"
+#include "Poller/Timer.h"
 
 namespace mediakit {
 
@@ -40,6 +41,10 @@ struct TranscodeOption {
     int sample_rate = 0;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
+    /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */
+    bool enable_silence = true;
+    /** 静音兜底触发阈值（毫秒）：超过该时长没有新帧输出即开始补静音 */
+    int silence_timeout_ms = 200;
 
     // 必须同时校验编码类型，否则传入视频 codec 时会被音频规则误判
     // Must check the track type too, otherwise a video codec passed to the audio
@@ -81,7 +86,7 @@ struct TranscodeOption {
  * Decoupled from MediaSink so it can be unit tested. Three call sites:
  * addTrack at track-ready time, inputFrame per frame, and an output callback.
  */
-class TranscodeSink {
+class TranscodeSink : public std::enable_shared_from_this<TranscodeSink> {
 public:
     using Ptr = std::shared_ptr<TranscodeSink>;
     using onOutput = std::function<void(const Frame::Ptr &)>;
@@ -123,13 +128,33 @@ public:
     /** 转码失败的轨数（配置不当/编码器缺失时非 0） */
     size_t failedTrackCount() const;
 
+    /** 静音兜底已补出的帧数（判据用：源端断流后该值应持续增长） */
+    size_t silenceFrameCount() const;
+
 private:
     struct TrackContext {
         bool transcoding = false;
+        bool audio = false;
         Track::Ptr target_track;
         std::shared_ptr<FFmpegDecoder> decoder;
         std::shared_ptr<FFmpegEncoder> encoder;
         size_t frame_count = 0;
+        /** 已补出的静音帧数 */
+        size_t silence_count = 0;
+        /** 最近一次输出真实帧的时刻(ms)，用于判断源端是否断流 */
+        int64_t last_output_ms = 0;
+        /** 真实帧是否已产出过；未产出前不补静音，避免抢先于首帧 */
+        bool has_output = false;
+        /** 已进入静音兜底状态：每个 tick 续补一帧，直到真实帧回来 */
+        bool silence_mode = false;
+        /** 静音态的"进入沿"，只为打一条进入日志取证用 */
+        bool silence_entered = false;
+        /** 已补出的静音帧累计覆盖的时长（毫秒），用于按真实时间节奏补帧 */
+        int silence_debt_ms = 0;
+        /** 正在由兜底路径编码（用于在 onEncoded 里区分真实帧与静音帧） */
+        bool in_silence_encode = false;
+        /** 该轨一帧的时长（毫秒），决定静音补帧的节奏 */
+        int frame_interval_ms = 20;
     };
 
     /** 建立该轨的 解码器 + 编码器；成功时 target_track 非空 */
@@ -139,12 +164,46 @@ private:
     void onDecoded(int index, const FFmpegFrame::Ptr &frame);
     void onEncoded(int index, const Frame::Ptr &frame);
 
+    /**
+     * 懒创建静音兜底定时器。
+     *
+     * 只在首次输出帧时创建，用当前线程的 EventPoller：所有转码输出本来就跑在
+     * muxer 的 poller 线程上，定时器挂同一个 poller 才能保证补出来的静音帧与
+     * 真实帧串行进入下游，不需要额外加锁。
+     *
+     * Lazily create the silence timer on the calling (muxer) poller. All transcode
+     * output already runs on that thread, so silence frames and real frames reach
+     * downstream strictly serialized without extra locking.
+     */
+    void ensureSilenceTimer();
+    void cancelSilenceTimer();
+
+    /** 定时器回调：给断流的转码轨补静音帧 */
+    void onSilenceTick();
+
+    /**
+     * 标记该轨"上游仍在产出"。
+     *
+     * 除真实输出帧外，按需跳过（无人观看）也必须调用：没人看时我们有意不转码，
+     * 这跟上游断流是两件事，混为一谈会在无人观看时凭空补出大量静音帧。
+     *
+     * Mark the track as "upstream still producing". Besides real output frames,
+     * on-demand skipping must call this too: declining to transcode when nobody
+     * watches is not the same as a stalled upstream, and conflating them makes
+     * the fallback emit hundreds of pointless silence frames.
+     */
+    void markTrackActive(int index);
+
     mutable std::mutex _mtx;
     TranscodeOption _option;
     std::function<size_t()> _reader_count;
     onOutput _on_output;
     std::unordered_map<int, TrackContext> _contexts;
     size_t _failed = 0;
+    /** 静音兜底定时器；只有存在转码音频轨时才创建 */
+    toolkit::Timer::Ptr _silence_timer;
+    /** 定时器检查周期（毫秒），取 silence_timeout_ms 的 1/4，保证补帧足够密 */
+    uint64_t _silence_tick_ms = 50;
 };
 
 }//namespace mediakit
