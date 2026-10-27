@@ -113,14 +113,25 @@ def start(tag):
                          stdout=open(LOG, "a"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)
-        if lpid(RTMP) == p.pid:
+        # 必须同时满足：进程还活着 + 端口监听者就是它（旧进程占端口时会拿到别人的 pid）
+        if p.poll() is None and lpid(RTMP) == p.pid:
             return p
     print(open(LOG).read()[-800:]); sys.exit(1)
 
 def stop(p):
+    """停服务。必须等它真的退出再返回，否则上一轮的 SIGTERM 会晚到、
+    把下一轮刚启动的进程关掉（表现为矩阵中途 Connection refused，
+    日志里是一次「Server shutdown」而不是崩溃）。"""
     try: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
     except Exception: pass
-    time.sleep(1.0)
+    for _ in range(40):
+        if p.poll() is not None:
+            break
+        time.sleep(0.1)
+    else:
+        try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception: pass
+    time.sleep(0.3)
 
 def push(src, stream):
     return subprocess.Popen(["ffmpeg", "-re", "-stream_loop", "-1", "-i", src, "-c", "copy",

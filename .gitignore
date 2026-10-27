@@ -65,3 +65,4 @@ config.dts.ini
 config.crash.ini
 config.matrix.ini
 config.reverse.ini
+config.camera.ini
