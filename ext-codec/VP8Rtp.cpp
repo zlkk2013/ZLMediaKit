@@ -324,7 +324,18 @@ bool VP8RtpEncoder::inputFrame(const Frame::Ptr &frame) {
     RTPVideoHeaderVP8 info;
     info.InitRTPVideoHeaderVP8();
     info.beginningOfPartition = true;
-    info.nonReference = !frame->dropAble();
+    // N 位（non-reference）语义是「这一帧不被任何后续帧参考」= 可以丢。
+    // 原来写成 !frame->dropAble() 是反的：关键帧和所有参考帧都被标成“可丢”，
+    // 浏览器一侧的 jitter buffer / 分层丢帧逻辑会据此丢掉关键帧。
+    // 现在按 dropAble() 取值；转码输出（lag-in-frames=0、无 alt-ref、无时域分层）
+    // 的每一帧都是参考帧，因此 N 恒为 0 —— 与编码器实际行为一致。
+    // The N bit means "no later frame references this one" (= droppable). The old
+    // `!frame->dropAble()` was inverted: keyframes and every reference frame were
+    // flagged droppable, so a browser jitter buffer / layer-dropping logic could
+    // discard keyframes. Use dropAble() as-is; transcoded frames (lag-in-frames=0,
+    // no alt-ref, no temporal layering) are all references, hence N stays 0, which
+    // matches what the encoder actually produces.
+    info.nonReference = frame->dropAble();
     uint8_t header[20];
     int header_size = info.Write(header, sizeof(header));
 
