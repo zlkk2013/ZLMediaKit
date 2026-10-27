@@ -235,3 +235,31 @@ RFC 3551 里 pt=14 的名字就是 MPA。
 | VP8 / VP9 | 无法投递 | 有 libvpx 编码器，但 `Rtsp.h` 里没有对应载荷类型 |
 | AV1 / H266 | 未接 | 无编码器分支，也无载荷 |
 | G722.1 / SVAC | 未做 | 需要 ffmpeg 二次开发（私有编解码器） |
+
+### 10.4 H265 源 → H264：查到根因，未修完
+
+**现象**：H265 经 RTSP 推入、配 `video_codec=H264`，转码日志显示成功（`H265 -> H264`
+已登记、libx264 出了 400+ 帧），但拉流端 `DESCRIBE` 仍返回 H265 的 SDP，且客户端按
+hevc 解码「0 错误」——说明**观众确实拿到的是源的 H265 RTP**。
+
+**排查与结论**：
+
+1. `RtspMediaSourceImp::setSdp()` 里 `if (!getSdp().empty()) return;` —— SDP 一旦设定
+   就不再更新。已加 `RtspMediaSource::updateSdpCache()`（只刷新对外 SDP，不重载
+   demuxer）并在 `RtspMediaSourceMuxer::addTrackCompleted()` 里按需调用。
+2. **但 DESCRIBE 返回的 SDP 依然是推流端的原始 SDP**（带 `a=control:streamid=0` 与
+   `sprop-vps/sps/pps`），不是我们 muxer 生成的（muxer 生成的是 `a=control:trackID=`）。
+   说明这条拓扑下 `RtspMediaSourceMuxer` 根本没接管该源。
+
+**根因**：RTSP 进 → RTSP 出时，ZLM 默认走 **direct-proxy**（`RtspMediaSourceImp::onWrite`
+在 `directProxy` 为真时直接透传源 RTP，不解复用）。转码换轨发生在
+`MultiMediaSourceMuxer` 里，而观众连接的 `RtspMediaSource` 是推流端那个源对象 ⇒
+**转码输出不进入这条链路**，改 SDP 也没用。
+
+**正确修法**（未做）：对「源是 RTSP 且该流启用转码」的情况关闭 direct-proxy，
+让帧走 muxer；同时把 SDP 改成 muxer 生成的版本（`updateSdpCache` 已就绪）。
+需要动 `RtspMediaSourceImp::onWrite` 的 directProxy 判定，并处理关闭代理后的
+RTP 解复用开销，属于架构级改动，单独一轮做。
+
+> 对比：H264 经 **RTMP** 推入转 H265 是正常的 —— 那条路径的 RTSP 输出源由 muxer
+> 新建，SDP 本来就是转码后的轨。

@@ -11,6 +11,12 @@ void RtspMediaSource::setSdp(const std::string &sdp) {
     }
 }
 
+void RtspMediaSource::updateSdpCache(const std::string &sdp) {
+    SdpParser sdp_parser(sdp);
+    _have_video = static_cast<bool>(sdp_parser.getTrack(TrackVideo));
+    _sdp = sdp_parser.toString();
+}
+
 void RtspMediaSource::onWrite(RtpPacket::Ptr rtp, bool keyPos) {
     _speed[rtp->type] += rtp->size();
     assert(rtp->type >= 0 && rtp->type < TrackMax);

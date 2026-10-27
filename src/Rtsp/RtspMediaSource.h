@@ -120,6 +120,25 @@ public:
     virtual void setSdp(const std::string &sdp);
 
     /**
+     * 只刷新对外提供的 SDP 缓存，不重新加载 demuxer。
+     *
+     * 场景：源流是 RTSP 推上来的，发布时 SDP 就已固定（setSdp 在已有 SDP 时直接
+     * 返回）；转码把轨换掉后，观众端 DESCRIBE 拿到的仍是源编码（实测 H265 源转
+     * H264，SDP 里还写着 hevc，客户端按 hevc 解 H264 数据）。
+     *
+     * 这里只更新 `_sdp`/`_have_video`，因为 demuxer 是按源 SDP 建好的、用来解
+     * 源端 RTP，不能跟着目标轨重载。
+     *
+     * Refresh only the SDP served to viewers, without reloading the demuxer. An
+     * RTSP-published source has its SDP fixed at publish time and setSdp() returns
+     * early once one exists, so after a transcode swaps the track viewers still
+     * DESCRIBE the source codec (measured: H265 -> H264 still advertised as hevc).
+     * The demuxer is built from the SOURCE sdp to parse source RTP, so it must not
+     * be reloaded here.
+     */
+    void updateSdpCache(const std::string &sdp);
+
+    /**
      * 输入rtp
      * @param rtp rtp包
      * @param keyPos 该包是否为关键帧的第一个包

@@ -48,7 +48,14 @@ public:
 
     void addTrackCompleted() override {
         RtspMuxer::addTrackCompleted();
-        _media_src->setSdp(getSdp());
+        auto sdp = getSdp();
+        if (sdp != _media_src->getSdp()) {
+            // 走 updateSdpCache 而不是 setSdp：后者在已有 SDP 时直接返回，
+            // 而转码换轨后必须让观众端看到新的目标编码
+            // Use updateSdpCache, not setSdp: the latter returns early once an SDP
+            // exists, so a transcode track swap would never reach viewers.
+            _media_src->updateSdpCache(sdp);
+        }
     }
 
     void onReaderChanged(MediaSource &sender, int size) override {
