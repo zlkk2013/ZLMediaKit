@@ -189,8 +189,18 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
     if (is_audio) {
         auto audio = static_pointer_cast<AudioTrack>(track);
         int sample_rate = _option.sample_rate > 0 ? _option.sample_rate : audio->getAudioSampleRate();
+        int channels = audio->getAudioChannel();
+        // 载荷规格写死的 codec（G711 8k/单声道、MP3 44.1k/双声道）必须按规格建目标轨：
+        // 否则轨道声明的参数与 RTP payload 表对不上，RTSP 封装找不到 payload 类型，
+        // 观众端报 "Decoder (codec none) not found"，音频整条丢失。实测 16k 源转 MP3
+        // 就是这样：编码器按 44.1k 出包，轨却声明 16k，整轨被丢。
+        // Codecs with a fixed RTP payload (G711 8k/mono, MP3 44.1k/stereo) must build the
+        // target track at that spec, otherwise the RTSP muxer cannot map the payload type
+        // and the whole audio track is dropped ("Decoder (codec none) not found").
+        // Measured: 16kHz source -> MP3 declared 16k while packets were 44.1k.
+        forcedAudioSpec(_option.audio_codec, sample_rate, channels);
         target = Factory::getTrackByCodecId(_option.audio_codec, sample_rate,
-                                            audio->getAudioChannel(), audio->getAudioSampleBit());
+                                            channels, audio->getAudioSampleBit());
     } else {
         target = Factory::getTrackByCodecId(_option.video_codec);
         if (target) {

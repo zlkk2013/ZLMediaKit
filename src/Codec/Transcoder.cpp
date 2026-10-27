@@ -419,10 +419,11 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
         // timestamp base disagree with the declared track: measured 795..1594 packets
         // for 5s of 8kHz audio (correct is 250), and the receiver played 5s as ~30s.
         // Forcing 8k mono lets swr do the resample and downmix.
-        if (_codec_id == CodecG711A || _codec_id == CodecG711U) {
-            sample_rate = 8000;
-            channel = 1;
-        }
+        // 载荷规格写死的 codec（G711/MP3）必须按规格打开编码器，与目标轨的定义共用
+        // forcedAudioSpec()，避免两处各算一套
+        // Codecs with a fixed RTP payload (G711/MP3) must be opened at that spec,
+        // sharing forcedAudioSpec() with the target-track creation
+        forcedAudioSpec(_codec_id, sample_rate, channel);
         auto ret = openAudioCodec(sample_rate, channel, bitrate, _codec, track);
         if (!ret) {
             throw std::runtime_error(string("打开音频编码器失败: ") + _codec->name);
@@ -850,11 +851,25 @@ bool FFmpegEncoder::inputFrame(const FFmpegFrame::Ptr &frame, bool async) {
  * silence frames share this path so they are PCM-equivalent: bypassing the FIFO
  * for silence would misalign its leftover samples and punch a gap in the timeline.
  */
-bool FFmpegEncoder::encodeAudio_l(AVFrame *converted) {
-    if (_variable_frame_size) {
-        return encodeFrame(converted);
+int FFmpegEncoder::audioChunkSamples() const {
+    // 切帧长度的唯一来源，编码与静音补帧必须用同一个值，否则时间轴会漂。
+    // frame_size > 1 的编码器（libopus 960、AAC 1024、libmp3lame 1152）用它自己的；
+    // frame_size 为 0/1 的（G711/L16 这类裸 PCM）用 20ms = rate/50，
+    // 与 RTP 打包粒度一致，也避开 ffmpeg 默认 1024 帧长补零的坑。
+    //
+    // Single source of truth for the chunk size. Fixed-frame encoders
+    // (libopus 960, AAC 1024, libmp3lame 1152) use their own frame_size; the bare PCM
+    // ones that report 0/1 use 20ms = rate/50, matching the RTP packing granularity and
+    // avoiding ffmpeg's default 1024-sample padding.
+    if (_context->frame_size > 1) {
+        return _context->frame_size;
     }
+    auto rate = _context->sample_rate > 0 ? _context->sample_rate : 8000;
+    auto samples = rate / 50;
+    return samples > 0 ? samples : 1;
+}
 
+bool FFmpegEncoder::encodeAudio_l(AVFrame *converted) {
     if (!_fifo) {
         _fifo.reset(new TranscodeAudioFifo());
     }
@@ -862,7 +877,7 @@ bool FFmpegEncoder::encodeAudio_l(AVFrame *converted) {
         return false;
     }
 
-    auto frame_size = _context->frame_size > 0 ? _context->frame_size : 1024;
+    auto frame_size = audioChunkSamples();
     bool ret = true;
     while (true) {
         auto out = av_frame_alloc();
@@ -1031,35 +1046,28 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     }
 
     // ---- 音频路径 ----
-    if (_variable_frame_size) {
-        // 变长帧编码器（G711/MP3 之外的裸 PCM 类）不需要 FIFO 对齐，但单帧不能超过
-        // 编码器能接受的长度，也不能为 0；这里只做防御性校验。
-        // Variable-frame encoders need no FIFO alignment, but a single frame must be
-        // non-empty and within what the encoder accepts; validate defensively only.
-        auto converted = formatFrame(frame);
-        if (!converted) {
-            return false;
-        }
-        auto av_frame = converted->get();
-        if (!av_frame || av_frame->nb_samples <= 0) {
-            return false;
-        }
-        // 变长帧也要给 pts：编码器 time_base 是 1/sample_rate，按累计采样数推进，
-        // 否则包出来 pts 全为空/NA，封装层直接报 "missing PTS" 并丢弃音频。
-        // Variable-frame output still needs a pts: the encoder time_base is
-        // 1/sample_rate and we advance by accumulated samples; otherwise packets carry
-        // no pts, muxers report "missing PTS" and drop the audio entirely.
-        av_frame->pts = _frame_index;
-        _frame_index += av_frame->nb_samples;
-        return encodeFrame(av_frame);
-    }
-
-    // 固定帧长：攒够 frame_size 再编码；与静音兜底共用 encodeAudio_l，
-    // 保证两条路径的 FIFO/pts 记账完全一致
-    // Fixed frame size: accumulate frame_size samples first. Shares encodeAudio_l
-    // with the silence fallback so both paths agree on FIFO/pts bookkeeping
+    // 所有音频 codec 一律走 encodeAudio_l 的 FIFO 分帧，**不要**因为 frame_size==0
+    // 就直接把任意长度的帧塞进编码器。
+    //
+    // 原因（实测教训）：PCM_ALAW/PCM_MULAW 虽然 frame_size 报 0，但它们并没有
+    // AV_CODEC_CAP_VARIABLE_FRAME_SIZE 能力，ffmpeg 会按默认帧长 1024 把输入帧补零。
+    // 8kHz 源的解码帧只有 160 样本（20ms），每帧被撑成 1024 样本 → 内容放大约 6.4 倍：
+    // 拉 5 秒音频解码出来是 31.88 秒、1589 个包（正确值 250 包 / 5.000 秒）。
+    // 目标采样率与源相同时（8k→8k）不做重采样，这条路径才会被走到，所以 44.1k→PCMA
+    // 反而正确，掩盖了问题。
+    //
+    // Every audio codec goes through encodeAudio_l's FIFO framing. Do NOT feed arbitrary
+    // frame lengths straight into the encoder just because frame_size == 0: PCM_ALAW /
+    // PCM_MULAW report frame_size 0 but lack AV_CODEC_CAP_VARIABLE_FRAME_SIZE, so ffmpeg
+    // pads each frame to its default 1024 samples. An 8kHz source frame is only 160
+    // samples (20ms), so each became 1024 -> content inflated ~6.4x (5s of pull decoded
+    // to 31.88s / 1589 packets instead of 250 / 5.000s). Only reachable when the target
+    // rate equals the source rate (no resampling), which is why 44.1k -> PCMA looked fine.
     auto converted = formatFrame(frame);
     if (!converted) {
+        return false;
+    }
+    if (!converted->get() || converted->get()->nb_samples <= 0) {
         return false;
     }
     return encodeAudio_l(converted->get());
@@ -1250,8 +1258,8 @@ void FFmpegEncoder::flush() {
     _flush_done = true;
     // 音频 FIFO 里剩下的数据用静音补齐最后一帧，否则尾部会丢
     // Pad the tail of the audio FIFO so the last frame is not lost
-    if (_fifo && _fifo->inited() && !_variable_frame_size && _context->codec_type == AVMEDIA_TYPE_AUDIO) {
-        auto frame_size = _context->frame_size > 0 ? _context->frame_size : 1024;
+    if (_fifo && _fifo->inited() && _context->codec_type == AVMEDIA_TYPE_AUDIO) {
+        auto frame_size = audioChunkSamples();
         auto left = _fifo->size();
         if (left > 0 && left < frame_size) {
             TraceL << "flush audio fifo with " << left << "/" << frame_size << " samples";

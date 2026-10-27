@@ -63,3 +63,4 @@ config.g8.ini
 config.e0.ini
 config.dts.ini
 config.crash.ini
+config.matrix.ini

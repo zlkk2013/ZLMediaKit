@@ -32,6 +32,37 @@ extern "C" {
 namespace mediakit {
 
 /**
+ * 某些音频 codec 的 RTP 载荷规格是**写死**的（见 Rtsp.h 的 payload 表），
+ * 编码器与目标轨都必须按这个规格来，否则 RTSP 封装找不到对应的 payload 类型，
+ * 观众端直接报 "Decoder (codec none) not found"，音频整条丢失。
+ *
+ *   PCMA / PCMU : pt=8 / pt=0，8000Hz 单声道
+ *   MP3         : pt=14，44100Hz 双声道
+ *
+ * 返回 true 表示该 codec 有强制规格，并回填 rate/channels。
+ *
+ * Some audio codecs have a FIXED RTP payload format (see the payload table in
+ * Rtsp.h); both the encoder and the target track must use it, otherwise the RTSP
+ * muxer cannot map the track and viewers get "Decoder (codec none) not found"
+ * with no audio at all.
+ */
+static inline bool forcedAudioSpec(CodecId codec, int &rate, int &channels) {
+    switch (codec) {
+        case CodecG711A:
+        case CodecG711U:
+            rate = 8000;
+            channels = 1;
+            return true;
+        case CodecMP3:
+            rate = 44100;
+            channels = 2;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
  * 视频输出目标参数
  *
  * 全部为 0 时表示「跟随源」，行为与此前硬编码路径完全一致。
@@ -217,6 +248,8 @@ private:
     void onEncode(AVPacket *packet);
     bool encodeFrame(AVFrame *frame);
     bool encodeAudio_l(AVFrame *converted);
+    /** 音频切帧长度（采样数），编码与静音补帧共用；见实现处注释 */
+    int audioChunkSamples() const;
     bool inputFrame_l(const FFmpegFrame::Ptr &frame);
     bool drainEncoder();
 
