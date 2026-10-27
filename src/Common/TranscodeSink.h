@@ -246,6 +246,21 @@ private:
     std::string _label;
     std::function<size_t()> _reader_count;
     onOutput _on_output;
+
+    /**
+     * 输出串行锁。音频与视频的编码完成回调落在不同线程（音频在推流 poller 线程、
+     * 视频在 decoder 线程），两者同时写同一个 muxer 的协议缓存会把内部链表写坏，
+     * 表现为低概率 SIGSEGV（崩在 RtspMediaSource::onWrite 的链表插入处）。
+     *
+     * **不能复用 _mtx**：编码过程本身会回调 onEncoded 再取 _mtx，持锁调用会自锁。
+     *
+     * Serializes output. Audio and video encode callbacks land on different threads
+     * (audio on the publish poller thread, video on the decoder thread); writing the
+     * same muxer concurrently corrupts its internal packet lists, which showed up as
+     * an intermittent SIGSEGV inside RtspMediaSource::onWrite. Must NOT reuse _mtx:
+     * encoding re-enters onEncoded and takes _mtx, so holding it would self-deadlock.
+     */
+    mutable std::mutex _output_mtx;
     std::unordered_map<int, TrackContext> _contexts;
     size_t _failed = 0;
     /** 静音兜底定时器；只有存在转码音频轨时才创建 */

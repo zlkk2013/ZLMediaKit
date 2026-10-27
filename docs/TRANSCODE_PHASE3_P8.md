@@ -98,7 +98,19 @@ cam1 的视频保持 `h264 320x240` 未转——全局 `video_codec` 为空就�
 
 为了让调用方不被误导，`addTranscode`/`getTranscode` 的返回体都带 `persistent:false`。实测确认该字段为 `false`。
 
-## 5. 踩坑记录（测试环境本身会骗人）
+## 5. 修复：双轨转码 + 客户端连断导致的 SIGSEGV
+
+本线在 720p 压测时发现**约 1/3 概率 SIGSEGV**，崩溃点在 `RtspMediaSource::onWrite` 的 PacketCache 链表插入处。
+
+根因不在 API 层，而在 `TranscodeSink::onEncoded`：它在锁外调用 `_on_output(frame)`，而音频与视频的编码完成回调落在不同线程（音频在推流 poller 线程、视频在 decoder 线程），两个线程同时写同一个 muxer 的协议缓存，把链表写坏。
+
+修法：在 `TranscodeSink` 加一把独立的输出串行锁（只用一把，不能复用 `_mtx`——编码过程会回调 `onEncoded` 再取 `_mtx`，持锁会自锁），只包住 `_on_output(frame)`。
+
+验证：同一复现场景（720p 双轨 + 两个 RTSP 客户端先连后断）修复前 6 轮崩 4 轮，修复后 **12 轮 0 崩溃**；本文件 33 项断言修复后仍全绿。
+
+> 该竞态在 P6/P7 集成就已存在，详见 `a2` 的 `docs/TRANSCODE_VIDEO_PARAMS.md` §3（含完整崩溃栈与反汇编定位）。
+
+## 6. 踩坑记录（测试环境本身会骗人）
 
 这一节的坑比产品 bug 更值得记，因为它们会让测试给出**看似合理但完全错误**的结论：
 
@@ -110,7 +122,7 @@ cam1 的视频保持 `h264 320x240` 未转——全局 `video_codec` 为空就�
 | 用 RTMP 验转码 | 配了 h265/opus，拉流还是 h264/aac | **RTMP/FLV 容器不承载 HEVC 与 Opus**，出口回退源编码 | 验转码一律用 RTSP 拉流 |
 | ffprobe 多流计数 | 音频 `nb_read_packets=0`，但服务端明明转了 369 帧 | 多流一起数时第二路常给 0 | 音视频分开用 `-select_streams a/v` 各起一个进程数 |
 
-## 6. 未验证项
+## 7. 未验证项
 
 - `stream_rule` 的 `vhost/app/stream` 三段写法只验证了解析，没有起第二个 vhost 实际推流验证匹配
 - 规则的 `stream` 字段留空（匹配该 app 下所有流）未实测

@@ -452,6 +452,15 @@ void TranscodeSink::onEncoded(int index, const Frame::Ptr &frame) {
     if (_on_output) {
         // 关键：流 id 不变，只是这条轨的 codec 变了 → 透明转码
         // Key point: same stream id, only this track's codec changed
+        //
+        // 必须串行：音频与视频的 onEncoded 在不同线程，直接并发调用会把 muxer
+        // 的协议缓存链表写坏（崩在 RtspMediaSource::onWrite，约 1/3 概率）。
+        // 锁只包住回调本身，不包编码，避免与编码过程中的重入自锁。
+        // Must serialize: onEncoded runs on different threads for audio and video,
+        // and calling the muxer concurrently corrupts its packet lists (crash inside
+        // RtspMediaSource::onWrite, roughly 1 in 3 runs). The lock wraps only the
+        // callback, never the encode itself, which re-enters onEncoded.
+        lock_guard<mutex> lck(_output_mtx);
         _on_output(frame);
     }
 }
