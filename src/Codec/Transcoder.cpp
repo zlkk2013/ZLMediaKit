@@ -171,12 +171,26 @@ bool TranscodeAudioFifo::write(const AVFrame *frame) {
     } else if (_channels != frame->ch_layout.nb_channels
                || _samplerate != frame->sample_rate
                || _format != (AVSampleFormat) frame->format) {
-        // 参数变了，必须重建，否则会写入错位数据  [AUTO-TRANSLATED:0f0f5d3e]
+        // 参数变了，必须重建，否则会写入错位数据
         // Parameters changed, must rebuild, otherwise misaligned data will be written
-        WarnL << "audio params changed, rebuilding fifo";
+        WarnL << "audio params changed, rebuilding fifo"
+              << ", " << _channels << "ch/" << _samplerate << "Hz/" << av_get_sample_fmt_name(_format)
+              << " -> " << frame->ch_layout.nb_channels << "ch/" << frame->sample_rate
+              << "Hz/" << av_get_sample_fmt_name((AVSampleFormat) frame->format);
+        // 关键：先把成员更新成新参数再分配。旧代码用旧的 _format/_channels 重建，
+        // 再用新格式去 av_audio_fifo_write，格式与 FIFO 不符 → 写入失败/数据错位，
+        // 表现为换轨（分辨率/声道变更）后整条音频变成静音或爆音。
+        // Critical: update the members to the new parameters BEFORE allocating. The old
+        // code rebuilt with the OLD _format/_channels then wrote new-format data into it,
+        // so the format never matched the FIFO -> write failure/misaligned samples,
+        // i.e. audio went silent or garbled after a mid-stream parameter change.
+        _channels = frame->ch_layout.nb_channels;
+        _samplerate = frame->sample_rate;
+        _format = (AVSampleFormat) frame->format;
         av_audio_fifo_free(_fifo);
         _fifo = av_audio_fifo_alloc(_format, _channels, frame->nb_samples * 4);
         if (!_fifo) {
+            WarnL << "av_audio_fifo_alloc failed on rebuild";
             return false;
         }
     }
@@ -237,6 +251,12 @@ static const AVCodec *findEncoder(CodecId codec_id) {
         case CodecOpus: return find("libopus", AV_CODEC_ID_OPUS);
         case CodecG711A:return find(nullptr, AV_CODEC_ID_PCM_ALAW);
         case CodecG711U:return find(nullptr, AV_CODEC_ID_PCM_MULAW);
+        // MP3 必须显式找 libmp3lame：裸 AV_CODEC_ID_MP3 在部分构建里只注册了解码器，
+        // 旧代码根本没有这个 case，配 audio_codec=MP3 会直接抛「未找到编码器」。
+        // MP3 must resolve libmp3lame explicitly: a bare AV_CODEC_ID_MP3 build may only
+        // register the decoder. The old code had no case at all, so audio_codec=MP3 threw
+        // "encoder not found" and silently fell back to passthrough.
+        case CodecMP3:  return find("libmp3lame", AV_CODEC_ID_MP3);
         case CodecVP8:  return find("libvpx", AV_CODEC_ID_VP8);
         case CodecVP9:  return find("libvpx-vp9", AV_CODEC_ID_VP9);
         default:        return nullptr;
@@ -278,7 +298,24 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
         }
     } else {
         auto audio = static_pointer_cast<AudioTrack>(track);
-        auto ret = openAudioCodec(audio->getAudioSampleRate(), audio->getAudioChannel(), bitrate, _codec);
+        auto sample_rate = audio->getAudioSampleRate();
+        auto channel = audio->getAudioChannel();
+        // PCMA/PCMU 的 RTP 载荷规格是死的：8000Hz 单声道（见 Rtsp.h 的 payload 表
+        // XX(PCMA, TrackAudio, 8, 8000, 1, ...)）。编码器必须按这个规格打开，
+        // 否则输出时间戳的时基与轨道声明不一致——实测 8kHz 源打成 PCMA 时，
+        // 5 秒音频被塞进 795~1594 个包（正确值 250），观众端把 8k 内容当更高速率播，
+        // 5 秒声音被拉成 30 秒。强制 8k 单声道后由 swr 负责重采样与下混。
+        //
+        // PCMA/PCMU have a fixed RTP payload format: 8000Hz mono (see the payload
+        // table in Rtsp.h). Opening the encoder at the source rate makes the output
+        // timestamp base disagree with the declared track: measured 795..1594 packets
+        // for 5s of 8kHz audio (correct is 250), and the receiver played 5s as ~30s.
+        // Forcing 8k mono lets swr do the resample and downmix.
+        if (_codec_id == CodecG711A || _codec_id == CodecG711U) {
+            sample_rate = 8000;
+            channel = 1;
+        }
+        auto ret = openAudioCodec(sample_rate, channel, bitrate, _codec, track);
         if (!ret) {
             throw std::runtime_error(string("打开音频编码器失败: ") + _codec->name);
         }
@@ -375,7 +412,8 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
     return true;
 }
 
-bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, const AVCodec *codec) {
+bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, const AVCodec *codec,
+                                   const Track::Ptr &target) {
     _context.reset(avcodec_alloc_context3(codec), [](AVCodecContext *ctx) { avcodec_free_context(&ctx); });
     if (!_context) {
         return false;
@@ -393,16 +431,51 @@ bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, con
             }
         }
         if (!found) {
+            // 取"最接近"的支持采样率，而不是 [0]。libopus 的 supported_samplerates 是
+            // 48000/24000/16000/12000/8000，[0] 恰好是 48000 所以旧代码没暴露问题；
+            // 但换个编码器（列表降序）就会把 8kHz 的源上采样到 96kHz，既废 CPU 又改变音色。
+            // Pick the NEAREST supported rate, not [0]. libopus lists 48000 first so the
+            // old code looked fine; another encoder listing high rates first would upsample
+            // an 8kHz source to 96kHz, wasting CPU and altering the timbre.
+            int best = codec->supported_samplerates[0];
+            int best_diff = abs(best - _context->sample_rate);
+            for (auto p = codec->supported_samplerates; *p; ++p) {
+                int diff = abs(*p - _context->sample_rate);
+                if (diff < best_diff) {
+                    best = *p;
+                    best_diff = diff;
+                }
+            }
             WarnL << "samplerate " << _context->sample_rate << " not supported by " << codec->name
-                  << ", fallback to " << codec->supported_samplerates[0];
-            _context->sample_rate = codec->supported_samplerates[0];
+                  << ", fallback to nearest " << best;
+            _context->sample_rate = best;
         }
     }
 
-    av_channel_layout_default(&_context->ch_layout, channel > 0 ? channel : 1);
+    int want_channels = channel > 0 ? channel : 1;
+    av_channel_layout_default(&_context->ch_layout, want_channels);
     if (codec->ch_layouts) {
-        // 只挑第一个可用布局，常见为 stereo/mono
-        av_channel_layout_copy(&_context->ch_layout, &codec->ch_layouts[0]);
+        // 必须优先挑与请求声道数一致的布局。旧代码无条件取 ch_layouts[0]：
+        // libmp3lame 的列表是 {1ch, 2ch}，立体声源会被静默降成单声道，丢一半声道，
+        // 观众端音量掉 3dB 且左右声道合并。
+        // Prefer a layout matching the requested channel count. The old code blindly took
+        // ch_layouts[0]; libmp3lame lists {1ch, 2ch}, so a stereo source was silently
+        // downmixed to mono — one channel dropped, ~3dB quieter, L/R summed.
+        const AVChannelLayout *pick = &codec->ch_layouts[0];
+        bool matched = false;
+        for (auto p = codec->ch_layouts; p->nb_channels; ++p) {
+            if (p->nb_channels == want_channels) {
+                pick = p;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            WarnL << "codec " << codec->name << " does not support " << want_channels
+                  << " channel(s), fallback to " << codec->ch_layouts[0].nb_channels;
+        }
+        av_channel_layout_copy(&_context->ch_layout, pick);
+        want_channels = _context->ch_layout.nb_channels;
     }
 
     _context->sample_fmt = codec->sample_fmts ? codec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
@@ -424,11 +497,64 @@ bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, con
     // variable, sending 1024-sample frames straight in, and libopus returns EINVAL.
     _variable_frame_size = (_context->frame_size <= 1);
 
+    // G711/其他"变长帧"编码器 frame_size 恒为 0，此时一帧的时长由我们自己定：
+    // 固定 20ms（与 RTP 打包粒度、实时性权衡一致），换算成采样点数即为 rate/50。
+    // 这里算一次存起来，静音兜底和 pts 推进都用同一个值，避免两条路径各算一套。
+    // Encoders like G711 always report frame_size == 0; we then choose 20ms per frame
+    // (matches the RTP packing granularity) = rate/50 samples. Compute it once so the
+    // silence fallback and the pts clock agree instead of each deriving its own value.
+    if (_variable_frame_size) {
+        _silence_samples = _context->sample_rate / 50;
+        if (_silence_samples <= 0) {
+            _silence_samples = 160;
+        }
+    } else {
+        _silence_samples = _context->frame_size;
+    }
+    // 一帧的毫秒时长，静音补帧的节奏与 pts 推进都以它为准
+    // Per-frame duration in ms; silence pacing and pts advancement both use it
+    _audio_frame_ms = (int64_t) _silence_samples * 1000LL / _context->sample_rate;
+    if (_audio_frame_ms <= 0) {
+        _audio_frame_ms = 20;
+    }
+    // 音频也写进 _frame_interval_ms：onEncode 的单调时钟与兜底推进都读它。
+    // G711 的 frame_size 是 0，旧代码在 onEncode 里落到 `next += 40` 的硬编码分支，
+    // 而 G711 一帧是 20ms → 静音时间轴按 2 倍速前进，观众端静音段被拉长一倍。
+    // 视频轨的 _frame_interval_ms 在 inputFrame_l 视频分支里另行赋值，不受影响。
+    // Also store it in _frame_interval_ms, which onEncode's monotonic clock and the
+    // fallback advance both read. G711 reports frame_size 0, so the old code fell into
+    // the hardcoded `next += 40` branch while a G711 frame is 20ms — silence advanced at
+    // 2x, so viewers saw the silent tail stretched to double length. The video track
+    // assigns _frame_interval_ms separately in inputFrame_l's video branch, unaffected.
+    _frame_interval_ms = _audio_frame_ms;
+
     InfoL << "audio encoder:" << codec->name
           << ", samplerate=" << _context->sample_rate
           << ", channels=" << _context->ch_layout.nb_channels
           << ", sample_fmt=" << av_get_sample_fmt_name(_context->sample_fmt)
-          << ", frame_size=" << _context->frame_size;
+          << ", frame_size=" << _context->frame_size
+          << ", variable_frame=" << _variable_frame_size
+          << ", frame_ms=" << _audio_frame_ms;
+
+    // AAC 目标轨必须在 addTrack 之前 ready，否则 RtspMuxer/MP4Muxer 直接把它丢掉
+    // （实测日志：`mpeg4-generic unready!` → RTSP 观众端完全没有音频轨）。
+    // AACTrack::ready() 只取决于 _cfg（AudioSpecificConfig）是否为空，而 _cfg 只能由
+    // setExtraData 填入，转码路径此前从不调用它 → 目标轨永远 unready。
+    // 好消息是 aac 编码器在 avcodec_open2 里就把 extradata（=AudioSpecificConfig）
+    // 生成好了，这里直接回填即可，无需预热编码。
+    // The AAC target track must be ready before addTrack, otherwise RtspMuxer/MP4Muxer
+    // drop it outright (measured: "mpeg4-generic unready!" -> RTP viewers got no audio
+    // track at all). AACTrack::ready() only depends on _cfg (AudioSpecificConfig) being
+    // non-empty, and _cfg is only ever set through setExtraData, which the transcode path
+    // never called — so the target track stayed unready forever. The aac encoder already
+    // fills extradata (=AudioSpecificConfig) inside avcodec_open2, so backfill it here;
+    // no warmup encode needed.
+    if (target && (_context->codec_id == AV_CODEC_ID_AAC || _context->codec_id == AV_CODEC_ID_OPUS)
+        && _context->extradata && _context->extradata_size > 0) {
+        target->setExtraData(_context->extradata, (size_t) _context->extradata_size);
+        InfoL << "audio target track extra data set, size=" << _context->extradata_size
+              << ", ready=" << target->ready();
+    }
     return true;
 }
 
@@ -554,11 +680,14 @@ bool FFmpegEncoder::inputSilence() {
     _flush_done = false;
 
     // 一帧的采样数与时长由编码器自身决定（libopus: 960 @48k = 20ms；
-    // AAC: 1024 @44.1k ≈ 23.2ms），不能用固定值，否则时间轴会漂。
+    // AAC: 1024 @44.1k ≈ 23.2ms；G711: frame_size=0，我们自己定 20ms = rate/50）。
+    // 不能用固定值，否则时间轴会漂。
     // The frame's sample count and duration come from the encoder itself
-    // (libopus: 960 @48k = 20ms; AAC: 1024 @44.1k ≈ 23.2ms).
+    // (libopus: 960 @48k = 20ms; AAC: 1024 @44.1k ≈ 23.2ms; G711 reports frame_size 0 so
+    // we fix it at 20ms = rate/50). Hardcoding would drift the timeline.
     int rate = _context->sample_rate > 0 ? _context->sample_rate : 48000;
-    int frame_size = _context->frame_size > 0 ? _context->frame_size : (rate / 50);
+    int frame_size = _silence_samples > 0 ? _silence_samples
+                     : (_context->frame_size > 0 ? _context->frame_size : (rate / 50));
 
     // 虚拟推进源时钟：静音帧在时间轴上紧跟上一帧，不产生空洞也不压缩。
     // 注意这里推进的是"若源端恢复后真实帧应落在哪里"的参考值，实际输出时间戳
@@ -567,6 +696,10 @@ bool FFmpegEncoder::inputSilence() {
     // timeline with no hole and no compression. This only tracks where a resumed
     // real frame "should" land; the actual output timestamp comes from the
     // monotonic clock in onEncode (see _silence_encoding).
+    // 用整数毫秒会累计误差（AAC 23.22ms 取整成 23ms，100 帧就差 22ms），
+    // 这里按采样计数累加，静音与真实帧走同一条采样时间轴。
+    // Integer ms accumulates error (AAC 23.22ms truncates to 23ms; 100 frames drift
+    // 22ms), so accumulate in samples: silence and real frames share one sample clock.
     if (_last_src_ms != AV_NOPTS_VALUE) {
         _last_src_ms += (int64_t) (frame_size * 1000LL / rate);
     } else {
@@ -667,13 +800,26 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
 
     // ---- 音频路径 ----
     if (_variable_frame_size) {
-        // 不需要对齐，直接编码  [AUTO-TRANSLATED:71a0d2b4]
-        // No alignment needed, encode directly
+        // 变长帧编码器（G711/MP3 之外的裸 PCM 类）不需要 FIFO 对齐，但单帧不能超过
+        // 编码器能接受的长度，也不能为 0；这里只做防御性校验。
+        // Variable-frame encoders need no FIFO alignment, but a single frame must be
+        // non-empty and within what the encoder accepts; validate defensively only.
         auto converted = formatFrame(frame);
         if (!converted) {
             return false;
         }
-        return encodeFrame(converted->get());
+        auto av_frame = converted->get();
+        if (!av_frame || av_frame->nb_samples <= 0) {
+            return false;
+        }
+        // 变长帧也要给 pts：编码器 time_base 是 1/sample_rate，按累计采样数推进，
+        // 否则包出来 pts 全为空/NA，封装层直接报 "missing PTS" 并丢弃音频。
+        // Variable-frame output still needs a pts: the encoder time_base is
+        // 1/sample_rate and we advance by accumulated samples; otherwise packets carry
+        // no pts, muxers report "missing PTS" and drop the audio entirely.
+        av_frame->pts = _frame_index;
+        _frame_index += av_frame->nb_samples;
+        return encodeFrame(av_frame);
     }
 
     // 固定帧长：攒够 frame_size 再编码；与静音兜底共用 encodeAudio_l，

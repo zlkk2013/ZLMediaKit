@@ -13,6 +13,7 @@
 #include "TranscodeSink.h"
 #include "Extension/Factory.h"
 #include "Util/util.h"
+#include "Common/Parser.h"   // StrCaseCompare：别名表要不区分大小写
 #include "Common/config.h"
 #include <atomic>
 
@@ -20,6 +21,53 @@ using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
+
+/**
+ * 把配置里写的 codec 名解析成 CodecId，容忍常见别名。
+ *
+ * 只看 zlm 的规范名（PCMA/PCMU/MP3/mpeg4-generic/opus/H264/H265）容易踩坑：
+ * 运维写 `g711a`、`g711u`、`aac`、`hevc` 都是很自然的，而 getCodecId 对不认识
+ * 的字符串只返回 CodecInvalid，最终表现为「转码被静默关闭」——配置看起来生效了，
+ * 实际走的透传，很难发现。所以这里补一张别名表，并且认不出时打 ErrorL 并列出
+ * 合法取值，让人一眼看到问题。
+ *
+ * Resolves a configured codec name to CodecId, tolerating common aliases. Only the
+ * canonical names (PCMA/PCMU/MP3/mpeg4-generic/opus/H264/H265) are understood by
+ * getCodecId, but `g711a`, `g711u`, `aac`, `hevc` are what people naturally write;
+ * an unknown string silently became CodecInvalid and quietly disabled transcoding.
+ * Aliases fix the common cases, and an unknown name is now an ErrorL listing the
+ * accepted values instead of a bare warning.
+ */
+static CodecId parseCodecName(const std::string &raw, const char *what) {
+    auto name = raw;
+    // 前后空白与大小写都容忍 / tolerate surrounding blanks and case
+    auto b = name.find_first_not_of(" \t");
+    auto e = name.find_last_not_of(" \t");
+    name = (b == std::string::npos) ? "" : name.substr(b, e - b + 1);
+    if (name.empty()) {
+        return CodecInvalid;
+    }
+    static const std::map<std::string, CodecId, StrCaseCompare> alias = {
+            {"g711a", CodecG711A}, {"pcma", CodecG711A}, {"alaw", CodecG711A},
+            {"g711u", CodecG711U}, {"pcmu", CodecG711U}, {"mulaw", CodecG711U},
+            {"aac",   CodecAAC},   {"mpeg4-generic", CodecAAC},
+            {"mp3",   CodecMP3},
+            {"opus",  CodecOpus},
+            {"h264",  CodecH264},  {"avc", CodecH264},
+            {"h265",  CodecH265},  {"hevc", CodecH265},
+    };
+    auto it = alias.find(name);
+    if (it != alias.end()) {
+        return it->second;
+    }
+    auto codec = getCodecId(name);
+    if (codec == CodecInvalid) {
+        ErrorL << "unknown transcode " << what << " codec: '" << raw
+               << "'. Accepted: PCMA(g711a), PCMU(g711u), AAC(mpeg4-generic), MP3, opus, "
+                  "H264, H265(hevc); empty means don't transcode this kind of track";
+    }
+    return codec;
+}
 
 TranscodeOption TranscodeOption::loadFromIni() {
     TranscodeOption option;
@@ -30,8 +78,8 @@ TranscodeOption TranscodeOption::loadFromIni() {
     if (!option.enable) {
         return option;
     }
-    option.audio_codec = getCodecId(ini[kTranscodeAudioCodec].as<std::string>());
-    option.video_codec = getCodecId(ini[kTranscodeVideoCodec].as<std::string>());
+    option.audio_codec = parseCodecName(ini[kTranscodeAudioCodec].as<std::string>(), "audio");
+    option.video_codec = parseCodecName(ini[kTranscodeVideoCodec].as<std::string>(), "video");
     option.bitrate = ini[kTranscodeBitrate].as<int>();
     option.sample_rate = ini[kTranscodeSampleRate].as<int>();
     option.on_demand = ini[kTranscodeOnDemand].as<bool>();
@@ -226,6 +274,15 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         auto av_ctx = ctx.encoder->getContext();
         if (av_ctx && av_ctx->frame_size > 0 && av_ctx->sample_rate > 0) {
             ctx.frame_interval_ms = (int) (av_ctx->frame_size * 1000LL / av_ctx->sample_rate);
+        } else if (av_ctx && av_ctx->sample_rate > 0) {
+            // G711 这类变长帧编码器 frame_size 恒为 0，直接落回下面的 20ms 默认值就会
+            // 与实际帧长脱节：8kHz 下 160 采样 = 20ms 恰好对，但 48kHz 下同一帧长是
+            // 3.3ms，按 20ms 补帧会让静音只补到 1/6 的量。这里按编码器真实采样率算。
+            // Variable-frame encoders like G711 always report frame_size 0; falling back
+            // to the 20ms default decouples the pacing from the real frame length — 20ms
+            // happens to be right for 160 samples at 8kHz, but at 48kHz that frame spans
+            // 3.3ms, so padding on a 20ms beat only covers 1/6 of the gap.
+            ctx.frame_interval_ms = (int) (ctx.encoder->getAudioFrameMs());
         } else {
             ctx.frame_interval_ms = 20;
         }

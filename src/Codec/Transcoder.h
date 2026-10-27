@@ -180,6 +180,16 @@ public:
     CodecId getCodecId() const override { return _codec_id; }
     const AVCodecContext *getContext() const { return _context.get(); }
 
+    /**
+     * 一帧音频的毫秒时长：固定帧长取 frame_size/rate，变长帧（G711 frame_size=0）
+     * 按 20ms 计。静音兜底的补帧节奏必须用它，否则会与实际帧长脱节。
+     *
+     * Per-frame audio duration in ms: frame_size/rate for fixed-frame encoders, 20ms for
+     * variable-frame ones (G711 reports frame_size 0). The silence fallback must pace on
+     * this value or it drifts from the real frame length.
+     */
+    int getAudioFrameMs() const { return (int) _audio_frame_ms; }
+
     /** 编码器是否可用（构造成功即为 true，供上层做能力判定） */
     bool available() const { return _context && _codec; }
 
@@ -191,7 +201,14 @@ private:
     bool drainEncoder();
 
     bool openVideoCodec(int width, int height, int bitrate, const AVCodec *codec);
-    bool openAudioCodec(int samplerate, int channel, int bitrate, const AVCodec *codec);
+    /**
+     * @param target 目标轨（音频）。用于回填 extradata 让 AACTrack::ready() 变真，
+     *               否则 RtspMuxer/MP4Muxer 会把未就绪的转码轨直接丢弃。
+     *               Target audio track. Used to backfill extradata so AACTrack::ready()
+     *               becomes true; otherwise RtspMuxer/MP4Muxer drop the unready track.
+     */
+    bool openAudioCodec(int samplerate, int channel, int bitrate, const AVCodec *codec,
+                        const Track::Ptr &target = nullptr);
 
     /** 把 FFmpegFrame 转成编码器要求的像素格式/采样格式 */
     FFmpegFrame::Ptr formatFrame(const FFmpegFrame::Ptr &frame);
@@ -208,6 +225,10 @@ private:
 
     /** OPUS 等允许变长帧的编码器，不需要 FIFO 对齐 */
     bool _variable_frame_size = false;
+    /** 一帧的采样点数：固定帧长编码器取 frame_size，变长帧（G711）取 rate/50 */
+    int _silence_samples = 0;
+    /** 一帧的毫秒时长，静音补帧节奏与 pts 推进共用 */
+    int64_t _audio_frame_ms = 20;
     /** 输出帧的 track index，由所属 track 决定 */
     int _track_index = -1;
     /** 输出时间戳（毫秒），自维护严格单调 */
