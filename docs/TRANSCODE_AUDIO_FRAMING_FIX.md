@@ -232,8 +232,9 @@ RFC 3551 里 pt=14 的名字就是 MPA。
 | 项 | 状态 | 原因 |
 |---|---|---|
 | H265 源 → H264（RTSP 进 RTSP 出） | **转码成功但 SDP 不更新** | 日志证明 `H265 -> H264` 已登记、libx264 出 400+ 帧，但 RTSP 推流进来的源在换轨前就生成了 SDP，拉流端仍显示 hevc |
-| VP8 / VP9 | 无法投递 | 有 libvpx 编码器，但 `Rtsp.h` 里没有对应载荷类型 |
-| AV1 / H266 | 未接 | 无编码器分支，也无载荷 |
+| VP8 / VP9 | ~~无法投递~~ **已打通** | 旧归因「`Rtsp.h` 里没有对应载荷类型」是错的：动态 PT 96 + rtpmap 一直是对的，真正的卡点是 warmup 拿不到关键帧（裸帧 codec 没有 SPS/PPS）与 libvpx 默认离线档。`h264/hevc → vp8/vp9` 实测 0 解码错误 |
+| AV1 | **已打通** | 接 libaom-av1（lag-in-frames=0）；ffmpeg 客户端无 AV1 的 RTP 解包器，用 `scripts/av1_rtp_verify.py` 自解包验证 |
+| H266 | 打不通（依赖缺失） | ffmpeg 无 VVC 编码器（只有解码器），且 ZLM 侧无 H266 插件/打包器 |
 | G722.1 / SVAC | 未做 | 需要 ffmpeg 二次开发（私有编解码器） |
 
 ### 10.4 H265 源 → H264：查到根因，未修完

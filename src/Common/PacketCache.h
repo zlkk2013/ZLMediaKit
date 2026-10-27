@@ -13,6 +13,7 @@
 
 #include "Common/config.h"
 #include "Util/List.h"
+#include <mutex>
 
 namespace mediakit {
 // / 缓存刷新策略类  [AUTO-TRANSLATED:bd941d15]
@@ -43,9 +44,19 @@ public:
     virtual ~PacketCache() = default;
 
     void inputPacket(uint64_t stamp, bool is_video, std::shared_ptr<packet> pkt, bool key_pos) {
+        // 合写缓存必须是线程安全的：转码场景下视频帧来自编码器线程、音频帧来自
+        // 推流端线程，两条线程会同时进到同一个 PacketCache。flush() 里
+        // `onFlush(std::move(_cache))` 与随后重建 _cache 之间有窗口，另一个线程
+        // 在窗口里 emplace_back 就会踩到空的 _cache → SIGSEGV（实测 50~100 个包后崩）。
+        // The merge-write cache must be thread safe: with transcoding, video frames come
+        // from the encoder thread while audio frames come from the publisher thread, and
+        // both enter the same PacketCache. flush() moves _cache out and only then
+        // reassigns it; another thread appending inside that window dereferences a null
+        // _cache -> SIGSEGV (measured after 50-100 packets).
+        std::lock_guard<std::mutex> lck(_mtx);
         bool flag = flushImmediatelyWhenCloseMerge();
         if (!flag && _policy.isFlushAble(is_video, key_pos, stamp, _cache->size())) {
-            flush();
+            flush_l();
         }
 
         // 追加数据到最后  [AUTO-TRANSLATED:e24ccfb6]
@@ -56,11 +67,26 @@ public:
         }
 
         if (flag) {
-            flush();
+            flush_l();
         }
     }
 
     void flush() {
+        std::lock_guard<std::mutex> lck(_mtx);
+        flush_l();
+    }
+
+    virtual void clearCache() {
+        std::lock_guard<std::mutex> lck(_mtx);
+        _cache->clear();
+    }
+
+    virtual void onFlush(std::shared_ptr<packet_list>, bool key_pos) = 0;
+
+private:
+    /// 调用方必须已持有 _mtx
+    /// Caller must already hold _mtx
+    void flush_l() {
         if (_cache->empty()) {
             return;
         }
@@ -69,13 +95,6 @@ public:
         _key_pos = false;
     }
 
-    virtual void clearCache() {
-        _cache->clear();
-    }
-
-    virtual void onFlush(std::shared_ptr<packet_list>, bool key_pos) = 0;
-
-private:
     bool flushImmediatelyWhenCloseMerge() {
         // 一般的协议关闭合并写时，立即刷新缓存，这样可以减少一帧的延时，但是rtp例外  [AUTO-TRANSLATED:54eba701]
         // Generally, when the protocol closes the merge write, the cache is refreshed immediately, which can reduce the delay of one frame, but RTP is an exception.
@@ -93,6 +112,7 @@ private:
 
 private:
     bool _key_pos = false;
+    std::mutex _mtx;
     policy _policy;
     std::shared_ptr<packet_list> _cache;
 };

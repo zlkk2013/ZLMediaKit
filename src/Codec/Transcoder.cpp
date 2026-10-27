@@ -156,7 +156,21 @@ public:
         : FrameFromBuffer<FrameFromPtr>(codec, buf, dts, pts, prefix) {
     }
 
+    /**
+     * 裸帧 codec（VP8/VP9/AV1）的关键帧只能由编码器包的 AV_PKT_FLAG_KEY 给出：
+     * 它们没有 NAL 头可以解析。走 NAL 判定的默认分支会按码流首字节瞎猜，
+     * 结果 GOP 缓存不从关键帧起、观众中途接入解不出来。
+     * For raw-packet codecs (VP8/VP9/AV1) the keyframe flag can only come from the
+     * encoder's AV_PKT_FLAG_KEY — they have no NAL header to parse. The NAL-based
+     * default would guess from the first byte of the bitstream, so the GOP cache
+     * would not restart at a keyframe and mid-stream viewers could not decode.
+     */
+    void setKeyFrameFromPacket(bool key) { _key_from_packet = key; }
+
     bool keyFrame() const override {
+        if (isRawPacketCodec()) {
+            return _key_from_packet;
+        }
         auto ptr = nalHeader();
         if (!ptr) {
             return false;
@@ -175,6 +189,14 @@ public:
     }
 
     bool configFrame() const override {
+        // 裸帧 codec 没有独立的 config 帧（sequence header 就带在关键帧里），
+        // 当成 config 会让下游跳过这一帧的画面
+        // Raw-packet codecs have no standalone config frame (the sequence header
+        // rides along with the keyframe); claiming otherwise makes downstream skip
+        // the picture entirely
+        if (isRawPacketCodec()) {
+            return false;
+        }
         auto ptr = nalHeader();
         if (!ptr) {
             return false;
@@ -188,6 +210,12 @@ public:
     }
 
 private:
+    bool isRawPacketCodec() const {
+        auto codec = getCodecId();
+        return codec == CodecVP8 || codec == CodecVP9 || codec == CodecAV1;
+    }
+
+    bool _key_from_packet = false;
     const uint8_t *nalHeader() const {
         // size 太短时保守当非关键帧：调用方（emit）保证至少 4 字节起始码 + 1 字节 NAL 头，
         // 但热身/异常路径下也不能越界读。
@@ -342,6 +370,25 @@ static const AVCodec *findEncoder(CodecId codec_id) {
         case CodecMP3:  return find("libmp3lame", AV_CODEC_ID_MP3);
         case CodecVP8:  return find("libvpx", AV_CODEC_ID_VP8);
         case CodecVP9:  return find("libvpx-vp9", AV_CODEC_ID_VP9);
+        // AV1 优先 libaom-av1 而不是更快的 libsvtav1：libaom 在 lag-in-frames=0 下
+        // 第一帧就出包（warmup 才能拿到关键帧、目标轨才能 ready），而 SVT-AV1 有
+        // 内部 lookahead，首帧一个包都不吐（实测 warmup produced no packet），
+        // 目标轨因此永远 unready，整条视频轨被 muxer 丢弃。
+        // AV1 prefers libaom-av1 over the faster libsvtav1: with lag-in-frames=0 libaom
+        // emits a packet on the very first frame (what warmup needs to make the target
+        // track ready), while SVT-AV1 buffers internally and emits nothing for the first
+        // frame (measured: "warmup produced no packet"), leaving the track forever
+        // unready so every muxer drops the whole video track.
+        case CodecAV1:  return find("libaom-av1", AV_CODEC_ID_AV1);
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+        // H266/VVC：ffmpeg 侧只有解码器（vvc dec），编码器要靠外部 libvvenc，
+        // 主流发行版/conda 构建都没带。这里显式说明，而不是落到 default 的
+        // 「未找到编码器」——否则看起来像我们没接。
+        // H266/VVC: ffmpeg ships a decoder only; encoding needs the external libvvenc,
+        // which neither distro nor conda builds enable. Fail with a reason instead of
+        // the generic "encoder not found".
+        case CodecH266: return find("libvvenc", AV_CODEC_ID_VVC);
+#endif
         default:        return nullptr;
     }
 }
@@ -601,6 +648,49 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
         // Explicitly disable scene-cut IDR, same reason as H264
         std::string params = "log-level=error:scenecut=0";
         av_opt_set(_context->priv_data, "x265-params", params.c_str(), 0);
+    } else if (codec->id == AV_CODEC_ID_VP8 || codec->id == AV_CODEC_ID_VP9) {
+        // libvpx 默认是「离线高质量」档：deadline=good + lag-in-frames=25（前向参考）。
+        // 直播必须显式切实时模式，否则两个后果都实测到了：
+        //   1. 第一帧不出包 —— warmup 拿不到关键帧，目标轨永远 unready，
+        //      RtspMuxer 直接 "VP9 unready!" 丢掉整条轨（日志 "warmup produced no packet"）
+        //   2. 每帧编码耗时远超实时，延迟迅速累积
+        // libvpx defaults to its offline/high-quality profile: deadline=good with
+        // lag-in-frames=25. Live needs realtime mode explicitly — both failure modes
+        // were measured: (1) no packet for the first frame, so warmup never gets a
+        // keyframe and the target track stays unready ("VP9 unready!", track dropped);
+        // (2) per-frame encode cost far above realtime.
+        av_opt_set(_context->priv_data, "deadline", "realtime", 0);
+        // cpu-used 8 = 实时档的速度/质量折衷（VP8/VP9 实时档最大值都是 8）
+        // cpu-used 8 is the realtime-profile sweet spot (max is 8 for both)
+        av_opt_set_int(_context->priv_data, "cpu-used", 8, 0);
+        av_opt_set_int(_context->priv_data, "lag-in-frames", 0, 0);
+        // auto-alt-ref 依赖 lookahead，lag=0 时必须一起关掉，否则 open2 失败
+        // auto-alt-ref needs lookahead; must be off together with lag=0 or open2 fails
+        av_opt_set_int(_context->priv_data, "auto-alt-ref", 0, 0);
+        // 直播不重传：开错误恢复，单包丢失不至于整帧花掉
+        // Live has no retransmission: enable error resilience so one lost packet
+        // does not wreck the whole frame
+        av_opt_set_int(_context->priv_data, "error-resilient", 1, 0);
+    } else if (codec->id == AV_CODEC_ID_AV1) {
+        // AV1 的 lookahead 同样必须关：libaom 默认 lag-in-frames=25，
+        // 首帧不出包会让 warmup 失败（与 libvpx 同一个坑）
+        // AV1 lookahead must be off for the same reason as libvpx: the default
+        // lag-in-frames=25 emits nothing on the first frame and warmup fails
+        if (std::string(codec->name) == "libaom-av1") {
+            av_opt_set_int(_context->priv_data, "lag-in-frames", 0, 0);
+            av_opt_set_int(_context->priv_data, "cpu-used", 8, 0);
+            // 不能用 usage=realtime：实测这条 nonrd 快路径在 libaom 3.9.1 上会踩坏堆
+            // （崩溃栈 aom_memalign <- av1_alloc_pmc <- av1_nonrd_use_partition，
+            // 6 次里 1 次）。默认 usage=good + cpu-used=8 已足够实时，且稳定。
+            // Do NOT use usage=realtime: on libaom 3.9.1 this nonrd fast path corrupts
+            // the heap (crash stack aom_memalign <- av1_alloc_pmc <-
+            // av1_nonrd_use_partition, 1 in 6 runs). Default usage=good + cpu-used=8
+            // is fast enough for realtime and stable.
+            _context->thread_count = 1;
+        } else {
+            // libsvtav1 等：preset 越大越快（0..13）
+            av_opt_set_int(_context->priv_data, "preset", 10, 0);
+        }
     }
     auto ret = avcodec_open2(_context.get(), codec, nullptr);
     if (ret < 0) {
@@ -1162,6 +1252,37 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
         return false;
     }
 
+    // 裸帧 codec（VP8/VP9/AV1）没有 Annex-B 起始码，也没有 SPS/PPS：宽高只能从
+    // 关键帧自身（VP8/VP9 的帧头、AV1 的 sequence header OBU）解析。所以这里把
+    // 编码器首包整帧喂给目标轨，只为让它 ready；不往后转发（同下，pts=0 与真实
+    // 时间轴不连续，会让 RTP 打包器时序错乱）。
+    // Raw-packet codecs (VP8/VP9/AV1) have no Annex-B start codes and no SPS/PPS: the
+    // dimensions live inside the keyframe itself (VP8/VP9 frame header, AV1 sequence
+    // header OBU). Feed the encoder's first packet to the target track purely to make
+    // it ready; do not forward it (see below: pts=0 is discontinuous with the real
+    // timeline and corrupts the RTP packer's ordering).
+    if (_codec_id == CodecVP8 || _codec_id == CodecVP9 || _codec_id == CodecAV1) {
+        int fed = 0;
+        for (auto &f : config_frames) {
+            size_t prefix = f->prefixSize();
+            if (f->size() <= prefix) {
+                continue;
+            }
+            auto buf = std::make_shared<toolkit::BufferLikeString>();
+            buf->assign(f->data() + prefix, f->size() - prefix);
+            auto one = std::make_shared<TranscodedFrame>(_codec_id, buf, 0, 0, 0);
+            one->setKeyFrameFromPacket(true);
+            video->inputFrame(one);
+            ++fed;
+            if (video->ready()) {
+                break;
+            }
+        }
+        InfoL << "warmup done (raw packet codec): fed=" << fed << ", ready=" << video->ready()
+              << ", size=" << video->getVideoWidth() << "x" << video->getVideoHeight();
+        return video->ready();
+    }
+
     // 只把预热包作为 config 帧喂给目标轨，用于提取 VPS/SPS/PPS 让 ready() 变真。
     // 注意不要把这些包当作普通帧往后传：它们的时间戳是 0，与真实流不连续，
     // 会让 RTP 打包器的环形缓冲时序错乱（曾导致 RtspMediaSource::onWrite 崩溃）。
@@ -1355,6 +1476,25 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
         }
     }
     bool is_key = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+
+    // 裸帧 codec（VP8/VP9/AV1）没有 Annex-B 起始码，编码包本身就是完整帧：
+    // 原样交出、prefixSize=0。若沿用下面的 emit（前置 4 字节起始码 + prefix=4），
+    // 下游 RtpEncoder 会把那 4 个字节当成 VP8 的 payload descriptor /
+    // AV1 的 aggregation header，观众端直接解不出来。
+    // Raw-packet codecs (VP8/VP9/AV1) carry no Annex-B start code — the encoded packet
+    // IS the frame. Hand it over untouched with prefixSize=0. Reusing emit() below
+    // (which prepends a 4-byte start code and reports prefix=4) makes the RTP packers
+    // read those 4 bytes as a VP8 payload descriptor / AV1 aggregation header and the
+    // viewer cannot decode anything.
+    if (_codec_id == CodecVP8 || _codec_id == CodecVP9 || _codec_id == CodecAV1) {
+        auto buf = std::make_shared<toolkit::BufferLikeString>();
+        buf->assign((const char *) packet->data, (size_t) packet->size);
+        auto frame = std::make_shared<TranscodedFrame>(_codec_id, buf, next_ms, next_ms, 0);
+        frame->setKeyFrameFromPacket(is_key);
+        frame->setIndex(_track_index);
+        _cb(frame);
+        return;
+    }
 
     auto emit = [&](const char *nal, size_t nal_len, size_t /*prefix*/) {
         // 统一按 4 字节起始码组装：下游 H265RtpEncoder / 各类 Muxer 只用 prefixSize
