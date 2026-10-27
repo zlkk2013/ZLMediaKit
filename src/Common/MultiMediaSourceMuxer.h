@@ -230,6 +230,22 @@ protected:
     bool onTrackFrame(const Frame::Ptr &frame) override;
     bool onTrackFrame_l(const Frame::Ptr &frame);
 
+#if defined(ENABLE_FFMPEG)
+    /**
+     * 转码输出帧的回灌入口（在解码/编码线程调用，不是源线程）。
+     * 下游 muxer（fmp4/ts/hls 的 BufferLikeString、paced sender 等）都假定单线程，
+     * 而源轨透传帧来自 RTP 线程、转码帧来自解码线程，两路并发写同一个 muxer
+     * 会破坏堆内存（实测 5 秒内 malloc abort，栈停在 MP4FileMemory::onWrite）。
+     * 所以这里和 onTrackFrame 用同一把递归锁串行化。
+     *
+     * Re-entry point for transcoded frames (called on the codec thread, not the
+     * source thread). Downstream muxers assume single-threaded input; concurrent
+     * writes from the pass-through path (RTP thread) and the transcoder corrupt
+     * the heap, so both paths share one recursive lock.
+     */
+    void onTranscodeFrame(const Frame::Ptr &frame);
+#endif//ENABLE_FFMPEG
+
 private:
     void createGopCacheIfNeed();
     std::shared_ptr<MediaSinkInterface> makeRecorder(Recorder::type type);
@@ -246,6 +262,16 @@ private:
     toolkit::Ticker _last_check;
     std::unordered_map<int, Stamp> _stamps;
     std::weak_ptr<Listener> _track_listener;
+    /**
+     * 串行化下游帧分发：源轨透传帧在源线程、转码帧在解码线程，下游 muxer 不是
+     * 线程安全的（见 onTranscodeFrame 说明）。递归锁，因为透传路径内部可能同步
+     * 回调出转码帧。
+     *
+     * Serializes downstream frame distribution: pass-through frames arrive on the
+     * source thread while transcoded frames arrive on codec threads. Recursive
+     * because the pass-through path can synchronously emit a transcoded frame.
+     */
+    std::recursive_mutex _frame_mtx;
 #if defined(ENABLE_RTPPROXY)
     std::unordered_multimap<std::string, std::tuple<RingType::RingReader::Ptr, std::weak_ptr<RtpSender>>> _rtp_sender;
 #endif // ENABLE_RTPPROXY

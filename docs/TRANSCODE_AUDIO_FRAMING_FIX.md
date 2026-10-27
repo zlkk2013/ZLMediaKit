@@ -231,35 +231,124 @@ RFC 3551 里 pt=14 的名字就是 MPA。
 
 | 项 | 状态 | 原因 |
 |---|---|---|
-| H265 源 → H264（RTSP 进 RTSP 出） | **转码成功但 SDP 不更新** | 日志证明 `H265 -> H264` 已登记、libx264 出 400+ 帧，但 RTSP 推流进来的源在换轨前就生成了 SDP，拉流端仍显示 hevc |
+| H265 源 → H264（RTSP 进 RTSP 出） | **已修复**（见 10.4） | direct-proxy 把源 RTP 直接透传，转码输出进不了观众的链路 |
 | VP8 / VP9 | 无法投递 | 有 libvpx 编码器，但 `Rtsp.h` 里没有对应载荷类型 |
 | AV1 / H266 | 未接 | 无编码器分支，也无载荷 |
 | G722.1 / SVAC | 未做 | 需要 ffmpeg 二次开发（私有编解码器） |
 
-### 10.4 H265 源 → H264：查到根因，未修完
+### 10.4 H265 源 → H264（RTSP 进 RTSP 出）：已修复
 
 **现象**：H265 经 RTSP 推入、配 `video_codec=H264`，转码日志显示成功（`H265 -> H264`
-已登记、libx264 出了 400+ 帧），但拉流端 `DESCRIBE` 仍返回 H265 的 SDP，且客户端按
-hevc 解码「0 错误」——说明**观众确实拿到的是源的 H265 RTP**。
+已登记、libx264 出了 400+ 帧），但拉流端 `DESCRIBE` 仍返回 H265 的 SDP，客户端按
+hevc 解码「0 错误」——观众拿到的是**源的 H265 RTP**。
 
-**排查与结论**：
+**根因**：RTSP → RTSP 默认走 direct-proxy（`[rtsp] directProxy=1`）。这条模式下
 
-1. `RtspMediaSourceImp::setSdp()` 里 `if (!getSdp().empty()) return;` —— SDP 一旦设定
-   就不再更新。已加 `RtspMediaSource::updateSdpCache()`（只刷新对外 SDP，不重载
-   demuxer）并在 `RtspMediaSourceMuxer::addTrackCompleted()` 里按需调用。
-2. **但 DESCRIBE 返回的 SDP 依然是推流端的原始 SDP**（带 `a=control:streamid=0` 与
-   `sprop-vps/sps/pps`），不是我们 muxer 生成的（muxer 生成的是 `a=control:trackID=`）。
-   说明这条拓扑下 `RtspMediaSourceMuxer` 根本没接管该源。
+- `RtspMediaSourceImp::onWrite` 把源 RTP 原样透传给观众（`RtspMediaSource::onWrite`）；
+- `setProtocolOption` 把 `_option.enable_rtsp = !directProxy` ⇒ **muxer 根本不建 RTSP 输出源**；
+- 而转码换轨只发生在 `MultiMediaSourceMuxer` 内部。
 
-**根因**：RTSP 进 → RTSP 出时，ZLM 默认走 **direct-proxy**（`RtspMediaSourceImp::onWrite`
-在 `directProxy` 为真时直接透传源 RTP，不解复用）。转码换轨发生在
-`MultiMediaSourceMuxer` 里，而观众连接的 `RtspMediaSource` 是推流端那个源对象 ⇒
-**转码输出不进入这条链路**，改 SDP 也没用。
+三条合起来：观众连的是推流端那个 `RtspMediaSourceImp`（SDP 是推流端的原始 SDP，
+`a=control:streamid=` + `sprop-vps/sps/pps`），转码输出只流向 rtmp/hls/ts 等 muxer 打开的
+协议。两条路不交叉，改 SDP 缓存也没用。
 
-**正确修法**（未做）：对「源是 RTSP 且该流启用转码」的情况关闭 direct-proxy，
-让帧走 muxer；同时把 SDP 改成 muxer 生成的版本（`updateSdpCache` 已就绪）。
-需要动 `RtspMediaSourceImp::onWrite` 的 directProxy 判定，并处理关闭代理后的
-RTP 解复用开销，属于架构级改动，单独一轮做。
+**改法**（4 处；只在"本流启用转码"时改变行为）：
 
-> 对比：H264 经 **RTMP** 推入转 H265 是正常的 —— 那条路径的 RTSP 输出源由 muxer
-> 新建，SDP 本来就是转码后的轨。
+| 位置 | 改动 |
+|---|---|
+| `RtspMediaSourceImp::resolveTranscodeEnable()`（新增） | 用 `TranscodeRuntime::instance().resolve(getMediaTuple(), &source)` 解析本流是否启用转码，结果缓存进 `_transcode_enabled`。**不是**每个 RTP 包解析一次配置（`resolve` 会遍历 mINI + 解析所有 `stream_rule`） |
+| `RtspMediaSourceImp::setProtocolOption()` | `_option.enable_rtsp = direct_proxy ? _transcode_enabled : true` —— 启用转码时让 muxer 建自己的 RTSP 输出源（SDP 由 muxer 生成，带 `a=control:trackID=`） |
+| `RtspMediaSourceImp::onWrite()` | `if (directProxy && !_transcode_enabled)` 才透传源 RTP；启用转码时只做 `_demuxer->inputRtp()`，帧经 muxer 里的 `TranscodeSink` 换轨后由 muxer 的 `RtspMediaSource` 重新打 RTP 发给观众 |
+| `RtspMediaSourceMuxer::addTrackCompleted()`（上一提交已加） | `updateSdpCache(getSdp())` 刷新对外 SDP。之前它"没生效"，是因为观众连的是上面那个 Imp；现在观众连的就是这个 muxer 源，SDP 自然是转码后的轨 |
+
+`_all_track_ready && !_muxer->isEnabled()` 分支语义保持不变（无人观看且输出按需时跳过解复用），
+只是该分支下不再有透传写入；关键帧判定仍归 `_demuxer->inputRtp()` 与 muxer 侧的
+`keyFrame()/configFrame()`，秒开/开播花屏的风险点没有被改动。
+
+**顺带修掉的并发缺陷（必现崩溃）**：开通 RTSP 输出后，转码帧在解码线程产出、未转码的轨
+（例如只转视频时的音频）仍在 RTP 线程，两条线程同时写同一个下游 muxer（fmp4 的
+`BufferLikeString` 等）。实测撑不到 5 秒就 `malloc` abort：
+
+```
+[7]  std::string::__grow_by                     ← 堆被踩坏
+[9]  mediakit::MP4FileMemory::onWrite
+[10] mov_write_styp
+[11] fmp4_write_fragment
+[12] MP4MuxerMemory::inputFrame
+[13] MultiMediaSourceMuxer::onTrackFrame_l
+[15] TranscodeSink::onEncoded                   ← 解码线程
+```
+
+`MultiMediaSourceMuxer::onTrackFrame_l()` 现在加递归锁，把下游分发串行化（源线程 / 解码线程 /
+平滑发送定时器线程都汇到这里）。锁**不**包住 `_paced_sender->inputFrame()` —— 平滑发送的帧是
+`FramePacedSender` 的定时器线程回调进 `onTrackFrame_l`，如果外层持锁再抢 `FramePacedSender::_mtx`
+就会与它交叉死锁。
+
+**实测（真机，macOS，H265 640x360@15fps，RTSP 推 → RTSP 拉）**
+
+用例全部由 `scripts/rtsp_transcode_check.py` 跑（裸 socket 发 DESCRIBE、ffprobe 属性、包数、
+`-f null` 解码错误、落盘后逐帧 framemd5）：
+
+| 用例 | 拉流 ffprobe | DESCRIBE SDP | 5 秒包数 | 解码错误 | 拉流落盘 |
+|---|---|---|---|---|---|
+| H265 → H264 | **h264 640x360** | `rtpmap:96 H264/90000` + `a=control:trackID=0/1`，无 `streamid=`、无 `sprop-vps` | 75 | 0 | 5.017s / 197531 B / 77 帧 |
+| H264 → H265 | **hevc 640x360** | `rtpmap:96 H265/90000` + `sprop-vps/sps/pps` + `trackID=0/1` | 77 | 0 | 5.017s / 147765 B / 77 帧 |
+| H265 → H264 + AAC→opus | h264 640x360 | `rtpmap:96 H264/90000` + `rtpmap:97 opus/48000/2` + `trackID=0/1` | 77 | 0 | 5.017s / 197694 B |
+
+转码后 SDP 的 video 段（H265→H264，`sprop-parameter-sets` 是 libx264 新产出的 SPS/PPS，
+不是源的 `sprop-vps`）：
+
+```
+m=video 0 RTP/AVP 96
+a=fmtp:96 packetization-mode=1; profile-level-id=640016; sprop-parameter-sets=Z2QAFqy0BQF/ywgAAAMACAAAAwD0eLF1,aO88sA==
+a=rtpmap:96 H264/90000
+a=control:trackID=0
+m=audio 0 RTP/AVP 97
+a=rtpmap:97 mpeg4-generic/44100/1
+a=control:trackID=1
+```
+
+**画面取证**：拉流转码流的 2s 处抽帧是一帧正常的彩条测试图（含时间码叠加），不是绿屏/花屏。
+
+**确认真的重编码**：把拉流解码帧的 framemd5 与源解码帧比对 —— H265→H264 命中 0/77、
+H264→H265 命中 0/77（0%），即输出帧与源帧完全不同；对照组（不开转码）是 100% 命中。
+
+**基线回归（不开转码，direct-proxy 行为必须一模一样）**
+
+改前二进制（`git stash` 干净树编译）vs 改后二进制，同源同参数，同一条推拉拓扑：
+
+| 源 | 改前 | 改后 |
+|---|---|---|
+| H264 | h264 640x360，73 包，5.162s，**337346 B**，72 帧 | h264 640x360，73 包，5.162s，**337346 B**，72 帧 |
+| H265 | hevc 640x360，57 包，5.156s，**512613 B**，76 帧 | hevc 640x360，57 包，5.156s，**512613 B**，76 帧 |
+
+落盘文件字节数逐个相同；解码帧 72/72、76/76 全部命中源解码帧（未重编码、未丢帧）；
+DESCRIBE 仍返回推流端原始 SDP（`a=control:streamid=`），即 direct-proxy 没被误关。
+
+**持续吞吐（15 秒连续拉流）**：H265→H264 单视频 227 包 / 期望 225，音视频同转 229 / 225，
+均 0 解码错误 —— 转码不会是 "前 5 秒正常、后面卡住"。
+
+**新增已知限制（本次改动暴露，但不是本次引入）**：转码流的 RTSP **断连续推**会失败。
+对外 RTSP 源变成 muxer 的 `RtspMediaSource` 后，`RtspSession::handleReq_ANNOUNCE` 里
+`dynamic_pointer_cast<RtspMediaSourceImp>(src)` 拿不到推流端对象，直接 406。实测：
+
+| 配置 | 重推后推流进程 | 日志 |
+|---|---|---|
+| 开转码（H265→H264） | 立即退出 | `ANNOUNCE: Already publishing` ×1 |
+| 不开转码（direct-proxy） | 存活，继续出流 | 无 |
+
+这与上游 `directProxy=0` 的行为完全一致（非 direct-proxy 时 Imp 本来就不注册），但启用转码后
+**默认**落到这个模式，运营上必须知道。要修得让 muxer 的 RTSP 源能找回 `RtspMediaSourceImp`
+做所有权转移，单独一轮。
+
+**未验证**
+
+- 只验证了 RTSP 推 → RTSP 拉；RTSP 推 → RTMP/HLS/WebRTC 拉在关掉 direct-proxy 后走既有非代理
+  路径，本次未重跑回归（之前 `[rtsp] directProxy=0` 的既有行为未变，但转码叠加后未实测）
+- 多路并发（≥2 路同时 H265→H264）未测；`TranscodeRuntime` 规则表与 `_transcode_enabled` 缓存
+  是按流解析的，但并发下的 CPU/延迟未观测
+- `on_publish` 返回 `stream_replace` 同时启用按流转码规则时：`RtspMediaSourceImp` 用推流原始
+  tuple 解析，muxer 用替换后的 tuple 解析，两边判定可能不一致（未实测）
+- Windows / Linux 未跑
+- 运行环境噪声提示：本机同时有其他任务在跑 `MediaServer`（会 `pkill -f MediaServer`），
+  测试脚本因此内置了"服务被杀就整轮重试"，最终数据都来自完整跑完的轮次

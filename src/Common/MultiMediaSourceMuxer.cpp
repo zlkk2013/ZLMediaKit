@@ -729,16 +729,7 @@ bool MultiMediaSourceMuxer::onTrackReady(const Track::Ptr &track_ref) {
                 if (auto strong_self = weak_self.lock()) {
                     // 转码出来的帧走完整下游：时间戳修正 + 平滑 + 协议分发 + GOP 缓存
                     // Transcoded frames take the full downstream path
-                    auto stamped = frame;
-                    if (strong_self->_option.modify_stamp != ProtocolOption::kModifyStampOff) {
-                        stamped = std::make_shared<FrameStamp>(
-                            frame, strong_self->_stamps[frame->getIndex()], strong_self->_option.modify_stamp);
-                    }
-                    if (strong_self->_paced_sender) {
-                        strong_self->_paced_sender->inputFrame(stamped);
-                    } else {
-                        strong_self->onTrackFrame_l(stamped);
-                    }
+                    strong_self->onTranscodeFrame(frame);
                 }
             });
             // 登记到运行时：HTTP 接口据此查询状态 / 热更新参数；顺便打上流标签，
@@ -923,6 +914,25 @@ void MultiMediaSourceMuxer::addProbe(uint32_t probe_ms, const std::function<void
     });
 }
 
+#if defined(ENABLE_FFMPEG)
+void MultiMediaSourceMuxer::onTranscodeFrame(const Frame::Ptr &frame) {
+    Frame::Ptr stamped = frame;
+    if (_option.modify_stamp != ProtocolOption::kModifyStampOff) {
+        // _stamps 的查表与 Stamp 状态更新同样需要串行（只锁这一小段，
+        // 避免把锁带进 paced_sender 的临界区）
+        // The _stamps lookup / Stamp update needs the same serialization; keep the
+        // scope small so the lock is never held across paced_sender->inputFrame
+        std::lock_guard<std::recursive_mutex> lock(_frame_mtx);
+        stamped = std::make_shared<FrameStamp>(frame, _stamps[frame->getIndex()], _option.modify_stamp);
+    }
+    if (_paced_sender) {
+        _paced_sender->inputFrame(stamped);
+    } else {
+        onTrackFrame_l(stamped);
+    }
+}
+#endif//ENABLE_FFMPEG
+
 bool MultiMediaSourceMuxer::onTrackFrame(const Frame::Ptr &frame_in) {
     if (_on_frame) {
         _on_frame(frame_in);
@@ -948,6 +958,16 @@ bool MultiMediaSourceMuxer::onTrackFrame(const Frame::Ptr &frame_in) {
 }
 
 bool MultiMediaSourceMuxer::onTrackFrame_l(const Frame::Ptr &frame_in) {
+    // 下游分发的唯一串行点：源轨透传帧来自源线程、转码帧来自解码线程、
+    // 平滑发送的帧来自定时器线程，而下游 muxer（fmp4/ts/hls 的缓冲区）不是
+    // 线程安全的。锁只加在这里，不能包住 paced_sender->inputFrame，否则与
+    // FramePacedSender 自己的锁形成交叉死锁。
+    //
+    // Single serialization point for downstream dispatch: pass-through frames come
+    // from the source thread, transcoded frames from codec threads and paced frames
+    // from the timer thread. The lock must not wrap paced_sender->inputFrame, or it
+    // deadlocks against FramePacedSender's own mutex.
+    std::lock_guard<std::recursive_mutex> lock(_frame_mtx);
     auto frame = frame_in;
     bool ret = false;
     if (_rtmp) {
