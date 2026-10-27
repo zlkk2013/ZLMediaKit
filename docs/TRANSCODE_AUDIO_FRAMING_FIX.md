@@ -112,7 +112,65 @@ Decoder (codec none) not found for input stream #0:0
 
 PCMA/PCMU 在全部 5 种源采样率下都是 **250 包 / 5.000 秒**，时长不变量全部满足。
 
-## 8. 仍存在的已知缺陷：MP3 线上包数翻倍
+## 8. MP3 时长翻倍（已修复）
+
+### 8.1 现象
+
+MP3 目标：拉 5 秒，解码出 **10.211 秒 / 392 包**（应为 ~193 包 / 5 秒），且**所有源采样率都一样**。
+
+### 8.2 排查过程（三层排除）
+
+| 假设 | 取证 | 结论 |
+|---|---|---|
+| 编码器重复出包 | 插桩：`chunks=350 → pkts=350`，pts 步进 1152 | **排除**，编码器 1:1 |
+| 双 sink 实例 | 日志只有 1 次 `encoder ready` / 1 次 `track registered` | **排除** |
+| 服务端超速推流 | 量墙钟：拉 5 秒实际花了 **10.28 秒**，内容 10.21 秒 | **排除**，是 1 倍速推的 |
+
+关键推论：拉流耗时和内容长度都翻倍，但包的间隔正常（26ms/包）—— 说明**时间戳的速率是真实速率的一半**，客户端按这个时间戳判断「5 秒」时其实收了 10 秒内容。
+
+### 8.3 根因：SDP 缺少 `a=rtpmap`
+
+裸 socket 抓服务端的 DESCRIBE 响应：
+
+```
+m=audio 0 RTP/AVP 14          ← 静态载荷 pt=14（MPEG 音频）
+（没有任何 a=rtpmap 行）
+```
+
+`src/Rtsp/Rtsp.cpp` 的 `DefaultSdp` 对静态载荷（`payload_type < 96`）**直接 return**，不写 rtpmap。而 RFC 3551 里 pt=14 的**默认时钟是 90000**，我们实际的 RTP 时间戳是按 44100 递增的 ⇒ 客户端按 90000 解释，播放速率变成 44100/90000 ≈ 0.49 倍，正好是 2 倍时长。
+
+PCMA（pt=8）一直正常，是因为它的 RFC 默认就是 8000，与实际一致 —— 这也是这个缺陷长期没被发现的原因。
+
+### 8.4 修法
+
+只对 MP3 补 rtpmap，其余静态载荷保持原样（不动基线）：
+
+```cpp
+if (payload_type < 96 && track.getCodecId() != CodecMP3) {
+    return;
+}
+// MPEG 音频（pt=14）在 RFC 3551 里的编码名是 MPA，不是 MP3
+auto encoding_name = track.getCodecId() == CodecMP3 ? "MPA" : track.getCodecName();
+_printer << "a=rtpmap:" << payload_type << " " << encoding_name << "/" << getSampleRate();
+```
+
+⚠️ **编码名必须是 `MPA`**：先写成 `MP3/44100/2` 时 ffmpeg 直接报
+`Audio: none, 44100 Hz, stereo ... unknown codec`、连解码器都找不到 —— 比不写 rtpmap 更糟。
+RFC 3551 里 pt=14 的名字就是 MPA。
+
+### 8.5 修复效果
+
+| 检查 | 修复前 | 修复后 |
+|---|---|---|
+| SDP | 无 rtpmap | `a=rtpmap:14 MPA/44100/2` |
+| 拉 5 秒的墙钟耗时 | 10.28 s | **5.09 s** |
+| 解码音频时长 | 10.211 s | **5.023 s** |
+| 包数 | 392 | **193**（26ms/包）|
+
+矩阵里 MP3 的 5 个组合全部通过，**已知缺陷清零（100 通过 / 0 失败）**。
+
+## 8-旧. 原始缺陷记录（保留以备追溯）
+
 
 | 观察 | 数值 |
 |---|---|

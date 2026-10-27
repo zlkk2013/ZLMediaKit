@@ -767,10 +767,26 @@ DefaultSdp::DefaultSdp(int payload_type, const Track &track)
     if (bitrate) {
         _printer << "b=AS:" << bitrate << "\r\n";
     }
-    if (payload_type < 96) {
+    // 静态载荷（<96）默认不写 rtpmap，让客户端按 RFC 3551 的固定映射解释。
+    // 但 MP3（pt=14）的 RFC 默认时钟是 **90000**，而实际的 MP3 流是 44100 ——
+    // 不显式声明，客户端会按 90000 解释我们的 RTP 时间戳，等于把流按 44100/90000
+    // 约 0.49 倍速播放：实测 5 秒音频被拉成 10.2 秒（时长翻倍）。
+    // 其余静态音频载荷（PCMA 8 / PCMU 0，默认 8000）与实现一致，保持原样不动。
+    //
+    // Static payloads normally omit rtpmap so clients use the RFC 3551 fixed mapping.
+    // MP3 (pt=14) is the exception: its RFC default clock is 90000 while the stream
+    // really is 44100, so without an explicit rtpmap clients interpret our RTP
+    // timestamps at 90kHz and play at ~0.49x (measured: 5s pulled as 10.2s).
+    if (payload_type < 96 && track.getCodecId() != CodecMP3) {
         return;
     }
-    _printer << "a=rtpmap:" << payload_type << " " << track.getCodecName() << "/" << getSampleRate();
+    // MPEG 音频（pt=14）在 RFC 3551 里的编码名是 **MPA**，不是 MP3。
+    // 写成 MP3 的话 ffmpeg 会把它当未知编码（"Audio: none ... unknown codec"），
+    // 比不写 rtpmap 更糟 —— 不写时客户端按静态表当 MPA/90000 处理，只能播成半速。
+    // MPEG audio (pt=14) is named MPA in RFC 3551, not MP3; using MP3 makes ffmpeg
+    // report an unknown codec, which is worse than omitting rtpmap entirely.
+    auto encoding_name = track.getCodecId() == CodecMP3 ? "MPA" : track.getCodecName();
+    _printer << "a=rtpmap:" << payload_type << " " << encoding_name << "/" << getSampleRate();
     if (track.getTrackType() == TrackAudio) {
         _printer << "/" << static_cast<const AudioTrack &>(track).getAudioChannel();
     }
