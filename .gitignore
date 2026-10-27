@@ -1,3 +1,6 @@
 build-wt/
 config.a3test.ini
+config.a2test.ini
+config.dts.ini
+config.crash.ini
 release/

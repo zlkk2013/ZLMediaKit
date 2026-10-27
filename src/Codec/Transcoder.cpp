@@ -123,6 +123,84 @@ static size_t probeAnnexbStartCodeLen(const uint8_t *data, size_t size) {
 
 namespace mediakit {
 
+/**
+ * 转码输出的单 NAL 帧
+ *
+ * 必须自己报告 keyFrame()/configFrame()。用 `FrameFromBuffer<FrameFromPtr>` 直接构造时
+ * 这两个都是 false（`FrameFromPtr::_is_key` 默认 false，`configFrame()` 在 FrameFromPtr 里
+ * 恒返回 false），下游后果是三处一起坏：
+ *  1. `MultiMediaSourceMuxer` 的 GOP 缓存只按 `frame->keyFrame() || configFrame()` 标记
+ *     GOP 起点。全 false 时缓存永不重定位，观众**中途接入**拿到的第一个视频帧不是 IDR，
+ *     解码器立刻报 "Could not find ref with POC"（实测复现）。
+ *  2. `H265Track::inputFrame_l` 在关键帧前补插 config 帧的逻辑失效，新观众可能先收到
+ *     切片后收到 SPS。
+ *  3. RTP 打包不标 key 位（`CommonRtpEncoder::inputFrame` 的 is_key），丢包重传/秒开都受影响。
+ *
+ * 判定语义与 ext-codec 的 H265FrameHelper/H264FrameHelper 保持一致（单切片判定也照抄：
+ * 多切片时只有第一片算帧开始，否则 GOP 缓存会从中间一片起，同样解不开）。
+ * 这里不复用它们是为了不让 Transcoder 依赖 ext-codec 的具体类型。
+ *
+ * Frames emitted by the encoder must report keyFrame()/configFrame() themselves.
+ * Constructed as `FrameFromBuffer<FrameFromPtr>` both are always false
+ * (`_is_key` defaults false, `configFrame()` is hardcoded false in FrameFromPtr),
+ * which breaks three things at once: the muxer's GOP cache never restarts at a
+ * keyframe (a viewer joining mid-stream starts decoding at a non-IDR frame and
+ * immediately reports "Could not find ref with POC" — reproduced), H265Track stops
+ * inserting config frames before keyframes, and RTP never sets the key bit. The
+ * classification matches ext-codec's H265FrameHelper/H264FrameHelper, including the
+ * first-slice-only rule (multi-slice frames must not all count as a picture start).
+ */
+class TranscodedFrame : public FrameFromBuffer<FrameFromPtr> {
+public:
+    TranscodedFrame(CodecId codec, toolkit::Buffer::Ptr buf, uint64_t dts, uint64_t pts, size_t prefix)
+        : FrameFromBuffer<FrameFromPtr>(codec, buf, dts, pts, prefix) {
+    }
+
+    bool keyFrame() const override {
+        auto ptr = nalHeader();
+        if (!ptr) {
+            return false;
+        }
+        if (getCodecId() == CodecH264) {
+            // IDR=5；多切片时 first_mb_in_slice 为 0 才是帧开始
+            // IDR=5; with multiple slices only the one with first_mb_in_slice==0 starts the frame
+            return (ptr[0] & 0x1F) == 5 && (ptr[1] & 0x80);
+        }
+        // H265：IRAP 覆盖 [BLA_W_LP(16), RSV_IRAP_VCL23(23)]；多切片时看
+        // first_slice_segment_in_pic_flag
+        // H265: IRAP spans [BLA_W_LP(16), RSV_IRAP_VCL23(23)]; for multiple slices check
+        // first_slice_segment_in_pic_flag
+        int type = (ptr[0] >> 1) & 0x3F;
+        return type >= 16 && type <= 23 && (ptr[2] & 0x80);
+    }
+
+    bool configFrame() const override {
+        auto ptr = nalHeader();
+        if (!ptr) {
+            return false;
+        }
+        if (getCodecId() == CodecH264) {
+            int type = ptr[0] & 0x1F;
+            return type == 7 || type == 8;   // SPS / PPS
+        }
+        int type = (ptr[0] >> 1) & 0x3F;
+        return type == 32 || type == 33 || type == 34;   // VPS / SPS / PPS
+    }
+
+private:
+    const uint8_t *nalHeader() const {
+        // size 太短时保守当非关键帧：调用方（emit）保证至少 4 字节起始码 + 1 字节 NAL 头，
+        // 但热身/异常路径下也不能越界读。
+        // Be conservative on short buffers: emit guarantees 4-byte start code + NAL header,
+        // but warmup and error paths must not read out of bounds either.
+        if (size() <= prefixSize() + 2) {
+            return nullptr;
+        }
+        return (const uint8_t *) data() + prefixSize();
+    }
+};
+
+
 static string ffmpeg_err_str(int errnum) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     av_strerror(errnum, errbuf, AV_ERROR_MAX_STRING_SIZE);
@@ -244,11 +322,17 @@ static const AVCodec *findEncoder(CodecId codec_id) {
 }
 
 FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_fps,
-                             const Track::Ptr &src_video) {
+                             const Track::Ptr &src_video, const VideoTargetParams &video_params) {
     if (!track) {
         throw std::runtime_error("encoder created with null track");
     }
-    _video_fps = src_fps;
+    // _video_fps 是「输出」帧率，_src_fps 是「源」帧率：
+    // 降帧抽帧要用两者之比，时间轴推进要用输出帧率。
+    // _video_fps is the OUTPUT frame rate, _src_fps the SOURCE one: decimation
+    // needs both, timeline advancement needs the output rate.
+    _src_fps = src_fps;
+    _video_params = video_params;
+    _video_fps = (_video_params.fps > 0) ? _video_params.fps : src_fps;
     _codec_id = track->getCodecId();
     _codec = findEncoder(_codec_id);
     if (!_codec) {
@@ -266,11 +350,35 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
         // The target track (H265Track etc.) is default-constructed with width/height 0
         // and only fills them after inputFrame parses the SPS. The encoder needs the
         // size at open2 time, so prefer the source track's dimensions.
-        if ((width <= 0 || height <= 0) && src_video) {
+        int src_w = width, src_h = height;
+        if ((src_w <= 0 || src_h <= 0) && src_video) {
             if (auto src = static_pointer_cast<VideoTrack>(src_video)) {
-                width = src->getVideoWidth();
-                height = src->getVideoHeight();
+                src_w = src->getVideoWidth();
+                src_h = src->getVideoHeight();
             }
+        }
+        // 目标尺寸：显式配置优先，否则跟随源。注意不能只改一半（宽给高不给），
+        // 那会输出极端长宽比的画面，所以必须成对生效。
+        // Target size: explicit config wins, otherwise follow the source. A half-set
+        // pair (width without height) would produce an extreme aspect ratio, so the
+        // two must be applied together.
+        if (_video_params.width > 0 && _video_params.height > 0) {
+            width = _video_params.width;
+            height = _video_params.height;
+            // 缩放有硬件/编码器约束：H264/H265 的宏块对齐是按 2 的倍数，
+            // 奇数尺寸会被编码器拒绝或裁掉最后一行像素，这里向上取偶数。
+            // Scaling has encoder constraints: H264/H265 macroblocks align to 2, so
+            // odd dimensions are rejected or crop the last row; round up to even.
+            width += width & 1;
+            height += height & 1;
+        } else {
+            width = src_w;
+            height = src_h;
+        }
+        _out_width = width;
+        _out_height = height;
+        if (_video_params.bitrate > 0) {
+            bitrate = _video_params.bitrate;
         }
         auto ret = openVideoCodec(width, height, bitrate, _codec);
         if (!ret) {
@@ -306,7 +414,9 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
     }
     InfoL << "encoder ready:" << _codec->name
           << ", codec=" << ::mediakit::getCodecName(_codec_id)
-          << ", bitrate=" << bitrate;
+          << ", bitrate=" << (_context ? _context->bit_rate : bitrate)
+          << ", out_size=" << _out_width << "x" << _out_height
+          << ", out_fps=" << _video_fps << ", src_fps=" << _src_fps;
 }
 
 FFmpegEncoder::~FFmpegEncoder() {
@@ -315,6 +425,69 @@ FFmpegEncoder::~FFmpegEncoder() {
     if (_context) {
         _context.reset();
     }
+}
+
+/**
+ * 估算自动码率
+ *
+ * bpp（bit per pixel）按编码器压缩效率取值：H265 比 H264 省约 30% 码率，
+ * 用同一个 bpp 会让 H265 输出明显偏大。
+ * 实测（320x240@15 噪声内容）：H264 bpp≈0.09、H265 bpp≈0.06 时画质与码率平衡良好。
+ * Estimate the automatic bitrate. The bits-per-pixel factor depends on codec
+ * efficiency: H265 needs about 30% less than H264, so a shared factor would make
+ * H265 output noticeably oversized.
+ */
+int FFmpegEncoder::estimateBitrate(int width, int height, int fps) const {
+    // 亚像素尺寸没有意义，先夹到最小 16x16
+    // Sub-pixel sizes are meaningless; clamp to at least 16x16
+    int w = width > 16 ? width : 16;
+    int h = height > 16 ? height : 16;
+    int f = fps > 0 ? fps : 25;
+    double bpp = (_codec_id == CodecH265 || _codec_id == CodecH266) ? 0.06 : 0.09;
+    auto bps = (int64_t) ((double) w * (double) h * (double) f * bpp);
+    if (bps < 32 * 1024) {
+        // 下限只保护自动估算：显式配置的码率必须被尊重，不能被悄悄改写
+        // The floor only protects the auto-estimate; an explicit bitrate must be
+        // honoured, never silently rewritten
+        bps = 32 * 1024;
+    }
+    return (int) bps;
+}
+
+/**
+ * 降帧判断
+ *
+ * 只在「显式配置的输出帧率 < 源帧率」时抽帧，其余情况一律保留（不插帧：转码
+ * 不能凭空造帧，上游来多少帧是这个数）。用整数累加避免浮点漂移：
+ * 第 n 个源帧在目标时间轴上的位置是 n*out/src，取整变化时才输出。
+ * Decide whether to keep a source frame. Frames are dropped only when the
+ * explicitly configured output fps is below the source fps; otherwise everything
+ * is kept (frames are never synthesised — transcoding cannot invent what upstream
+ * did not send). Integer accumulation avoids float drift: the n-th source frame
+ * sits at n*out/src on the target timeline, and is emitted when that integer steps.
+ */
+bool FFmpegEncoder::shouldKeepFrame() {
+    if (_src_fps <= 0.5f || _video_fps <= 0.5f || _video_fps >= _src_fps - 0.01f) {
+        // 不降帧：不计数，避免计数器无意义增长
+        // No decimation: skip the counters entirely
+        return true;
+    }
+    // 目标帧率按整数比处理（如 30→15 是 1/2，30→12 是 2/5）
+    // Treat the rates as an integer ratio (30->15 is 1/2, 30->12 is 2/5)
+    int64_t out = (int64_t) lroundf(_video_fps * 100.0f);
+    int64_t src = (int64_t) lroundf(_src_fps * 100.0f);
+    if (out <= 0 || src <= 0) {
+        return true;
+    }
+    _drop_index++;
+    // 第 n 帧（从 0 计）应落在 floor(n*out/src)；位置前进就保留
+    // Frame n (0-based) lands on floor(n*out/src); keep it when that advances
+    int64_t should_have = (_drop_index - 1) * out / src;
+    if (should_have >= _keep_index) {
+        _keep_index = should_have + 1;
+        return true;
+    }
+    return false;
 }
 
 bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVCodec *codec) {
@@ -330,10 +503,11 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
     _context->height = height;
     _context->time_base = AVRational{1, 1000};
 
-    // 帧率必须跟随源轨。硬编码 25fps 时，源为 15fps 的流会按 25fps 打时间戳，
-    // 导致下游播放速度错误、音画不同步。
-    // The frame rate must follow the source track. A hardcoded 25fps stamps a
-    // 15fps source at 25fps, producing wrong playback speed and A/V desync.
+    // 帧率必须跟随源轨（或显式配置的输出帧率）。硬编码 25fps 时，源为 15fps
+    // 的流会按 25fps 打时间戳，导致下游播放速度错误、音画不同步。
+    // The frame rate must follow the source track (or the explicitly configured
+    // output rate). A hardcoded 25fps stamps a 15fps source at 25fps, producing
+    // wrong playback speed and A/V desync.
     int fps = (_video_fps > 0.5f) ? (int) lroundf(_video_fps) : 0;
     if (fps <= 0) {
         fps = 25;   // 源轨无帧率信息时的保守回退
@@ -344,12 +518,22 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
     // stays stable regardless of frame rate
     _context->gop_size = fps;
 
-    _context->bit_rate = bitrate > 0 ? bitrate : (width * height * fps / 8);
-    if (_context->bit_rate < 200 * 1024) {
-        // 太低的码率会让画面糊成一片，给个下限
-        // Too low a bitrate destroys the picture; enforce a floor
-        _context->bit_rate = 200 * 1024;
+    bool explicit_bitrate = bitrate > 0;
+    _context->bit_rate = explicit_bitrate ? bitrate : estimateBitrate(width, height, fps);
+    if (_context->bit_rate < 8192) {
+        // 低于 8kbps 的流任何编码器都无法成形；这只是给显式配置的兜底
+        // Below 8kbps nothing is watchable; this is only a backstop for explicit values
+        _context->bit_rate = 8192;
     }
+    // 只设 bit_rate 时 x264/x265 走 ABR，实测会超出目标 10%~30%（x265 尤甚）。
+    // 补上 VBV 约束（maxrate=bufsize=目标码率，即 1 秒缓冲）后实测收敛到 1.03~1.05 倍，
+    // 且码率上限可控 —— 直播场景要的就是这个确定性。
+    // With only bit_rate set, x264/x265 run ABR and measured 10-30% over target
+    // (x265 worst). Adding VBV constraints (maxrate=bufsize=target, i.e. a 1-second
+    // buffer) brought it to 1.03-1.05x and bounds the peak — the determinism a live
+    // stream needs.
+    _context->rc_max_rate = _context->bit_rate;
+    _context->rc_buffer_size = _context->bit_rate;
 
     _context->max_b_frames = 0;   // 低延迟，直播不要 B 帧
     // 像素格式：优先 yuv420p。codec->pix_fmts[0] 对 x265 可能是 yuv420p10le 等
@@ -374,12 +558,21 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
     if (codec->id == AV_CODEC_ID_H264) {
         av_opt_set(_context->priv_data, "preset", "veryfast", 0);
         av_opt_set(_context->priv_data, "tune", "zerolatency", 0);
+        // 关掉场景切换强制 IDR：直播里源内容抖动（噪声/闪白）会频繁触发，
+        // 实测 150 帧里出现 53 个 IDR，码率随之失控。关键帧只按 gop_size 出。
+        // Disable scene-cut forced IDR: jittery source content (noise/flashes) triggers
+        // it constantly — measured 53 IDRs in 150 frames, blowing up the bitrate.
+        // Keyframes then come only from gop_size.
+        av_opt_set_int(_context->priv_data, "sc_threshold", 0, 0);
     } else if (codec->id == AV_CODEC_ID_HEVC) {
         // x265 低延迟参数：直播场景不要 lookahead、不要 B 帧
         // x265 low-latency params: no lookahead, no B frames for live
         av_opt_set(_context->priv_data, "preset", "ultrafast", 0);
         av_opt_set(_context->priv_data, "tune", "zerolatency", 0);
-        av_opt_set(_context->priv_data, "x265-params", "log-level=error", 0);
+        // 显式关闭场景切换 IDR，理由同 H264
+        // Explicitly disable scene-cut IDR, same reason as H264
+        std::string params = "log-level=error:scenecut=0";
+        av_opt_set(_context->priv_data, "x265-params", params.c_str(), 0);
     }
     auto ret = avcodec_open2(_context.get(), codec, nullptr);
     if (ret < 0) {
@@ -387,6 +580,12 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
         _context.reset();
         return false;
     }
+    InfoL << "video encoder opened: " << codec->name
+          << ", size=" << _context->width << "x" << _context->height
+          << ", fps=" << fps << ", gop=" << _context->gop_size
+          << ", bitrate=" << _context->bit_rate << "bps (" << (_context->bit_rate / 1024) << "kbps)"
+          << ", maxrate=" << _context->rc_max_rate
+          << ", explicit_bitrate=" << explicit_bitrate;
     return true;
 }
 
@@ -458,13 +657,27 @@ FFmpegFrame::Ptr FFmpegEncoder::formatFrame(const FFmpegFrame::Ptr &frame) {
     // into FFmpegSwr makes it read ch_layout as if it were audio (a video frame has
     // no channel layout), which crashes inside FFmpegSwr at strlen(NULL).
     if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
+        // 帧尺寸/格式可能中途变化（源切换分辨率、或首帧还没进来时拿到的帧），
+        // FFmpegSws 内部只在 _ctx 已存在且源参数不匹配时才重建，这里把
+        // 「目标尺寸」也纳入判断：缩放场景下目标尺寸来自配置而不是帧本身。
+        // The frame size/format can change mid-stream (source resolution switch). The
+        // FFmpegSws target is fixed at construction, so rebuild it whenever the encoder
+        // target changes, otherwise we would emit frames at the previous size.
         if (av_frame->format == _context->pix_fmt
             && av_frame->width == _context->width
             && av_frame->height == _context->height) {
             return frame;
         }
-        if (!_sws) {
+        if (!_sws || _sws_width != _context->width || _sws_height != _context->height
+            || _sws_format != (AVPixelFormat) _context->pix_fmt) {
             _sws.reset(new FFmpegSws(_context->pix_fmt, _context->width, _context->height));
+            _sws_width = _context->width;
+            _sws_height = _context->height;
+            _sws_format = (AVPixelFormat) _context->pix_fmt;
+            InfoL << "video scale path: " << av_frame->width << "x" << av_frame->height
+                  << " fmt=" << av_get_pix_fmt_name((AVPixelFormat) av_frame->format)
+                  << " -> " << _context->width << "x" << _context->height
+                  << " fmt=" << av_get_pix_fmt_name((AVPixelFormat) _context->pix_fmt);
         }
         auto out = _sws->inputFrame(frame);
         if (!out) {
@@ -472,6 +685,17 @@ FFmpegFrame::Ptr FFmpegEncoder::formatFrame(const FFmpegFrame::Ptr &frame) {
                   << av_frame->width << "x" << av_frame->height << " fmt=" << av_frame->format
                   << " -> " << _context->width << "x" << _context->height
                   << " fmt=" << _context->pix_fmt;
+            return nullptr;
+        }
+        // 校验缩放结果：sws 若因为目标尺寸非法而内部回退到源尺寸，
+        // 编码器会以尺寸不符报 EINVAL，但那时已经很难定位，这里直接拦住。
+        // Verify the scaled result: if sws silently falls back to the source size for
+        // an invalid target, the encoder then fails with an unhelpful EINVAL.
+        if (out->get()->width != _context->width || out->get()->height != _context->height) {
+            WarnL << "scaled frame size mismatch: got "
+                  << out->get()->width << "x" << out->get()->height
+                  << ", encoder expects " << _context->width << "x" << _context->height;
+            return nullptr;
         }
         return out;
     }
@@ -639,6 +863,14 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     _last_src_ms = src_dts;
 
     if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
+        // 降帧：目标帧率低于源时，按「源帧序号 × 目标/源」跳帧，替代方案（按时钟
+        // 累计）在源帧间隔抖动时会一次连丢/连留，这里的整数累加是确定性的。
+        // Decimation: when the target fps is below the source, skip frames by
+        // "source index * target/source". A wall-clock accumulator would burst-skip
+        // or burst-keep when the source jitters; this integer scheme is deterministic.
+        if (!shouldKeepFrame()) {
+            return true;
+        }
         auto converted = formatFrame(frame);
         if (!converted) {
             return false;
@@ -702,8 +934,19 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     return encodeAudio_l(converted->get());
 }
 
-bool FFmpegEncoder::warmup(const Track::Ptr &target, int width, int height) {
-    if (!target || !_context || width <= 0 || height <= 0) {
+bool FFmpegEncoder::warmup(const Track::Ptr &target) {
+    if (!target || !_context) {
+        return false;
+    }
+    // 预热用的尺寸必须是「编码器的输出尺寸」，不是源尺寸：缩放场景下两者不同，
+    // 用源尺寸造帧会让 avcodec_send_frame 因尺寸不符直接返回 EINVAL。
+    // The warmup frame must use the ENCODER's output size, not the source size:
+    // they differ when scaling, and a mismatched frame makes avcodec_send_frame
+    // return EINVAL immediately.
+    int width = _context->width;
+    int height = _context->height;
+    if (width <= 0 || height <= 0) {
+        WarnL << "warmup: encoder has no valid size";
         return false;
     }
     // 目标轨只可能是视频轨
@@ -799,16 +1042,32 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target, int width, int height) {
                         if (nal_len == 0) {
                             return;
                         }
-                        int nal_type = (((uint8_t) nal[0]) >> 1) & 0x3F;
-                        // 32=VPS 33=SPS 34=PPS；其余（IDR/SEI）一律丢弃
-                        // 32=VPS 33=SPS 34=PPS; drop everything else (IDR/SEI)
-                        if (nal_type == 32 || nal_type == 33 || nal_type == 34) {
+                        bool is_config_nal;
+                        if (_codec_id == CodecH264) {
+                            // H264 的 NAL 头是 1 字节、类型占低 5 位，没有 VPS：
+                            // 7=SPS 8=PPS。这里不能用 H265 的 (b0>>1)&0x3F，
+                            // 否则 H264 的 SPS(0x67) 会算出 51，永远匹配不上，
+                            // 目标轨永远不 ready，整条视频轨被 muxer 丢弃。
+                            // H264's NAL header is one byte with the type in the low 5
+                            // bits and has no VPS: 7=SPS, 8=PPS. The H265 formula
+                            // (b0>>1)&0x3F would compute 51 for an H264 SPS (0x67) and
+                            // never match, so the target track never becomes ready and
+                            // muxers drop the whole video track.
+                            int h264_type = ((uint8_t) nal[0]) & 0x1F;
+                            is_config_nal = (h264_type == 7 || h264_type == 8);
+                        } else {
+                            int nal_type = (((uint8_t) nal[0]) >> 1) & 0x3F;
+                            // 32=VPS 33=SPS 34=PPS；其余（IDR/SEI）一律丢弃
+                            // 32=VPS 33=SPS 34=PPS; drop everything else (IDR/SEI)
+                            is_config_nal = (nal_type == 32 || nal_type == 33 || nal_type == 34);
+                        }
+                        if (is_config_nal) {
                             // 同样用固定 4 字节起始码，和真实帧保持一致的形态
                             // Use a fixed 4-byte start code to match the real frames
                             auto buf = std::make_shared<toolkit::BufferLikeString>();
                             buf->assign("\x00\x00\x00\x01", 4);
                             buf->append(nal, nal_len);
-                            auto one = std::make_shared<FrameFromBuffer<FrameFromPtr>>(_codec_id, buf, 0, 0, 4);
+                            auto one = std::make_shared<TranscodedFrame>(_codec_id, buf, 0, 0, 4);
                             video->inputFrame(one);
                             fed_config++;
                         }
@@ -969,7 +1228,12 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
         auto buf = std::make_shared<toolkit::BufferLikeString>();
         buf->assign("\x00\x00\x00\x01", 4);
         buf->append(nal, nal_len);
-        auto frame = std::make_shared<FrameFromBuffer<FrameFromPtr>>(_codec_id, buf, next_ms, next_ms, 4);
+        // 用 TranscodedFrame 而不是裸 FrameFromBuffer：后者不会报告 keyFrame/configFrame，
+        // 会让 GOP 缓存不从关键帧开始、观众中途接入报 "Could not find ref with POC"。
+        // Use TranscodedFrame rather than a bare FrameFromBuffer: the latter never
+        // reports keyFrame/configFrame, so the GOP cache stops starting at keyframes and
+        // mid-stream viewers fail with "Could not find ref with POC".
+        auto frame = std::make_shared<TranscodedFrame>(_codec_id, buf, next_ms, next_ms, 4);
         frame->setIndex(_track_index);
         _cb(frame);
     };

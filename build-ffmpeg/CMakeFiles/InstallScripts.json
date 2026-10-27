@@ -1,0 +1,17 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/3rdpart/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/3rdpart/ZLToolKit/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/src/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/ext-codec/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/srt/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/api/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/api/tests/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/player/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/server/cmake_install.cmake",
+		"/Users/zhanglei/ZLMediaKit/build-ffmpeg/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

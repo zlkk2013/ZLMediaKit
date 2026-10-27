@@ -36,10 +36,18 @@ struct TranscodeOption {
     CodecId audio_codec = CodecInvalid;
     /** 目标视频 codec；CodecInvalid 表示不转视频 */
     CodecId video_codec = CodecInvalid;
-    /** 目标码率，0 表示沿用源 */
+    /** 目标码率，0 表示沿用源（音视频共用；视频想单独指定用 video_bitrate） */
     int bitrate = 0;
     /** 目标采样率（音频），0 表示沿用源 */
     int sample_rate = 0;
+    /** 视频输出宽，0=跟随源；必须与 video_height 成对 */
+    int video_width = 0;
+    /** 视频输出高，0=跟随源 */
+    int video_height = 0;
+    /** 视频输出帧率，0=跟随源。只支持降帧（抽帧） */
+    float video_fps = 0;
+    /** 视频专用码率(bps)，0=沿用 bitrate/源。优先于 bitrate */
+    int video_bitrate = 0;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
     /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */

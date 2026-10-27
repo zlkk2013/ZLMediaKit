@@ -68,7 +68,13 @@ CodecId parseTranscodeCodec(const string &name, TrackType expect, const char *wh
         codec = getCodecId(lower);
     }
     if (codec == CodecInvalid) {
-        WarnL << "unknown transcode " << what << " codec: '" << name << "', ignored";
+        // 用 Error 而不是 Warn：认不出 codec 会让这条轨静默不转码，
+        // 表现为「配置写了却没生效」，是最难排查的一类问题。
+        // Error rather than Warn: an unrecognised codec silently skips transcoding
+        // for that track, which looks exactly like "the config had no effect".
+        ErrorL << "unknown transcode " << what << " codec: '" << name
+               << "'. Accepted: PCMA/g711a, PCMU/g711u, AAC/mpeg4-generic, MP3, opus, L16, "
+                  "H264/avc, H265/hevc, H266, VP8, VP9, AV1; empty means don't transcode this kind";
         return CodecInvalid;
     }
     if (getTrackType(codec) != expect) {
@@ -163,6 +169,12 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_codec = parseTranscodeCodec(ini[kTranscodeVideoCodec].as<string>(), TrackVideo, "video");
     option.bitrate = parseInt(ini[kTranscodeBitrate].as<string>(), 0);
     option.sample_rate = parseInt(ini[kTranscodeSampleRate].as<string>(), 0);
+    // 视频输出参数：全 0 表示跟随源，行为与未引入这些配置项时一致
+    // Video output params: all-zero follows the source, matching earlier behavior
+    option.video_width = parseInt(ini[kTranscodeVideoWidth].as<string>(), 0);
+    option.video_height = parseInt(ini[kTranscodeVideoHeight].as<string>(), 0);
+    option.video_fps = (float) parseInt(ini[kTranscodeVideoFps].as<string>(), 0);
+    option.video_bitrate = parseInt(ini[kTranscodeVideoBitrate].as<string>(), 0);
     option.on_demand = parseBool(ini[kTranscodeOnDemand].as<string>(), true);
     return option;
 }
