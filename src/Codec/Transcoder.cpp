@@ -278,7 +278,22 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
         }
     } else {
         auto audio = static_pointer_cast<AudioTrack>(track);
-        auto ret = openAudioCodec(audio->getAudioSampleRate(), audio->getAudioChannel(), bitrate, _codec);
+        auto sample_rate = audio->getAudioSampleRate();
+        auto channel = audio->getAudioChannel();
+        // PCMA/PCMU 的 RTP 载荷规格是固定的 8000Hz 单声道（见 Rtsp.h 的 payload 表
+        // XX(PCMA, TrackAudio, 8, 8000, 1, ...)）。编码器必须按这个规格打开，否则
+        // 输出时间戳的时基与轨道声明不一致：实测 44.1kHz 源打成 PCMA 时 5 秒音频
+        // 被塞进 795 个包（正确值 250），观众端把内容按错误速率播放。
+        // 强制 8k 单声道后由 swr 负责重采样与下混。
+        //
+        // PCMA/PCMU have a fixed RTP payload format: 8000Hz mono (see Rtsp.h).
+        // Opening the encoder at the source rate makes the timestamp base disagree
+        // with the declared track: measured 795 packets for 5s (correct is 250).
+        if (_codec_id == CodecG711A || _codec_id == CodecG711U) {
+            sample_rate = 8000;
+            channel = 1;
+        }
+        auto ret = openAudioCodec(sample_rate, channel, bitrate, _codec);
         if (!ret) {
             throw std::runtime_error(string("打开音频编码器失败: ") + _codec->name);
         }

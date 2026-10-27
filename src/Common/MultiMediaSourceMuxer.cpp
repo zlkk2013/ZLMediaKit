@@ -13,6 +13,7 @@
 #include "MultiMediaSourceMuxer.h"
 #if defined(ENABLE_FFMPEG)
 #include "Common/TranscodeSink.h"
+#include "Transcode/TranscodeConfig.h"
 #endif//ENABLE_FFMPEG
 #include "Thread/WorkThreadPool.h"
 
@@ -710,37 +711,47 @@ bool MultiMediaSourceMuxer::onTrackReady(const Track::Ptr &track_ref) {
     // Take a mutable copy: transcoding needs to swap the track
     Track::Ptr track = track_ref;
 #if defined(ENABLE_FFMPEG)
-    // 懒创建：首条 track 到达时按配置决定是否启用转码
-    // Lazy init: decide on transcoding when the first track arrives
-    if (!_transcode && TranscodeOption::loadFromIni().enable) {
-        auto option = TranscodeOption::loadFromIni();
-        std::weak_ptr<MultiMediaSourceMuxer> weak_self = shared_from_this();
-        _transcode = std::make_shared<TranscodeSink>(option, [weak_self]() -> size_t {
-            if (auto strong_self = weak_self.lock()) {
-                return (size_t) strong_self->totalReaderCount();
-            }
-            return 0;
-        });
-        _transcode->setOnOutput([weak_self](const Frame::Ptr &frame) {
-            if (auto strong_self = weak_self.lock()) {
-                // 转码出来的帧走完整下游：时间戳修正 + 平滑 + 协议分发 + GOP 缓存
-                // Transcoded frames take the full downstream path
-                auto stamped = frame;
-                if (strong_self->_option.modify_stamp != ProtocolOption::kModifyStampOff) {
-                    stamped = std::make_shared<FrameStamp>(
-                        frame, strong_self->_stamps[frame->getIndex()], strong_self->_option.modify_stamp);
+    // 懒创建：首条 track 到达时按「全局段 + 按流规则 + API 覆盖」决定是否转码
+    // Lazy init: decide on transcoding when the first track arrives, resolved from
+    // the global section, per-stream rules and the API override
+    if (!_transcode) {
+        std::string source;
+        auto option = TranscodeRuntime::instance().resolve(getMediaTuple(), &source);
+        if (option.enable) {
+            std::weak_ptr<MultiMediaSourceMuxer> weak_self = shared_from_this();
+            _transcode = std::make_shared<TranscodeSink>(option, [weak_self]() -> size_t {
+                if (auto strong_self = weak_self.lock()) {
+                    return (size_t) strong_self->totalReaderCount();
                 }
-                if (strong_self->_paced_sender) {
-                    strong_self->_paced_sender->inputFrame(stamped);
-                } else {
-                    strong_self->onTrackFrame_l(stamped);
+                return 0;
+            });
+            _transcode->setOnOutput([weak_self](const Frame::Ptr &frame) {
+                if (auto strong_self = weak_self.lock()) {
+                    // 转码出来的帧走完整下游：时间戳修正 + 平滑 + 协议分发 + GOP 缓存
+                    // Transcoded frames take the full downstream path
+                    auto stamped = frame;
+                    if (strong_self->_option.modify_stamp != ProtocolOption::kModifyStampOff) {
+                        stamped = std::make_shared<FrameStamp>(
+                            frame, strong_self->_stamps[frame->getIndex()], strong_self->_option.modify_stamp);
+                    }
+                    if (strong_self->_paced_sender) {
+                        strong_self->_paced_sender->inputFrame(stamped);
+                    } else {
+                        strong_self->onTrackFrame_l(stamped);
+                    }
                 }
-            }
-        });
-        InfoL << "transcode enabled for stream: " << shortUrl()
-              << ", audio " << ::mediakit::getCodecName(option.audio_codec)
-              << ", video " << ::mediakit::getCodecName(option.video_codec)
-              << ", on_demand=" << option.on_demand;
+            });
+            // 登记到运行时：HTTP 接口据此查询状态 / 热更新参数；顺便打上流标签，
+            // 多路并发转码时日志才分得清是哪一路
+            // Register with the runtime so the HTTP API can query/update it, and label
+            // it so concurrent transcodes are distinguishable in logs
+            TranscodeRuntime::instance().attachSink(getMediaTuple(), _transcode);
+            InfoL << "transcode enabled for stream: " << shortUrl() << " (source=" << source << ")"
+                  << ", audio " << ::mediakit::getCodecName(option.audio_codec)
+                  << ", video " << ::mediakit::getCodecName(option.video_codec)
+                  << ", bitrate=" << option.bitrate
+                  << ", on_demand=" << option.on_demand;
+        }
     }
     // 转码：换轨不换流。_transcode 为空时 track 原样不变
     // Transcode: swap the track, keep the stream. Unchanged when _transcode is null
@@ -841,22 +852,6 @@ void MultiMediaSourceMuxer::onAllTrackReady() {
     }
     InfoL << "stream: " << shortUrl() << " , codec info: " << getTrackInfoStr(this);
 }
-
-#if defined(ENABLE_FFMPEG)
-void MultiMediaSourceMuxer::setTranscodeSink(const std::shared_ptr<TranscodeSink> &sink) {
-    _transcode = sink;
-    if (_transcode) {
-        // 转码结果回灌：走 onTrackFrame_l 而非 onTrackFrame，避免再次进入转码节点造成死循环
-        // Transcode output re-enters via onTrackFrame_l, not onTrackFrame, to avoid re-entering here
-        std::weak_ptr<MultiMediaSourceMuxer> weak_self = shared_from_this();
-        // 回灌逻辑在 setTranscodeSink 中统一设置，这里不重复
-        // The re-entry callback is installed in setTranscodeSink, not duplicated here
-        InfoL << "transcode sink attached to stream: " << shortUrl();
-    } else {
-        InfoL << "transcode sink detached from stream: " << shortUrl();
-    }
-}
-#endif//ENABLE_FFMPEG
 
 void MultiMediaSourceMuxer::createGopCacheIfNeed() {
     if (_ring) {

@@ -14,38 +14,13 @@
 #include "Extension/Factory.h"
 #include "Util/util.h"
 #include "Common/config.h"
+#include <algorithm>
 #include <atomic>
 
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
-
-TranscodeOption TranscodeOption::loadFromIni() {
-    TranscodeOption option;
-    auto &ini = mINI::Instance();
-    // 未配置 [transcode] 段时 getValue 返回默认值，行为与上游完全一致
-    // Without the [transcode] section, defaults are returned and behavior matches upstream
-    option.enable = ini[kTranscodeEnable].as<bool>();
-    if (!option.enable) {
-        return option;
-    }
-    option.audio_codec = getCodecId(ini[kTranscodeAudioCodec].as<std::string>());
-    option.video_codec = getCodecId(ini[kTranscodeVideoCodec].as<std::string>());
-    option.bitrate = ini[kTranscodeBitrate].as<int>();
-    option.sample_rate = ini[kTranscodeSampleRate].as<int>();
-    option.on_demand = ini[kTranscodeOnDemand].as<bool>();
-    option.enable_silence = ini[kTranscodeEnableSilence].as<bool>();
-    option.silence_timeout_ms = ini[kTranscodeSilenceTimeoutMS].as<int>();
-    if (option.silence_timeout_ms <= 0) {
-        option.silence_timeout_ms = 200;
-    }
-    if (option.audio_codec == CodecInvalid && option.video_codec == CodecInvalid) {
-        WarnL << "transcode enabled but no target codec configured, disabled";
-        option.enable = false;
-    }
-    return option;
-}
 
 TranscodeSink::TranscodeSink(const TranscodeOption &option, std::function<size_t()> reader_count)
     : _option(option), _reader_count(std::move(reader_count)) {
@@ -70,6 +45,16 @@ void TranscodeSink::setOption(const TranscodeOption &option) {
     _option = option;
 }
 
+void TranscodeSink::setStreamLabel(std::string label) {
+    lock_guard<mutex> lck(_mtx);
+    _label = std::move(label);
+}
+
+std::string TranscodeSink::streamLabel() const {
+    lock_guard<mutex> lck(_mtx);
+    return _label;
+}
+
 size_t TranscodeSink::transcodeFrameCount() const {
     lock_guard<mutex> lck(_mtx);
     size_t total = 0;
@@ -90,7 +75,82 @@ bool TranscodeSink::isTranscoding() const {
 }
 
 size_t TranscodeSink::failedTrackCount() const {
+    lock_guard<mutex> lck(_mtx);
     return _failed;
+}
+
+bool TranscodeSink::matchesOption(const TranscodeOption &option) const {
+    lock_guard<mutex> lck(_mtx);
+    if (!option.enable) {
+        // 关掉转码：已有转码轨还在跑，说明配置与实况不符
+        for (auto &pr : _contexts) {
+            if (pr.second.transcoding) {
+                return false;
+            }
+        }
+        return true;
+    }
+    for (auto &pr : _contexts) {
+        auto &ctx = pr.second;
+        if (ctx.type == TrackAudio) {
+            // 该转的已经在转同一个 codec，且采样率也对得上才算命中；
+            // 不该转的轨不能在转
+            if (!option.needAudioTranscode(ctx.source_codec)) {
+                if (ctx.transcoding) {
+                    return false;
+                }
+                continue;
+            }
+            if (!ctx.transcoding || !ctx.target_track) {
+                return false;
+            }
+            if (ctx.target_track->getCodecId() != option.audio_codec) {
+                return false;
+            }
+            auto audio = static_pointer_cast<AudioTrack>(ctx.target_track);
+            if (option.sample_rate > 0 && audio->getAudioSampleRate() != option.sample_rate) {
+                return false;
+            }
+        } else if (ctx.type == TrackVideo) {
+            if (!option.needVideoTranscode(ctx.source_codec)) {
+                if (ctx.transcoding) {
+                    return false;
+                }
+                continue;
+            }
+            if (!ctx.transcoding || !ctx.target_track) {
+                return false;
+            }
+            if (ctx.target_track->getCodecId() != option.video_codec) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
+    lock_guard<mutex> lck(_mtx);
+    std::vector<TrackStatus> ret;
+    ret.reserve(_contexts.size());
+    for (auto &pr : _contexts) {
+        TrackStatus st;
+        st.index = pr.first;
+        st.type = pr.second.type;
+        st.source_codec = pr.second.source_codec;
+        // 未转码时目标轨就是源轨本身（下游看到的就是源 codec）
+        st.target_codec = (pr.second.transcoding && pr.second.target_track)
+                              ? pr.second.target_track->getCodecId()
+                              : pr.second.source_codec;
+        st.transcoding = pr.second.transcoding;
+        st.frames = pr.second.frame_count;
+        ret.emplace_back(st);
+    }
+    // 按 track index 排序，让接口输出稳定
+    std::sort(ret.begin(), ret.end(), [](const TrackStatus &a, const TrackStatus &b) {
+        return a.index < b.index;
+    });
+    return ret;
 }
 
 bool TranscodeSink::shouldSkip() const {
@@ -251,21 +311,32 @@ Track::Ptr TranscodeSink::addTrack(const Track::Ptr &track) {
     TrackContext ctx;
     bool ok = setupTrack(track, ctx);
     int index = track->getIndex();
+    auto src = track->getCodecId();
+    auto type = track->getTrackType();
 
     lock_guard<mutex> lck(_mtx);
     if (!ok) {
         // 不需要转码的轨不算失败；需要转码但建不起来才算
-        auto src = track->getCodecId();
         bool wanted = _option.needAudioTranscode(src) || _option.needVideoTranscode(src);
         if (wanted) {
             _failed += 1;
-            WarnL << "transcode requested but unavailable, fallback to passthrough, index="
-                  << index << ", codec=" << getCodecName(src);
+            WarnL << "transcode requested but unavailable, fallback to passthrough, stream="
+                  << (_label.empty() ? "?" : _label) << ", index=" << index
+                  << ", codec=" << getCodecName(src);
         }
+        // 透传轨也登记，getTranscode 才能说明「这条轨没转」
+        TrackContext passthrough;
+        passthrough.transcoding = false;
+        passthrough.type = type;
+        passthrough.source_codec = src;
+        _contexts[index] = std::move(passthrough);
         return track;
     }
+    ctx.type = type;
+    ctx.source_codec = src;
     _contexts[index] = std::move(ctx);
-    InfoL << "transcode track registered, index=" << index
+    InfoL << "transcode track registered, stream=" << (_label.empty() ? "?" : _label)
+          << ", index=" << index
           << ", " << getCodecName(track->getCodecId())
           << " -> " << getCodecName(_contexts[index].target_track->getCodecId());
     return _contexts[index].target_track;
@@ -361,10 +432,11 @@ void TranscodeSink::onEncoded(int index, const Frame::Ptr &frame) {
                 it->second.silence_entered = false;
                 need_arm = !_silence_timer;
             }
-            // 每 100 帧打一条：便于判断转码链路是否持续产出
-            // Log every 100 frames so we can tell the chain keeps producing
+            // 每 100 帧打一条：便于判断转码链路是否持续产出。
+            // 带上流标识：多路并发时按流对账，别把别的流的计数当成这一路的。
             if (it->second.frame_count % 100 == 0) {
-                InfoL << "transcoded " << it->second.frame_count << " frames, index=" << index
+                InfoL << "transcoded " << it->second.frame_count << " frames, stream="
+                      << (_label.empty() ? "?" : _label) << ", index=" << index
                       << ", dts=" << frame->dts() << ", size=" << frame->size()
                       << ", silence=" << it->second.silence_count;
             }
@@ -380,6 +452,15 @@ void TranscodeSink::onEncoded(int index, const Frame::Ptr &frame) {
     if (_on_output) {
         // 关键：流 id 不变，只是这条轨的 codec 变了 → 透明转码
         // Key point: same stream id, only this track's codec changed
+        //
+        // 必须串行：音频与视频的 onEncoded 在不同线程，直接并发调用会把 muxer
+        // 的协议缓存链表写坏（崩在 RtspMediaSource::onWrite，约 1/3 概率）。
+        // 锁只包住回调本身，不包编码，避免与编码过程中的重入自锁。
+        // Must serialize: onEncoded runs on different threads for audio and video,
+        // and calling the muxer concurrently corrupts its packet lists (crash inside
+        // RtspMediaSource::onWrite, roughly 1 in 3 runs). The lock wraps only the
+        // callback, never the encode itself, which re-enters onEncoded.
+        lock_guard<mutex> lck(_output_mtx);
         _on_output(frame);
     }
 }
@@ -565,8 +646,9 @@ void TranscodeSink::resetTracks() {
             }
         }
         _contexts.clear();
+        // 与 _contexts 同锁内清零，否则 reset 后接口可能读到「0 条轨但 failed=1」
+        _failed = 0;
     }
-    _failed = 0;
 }
 
 }//namespace mediakit
