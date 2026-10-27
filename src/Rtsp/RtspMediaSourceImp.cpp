@@ -1,6 +1,9 @@
 ﻿#include "RtspMediaSourceImp.h"
 #include "RtspDemuxer.h"
 #include "Common/config.h"
+#if defined(ENABLE_FFMPEG)
+#include "Transcode/TranscodeConfig.h"
+#endif
 namespace mediakit {
 void RtspMediaSource::setSdp(const std::string &sdp) {
     SdpParser sdp_parser(sdp);
@@ -72,11 +75,35 @@ void RtspMediaSourceImp::onWrite(RtpPacket::Ptr rtp, bool key_pos)
         key_pos = _demuxer->inputRtp(rtp);
     }
     GET_CONFIG(bool, directProxy, Rtsp::kDirectProxy);
-    if (directProxy) {
+    if (directProxy && !_transcode_enabled) {
         // 直接代理模式才直接使用原始rtp  [AUTO-TRANSLATED:afd4ae3b]
         // Only the direct proxy mode directly uses the original rtp
+        // 启用转码时不能走这里：转码换轨在 MultiMediaSourceMuxer 内部完成，直接把源
+        // RTP 透传出去会让观众看到源编码（H265 源配 H264 目标时观众仍拿到 H265）。
+        // 解复用后帧会经 muxer 里的 TranscodeSink 换轨，再由 muxer 自己的
+        // RtspMediaSource 重新打成 RTP 发给观众。
+        //
+        // Not allowed while transcoding: the track swap happens inside the muxer,
+        // so forwarding the source RTP as-is shows viewers the source codec.
         RtspMediaSource::onWrite(std::move(rtp), key_pos);
     }
+}
+
+bool RtspMediaSourceImp::resolveTranscodeEnable() {
+#if defined(ENABLE_FFMPEG)
+    std::string source;
+    auto option = TranscodeRuntime::instance().resolve(getMediaTuple(), &source);
+    _transcode_enabled = option.enable;
+    if (_transcode_enabled) {
+        // 转码流必须走解复用+muxer 路径，日志里显式说明一句，方便对账
+        // Transcoded streams must go the demux+muxer way; say so in the log
+        InfoL << "transcode enabled, direct-proxy disabled for " << getUrl()
+              << " (source=" << source << ")";
+    }
+#else
+    _transcode_enabled = false;
+#endif
+    return _transcode_enabled;
 }
 
 void RtspMediaSourceImp::setProtocolOption(const ProtocolOption &option)
@@ -87,7 +114,14 @@ void RtspMediaSourceImp::setProtocolOption(const ProtocolOption &option)
     // 导致rtc无法播放，所以在rtsp推流rtc播放时，建议关闭直接代理模式  [AUTO-TRANSLATED:2c705dec]
     // This leads to the inability of rtc to play, so it is recommended to turn off direct proxy mode when rtsp pushes the stream and rtc plays
     _option = option;
-    _option.enable_rtsp = !direct_proxy;
+    // 启用转码时同样必须让 muxer 生成 RTSP 输出源：转码后的轨只有 muxer 里才有，
+    // 观众必须连到 muxer 的 RtspMediaSource（SDP 带 a=control:trackID=）而不是
+    // 推流端的 RtspMediaSourceImp（SDP 是推流端原始 SDP，带 streamid=）。
+    //
+    // Transcoding also requires the muxer to own the RTSP output source, otherwise
+    // viewers keep reading the publisher's RtspMediaSourceImp and its raw SDP.
+    _transcode_enabled = resolveTranscodeEnable();
+    _option.enable_rtsp = direct_proxy ? _transcode_enabled : true;
     _muxer = std::make_shared<MultiMediaSourceMuxer>(_tuple, _demuxer->getDuration(), _option);
     _muxer->setMediaListener(getListener());
     _muxer->setTrackListener(std::static_pointer_cast<RtspMediaSourceImp>(shared_from_this()));

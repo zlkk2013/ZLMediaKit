@@ -140,8 +140,30 @@ public:
     }
 
     RtspMediaSource::Ptr clone(const std::string& stream) override;
+
 private:
+    /**
+     * 本流是否启用转码（读 [transcode] 配置 + API 覆盖）。
+     * 只用于决定 onWrite 走 direct-proxy 还是解复用，所以结果缓存在
+     * _transcode_enabled 里，避免每个 RTP 包都去解析一遍配置。
+     *
+     * Whether transcoding is enabled for this stream. Only used to pick the
+     * direct-proxy vs. demux path in onWrite; the answer is cached in
+     * _transcode_enabled so we do not re-parse the config for every RTP packet.
+     */
+    bool resolveTranscodeEnable();
+
     bool _all_track_ready = false;
+    /**
+     * 启用转码时必须关闭 direct-proxy：转码换轨发生在 MultiMediaSourceMuxer
+     * 内部，而 direct-proxy 把源 RTP 原样透传给观众，两条路不交叉，转码输出
+     * 永远到不了观众端（见 docs/TRANSCODE_AUDIO_FRAMING_FIX.md §10.4）。
+     *
+     * Direct-proxy must be off when transcoding: the track swap happens inside
+     * MultiMediaSourceMuxer, while direct-proxy forwards the source RTP as-is.
+     * The two paths never meet, so transcoded output would never reach viewers.
+     */
+    bool _transcode_enabled = false;
     ProtocolOption _option;
     RtspDemuxer::Ptr _demuxer;
     MultiMediaSourceMuxer::Ptr _muxer;
