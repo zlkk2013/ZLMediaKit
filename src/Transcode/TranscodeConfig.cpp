@@ -42,6 +42,8 @@ static const map<string, CodecId, StrCaseCompare> &codecAlias() {
         {"pcmu",          CodecG711U},
         {"l16",           CodecL16},
         {"mp3",           CodecMP3},
+        {"g722",          CodecG722},
+        {"adpcm-g722",    CodecG722},
         {"h264",          CodecH264},
         {"avc",           CodecH264},
         {"h265",          CodecH265},

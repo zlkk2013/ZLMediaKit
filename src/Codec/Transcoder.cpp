@@ -329,6 +329,11 @@ static const AVCodec *findEncoder(CodecId codec_id) {
         case CodecOpus: return find("libopus", AV_CODEC_ID_OPUS);
         case CodecG711A:return find(nullptr, AV_CODEC_ID_PCM_ALAW);
         case CodecG711U:return find(nullptr, AV_CODEC_ID_PCM_MULAW);
+        // G722 在 ffmpeg 里是 adpcm_g722（16kHz 单声道，但样本按 8kHz 计时，
+        // 这是 G722 的历史包袱：RTP 时钟 16000、帧长 20ms = 320 样本）
+        // G722 lives in ffmpeg as adpcm_g722 (16kHz mono; its RTP clock is 16000
+        // with 20ms frames = 320 samples)
+        case CodecG722: return find(nullptr, AV_CODEC_ID_ADPCM_G722);
         // MP3 必须显式找 libmp3lame：裸 AV_CODEC_ID_MP3 在部分构建里只注册了解码器，
         // 旧代码根本没有这个 case，配 audio_codec=MP3 会直接抛「未找到编码器」。
         // MP3 must resolve libmp3lame explicitly: a bare AV_CODEC_ID_MP3 build may only

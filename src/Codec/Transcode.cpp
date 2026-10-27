@@ -399,6 +399,30 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num, const std:
             }
             codec = getCodec({AV_CODEC_ID_VP9});
             break;
+        // 以下三种上游没有映射：源流是 MP3/G722/L16 时 setupTrack 直接抛
+        // 「未找到解码器」，整条轨回落到透传（配了 target codec 也不生效）。
+        // 实测：MP3 源 -> opus 完全不转码，观众端仍是 mp3。
+        // These three were unmapped upstream: an MP3/G722/L16 source threw
+        // "no decoder found" during setupTrack and the whole track fell back to
+        // passthrough, so a configured target codec had no effect.
+        case CodecMP3:
+            if (codec && codec->id == AV_CODEC_ID_MP3) {
+                break;
+            }
+            codec = getCodec({AV_CODEC_ID_MP3});
+            break;
+        case CodecG722:
+            if (codec && codec->id == AV_CODEC_ID_ADPCM_G722) {
+                break;
+            }
+            codec = getCodec({AV_CODEC_ID_ADPCM_G722});
+            break;
+        case CodecL16:
+            if (codec && codec->id == AV_CODEC_ID_PCM_S16BE) {
+                break;
+            }
+            codec = getCodec({AV_CODEC_ID_PCM_S16BE});
+            break;
         default: codec = nullptr; break;
     }
 

@@ -777,7 +777,16 @@ DefaultSdp::DefaultSdp(int payload_type, const Track &track)
     // MP3 (pt=14) is the exception: its RFC default clock is 90000 while the stream
     // really is 44100, so without an explicit rtpmap clients interpret our RTP
     // timestamps at 90kHz and play at ~0.49x (measured: 5s pulled as 10.2s).
-    if (payload_type < 96 && track.getCodecId() != CodecMP3) {
+    // 需要显式 rtpmap 的静态载荷：MP3(pt=14) 与 G722(pt=9)。
+    // 两者的 RFC 默认时钟与实现不一致，不声明就会播错速度：
+    //   MP3  默认 90000，实际 44100 -> 0.49 倍速（时长翻倍）
+    //   G722 默认 8000， 实际 16000 -> 2 倍速（时长减半）
+    // 其余静态音频载荷（PCMA 8 / PCMU 0，默认 8000）与实现一致，保持原样不动。
+    //
+    // Static payloads needing an explicit rtpmap: MP3 (pt=14) and G722 (pt=9).
+    // Their RFC default clocks disagree with what we actually stamp (MP3 90k vs 44.1k,
+    // G722 8k vs 16k), so omitting rtpmap plays them at the wrong speed.
+    if (payload_type < 96 && track.getCodecId() != CodecMP3 && track.getCodecId() != CodecG722) {
         return;
     }
     // MPEG 音频（pt=14）在 RFC 3551 里的编码名是 **MPA**，不是 MP3。

@@ -57,6 +57,11 @@ static inline bool forcedAudioSpec(CodecId codec, int &rate, int &channels) {
             rate = 44100;
             channels = 2;
             return true;
+        case CodecG722:
+            // pt=9 / 16000Hz / 单声道（见 Rtsp.h 的载荷表）
+            rate = 16000;
+            channels = 1;
+            return true;
         default:
             return false;
     }

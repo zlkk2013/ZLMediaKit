@@ -49,6 +49,8 @@ TARGETS = [
     ("AAC", "aac", None, None),      # 采样率/声道跟随源
     # MP3 的 RTP 载荷固定 pt=14 / 44100Hz / 双声道（Rtsp.h），不看源
     ("MP3", "mp3", 44100, 2),
+    # G722 的 RTP 载荷 pt=9 / 16000Hz / 单声道；ffmpeg 里叫 adpcm_g722
+    ("G722", "adpcm_g722", 16000, 1),
 ]
 
 # 时长容差：MP3 有 lame 编码器延迟（576 样本）与帧对齐，放宽到 0.8s
