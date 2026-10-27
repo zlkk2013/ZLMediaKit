@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "Extension/Track.h"
 #include "Extension/Frame.h"
 #include "Codec/Transcoder.h"
@@ -98,6 +99,18 @@ public:
     void setOption(const TranscodeOption &option);
     const TranscodeOption &getOption() const { return _option; }
 
+    /**
+     * 给日志/可观测性用的流标识（如 `__defaultVhost__/live/cam1`）。
+     * 多路并发转码时，帧数计数日志必须能区分是哪一路，否则
+     * `transcoded N frames, index=1` 无法与单路接口返回值对账。
+     *
+     * Stream label for logs (e.g. `__defaultVhost__/live/cam1`). With several
+     * streams transcoding at once an untagged frame count cannot be reconciled
+     * per stream. Set by TranscodeRuntime::attachSink().
+     */
+    void setStreamLabel(std::string label);
+    std::string streamLabel() const;
+
     /** 指定 track 是否正在转码；未转码的轨走原路径，不经本节点 */
     bool isTrackTranscoding(int index) const;
 
@@ -128,12 +141,45 @@ public:
     /** 转码失败的轨数（配置不当/编码器缺失时非 0） */
     size_t failedTrackCount() const;
 
+    /**
+     * 当前已登记的轨是否已经符合给定参数（也就是 setOption 之后能否真正生效）。
+     * 已建好的编码器参数不可变，此时改 codec 只能等重推，调用方据此如实回报
+     * applied=immediate / pending，不能一律说成功了。
+     *
+     * Whether the tracks registered so far already match the given option.
+     * Created encoders cannot change parameters, so a codec switch needs a
+     * republish; the caller uses this to report immediate vs pending honestly.
+     */
+    bool matchesOption(const TranscodeOption &option) const;
+
+    /**
+     * 每条已登记轨的转码状态，供 getTranscode 接口返回明细。
+     * 未转码的轨也会出现在列表里（transcoding=false），否则运维看不出「为什么没转」。
+     *
+     * Per-track status for the getTranscode API. Passthrough tracks are listed
+     * too (transcoding=false), otherwise an operator cannot tell why nothing
+     * happened.
+     */
+    struct TrackStatus {
+        int index = 0;
+        TrackType type = TrackInvalid;
+        /** 源轨 codec */
+        CodecId source_codec = CodecInvalid;
+        /** 目标轨 codec；未转码时等于 source_codec */
+        CodecId target_codec = CodecInvalid;
+        bool transcoding = false;
+        size_t frames = 0;
+    };
+    std::vector<TrackStatus> trackStatus() const;
+
     /** 静音兜底已补出的帧数（判据用：源端断流后该值应持续增长） */
     size_t silenceFrameCount() const;
 
 private:
     struct TrackContext {
         bool transcoding = false;
+        TrackType type = TrackInvalid;
+        CodecId source_codec = CodecInvalid;
         bool audio = false;
         Track::Ptr target_track;
         std::shared_ptr<FFmpegDecoder> decoder;
@@ -196,6 +242,8 @@ private:
 
     mutable std::mutex _mtx;
     TranscodeOption _option;
+    /** 日志用流标识，见 setStreamLabel() / stream label used in logs */
+    std::string _label;
     std::function<size_t()> _reader_count;
     onOutput _on_output;
     std::unordered_map<int, TrackContext> _contexts;

@@ -43,6 +43,9 @@
 #include "Common/config.h"
 #include "Common/MediaSource.h"
 #include "Http/HttpSession.h"
+#if defined(ENABLE_FFMPEG)
+#include "Transcode/TranscodeApi.h"
+#endif//ENABLE_FFMPEG
 #include "Http/HttpRequester.h"
 #include "Player/PlayerProxy.h"
 #include "Pusher/PusherProxy.h"
@@ -1076,6 +1079,21 @@ void installWebApi() {
         CHECK_ARGS("schema","vhost","app","stream");
         val["online"] = (bool) (MediaSource::find(allArgs["schema"],allArgs["vhost"],allArgs["app"],allArgs["stream"]));
     });
+
+    // 转码运维接口 / Transcode control APIs
+    // 实现在 src/Transcode/TranscodeApi.cpp，这里只做注册与 secret 校验
+    // Implementation lives in src/Transcode/TranscodeApi.cpp; only registration
+    // and secret check happen here
+#if defined(ENABLE_FFMPEG)
+    api_regist("/index/api/addTranscode", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        val = addTranscodeApi(allArgs.getArgs());
+    });
+    api_regist("/index/api/getTranscode", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        val = getTranscodeApi(allArgs.getArgs());
+    });
+#endif//ENABLE_FFMPEG
 
     // 获取媒体流播放器列表  [AUTO-TRANSLATED:bcadf31c]
     // Get media stream player list
