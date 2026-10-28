@@ -485,8 +485,22 @@ void RtspSession::onAuthSuccess() {
                     }
                 });
                 if (matched == 0) {
+                    // 关键对照：带 schema 过滤再枚举一次。
+                    // find_l 用的是 for_each_media(schema=rtsp,...)，我这里不带过滤。
+                    // 若「不带过滤能枚举到、带 schema=rtsp 过滤枚举不到」，说明池中该条目的
+                    // _schema 不是 "rtsp" —— 这一条能解释此前所有矛盾。
+                    int by_schema = 0;
+                    MediaSource::for_each_media([&](const MediaSource::Ptr &s) {
+                        auto t = s->getMediaTuple();
+                        if (t.app == info.app && t.stream == info.stream) {
+                            ++by_schema;
+                            WarnL << "DIAG pool(schema-filtered) | schema=" << s->getSchema()
+                                  << " want=" << info.schema;
+                        }
+                    }, info.schema);
                     WarnL << "DIAG pool | no source at all for " << info.shortUrl()
-                          << " (schema=" << info.schema << ")";
+                          << " (schema=" << info.schema << ")"
+                          << " | unfiltered=" << matched << " filtered=" << by_schema;
                 }
             }
             string err = StrPrinter << "no such stream:" << strong_self->_media_info.shortUrl();

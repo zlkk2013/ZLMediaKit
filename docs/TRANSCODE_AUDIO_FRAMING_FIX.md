@@ -806,3 +806,34 @@ api_regist("/index/api/getMediaList", [](API_ARGS_MAP_ASYNC) {
 
 on_demand / 注册空窗 / SDP 空 / 键不一致 / weak_ptr 过期 / 双实例 / 观测结构不同，全部否定。
 现在线索收窄到一个具体可测的点：**池中 RTSP 条目的 `_schema` 实际值**。
+
+### 第九轮：schema 对照跑完，仍是 0/0 —— 矛盾无法在本轮收敛
+
+```
+23:04:59.548 DIAG pool | no source at all for __defaultVhost__/live/rc_h265_h264
+             | unfiltered=0 filtered=0
+```
+
+同时核对了 `MediaTuple` 的定义（`src/Record/Recorder.h:22`）：字段就是 `vhost/app/stream`，
+**我的判据没有用错字段**。因此「那一刻池里一条都没有」是真实的观测，不是插桩 bug。
+
+而采样器（同一进程、同一 `for_each_media`、0.2 秒间隔）在重叠的时间段里一直读到 5 条源，
+且**没有任何状态变化的记录**（采样器只在变化时打印）。
+
+同一个函数、同一个进程、时间重叠，却给出相反结果 —— 这已经超出本轮能用现有手段解释的范围。
+
+### 留给下一个人的完整事实（不要重复已验证的否定）
+
+**已排除**：on_demand、注册空窗、SDP 空、键不一致、weak_ptr 过期、双实例、
+观测结构不同、时间错位、字段用错。
+
+**已确定**：
+1. 转码两例必现，基线必不现（`h265->h264`、`h264->h265` 各失败一次；`enable=0` 通过）。
+2. 服务端走的是 `no such stream` 分支（不是 SDP 无 track）。
+3. `findAsync` 15 秒重试耗尽才回调，404 在耗尽时才发出。
+4. 池里 tuple 与请求完全一致（`__defaultVhost__/live/...`）。
+
+**建议的下一步（换手段，别再读同一个 API）**：
+直接在 `MediaSource::regist()` 和 `unregist()` 里打点（带 `this` 指针、schema、tuple、时间戳），
+把「这个流在池里的生命周期」由**写方**记录下来，而不是由读方（`for_each_media`）去猜。
+写方日志能一次性回答「DESCRIBE 那个时刻键在不在」，不会再有观测角度的歧义。
