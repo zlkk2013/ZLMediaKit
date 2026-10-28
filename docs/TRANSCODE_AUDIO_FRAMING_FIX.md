@@ -602,3 +602,33 @@ AV1 目标、默认开 fmp4、每轮推流 + 观众拉流触发落盘，**连跑
 （或接管时把旧 SDP 一并搬过去）。
 
 **在此之前不写进对外问题清单。**（本条曾被我误报为「源被摘掉的产品缺陷」，已纠正两次。）
+
+### 服务端日志定性（2026-10-28 补）
+
+在测试里把服务端 404 相关日志一并捞出来后，答案不再是「SDP 空」：
+
+```
+RtspSession.cpp:62 onError | RTSP播放器(__defaultVhost__/live/rc_h265_h264)断开:
+                          no such stream:__defaultVhost__/live/rc_h265_h264,耗时(s):15
+```
+
+走的是**「找不到源」分支**（`MediaSource::findAsync` 返回空），不是「SDP 里无有效 track」
+（那支会打 `sdp中无有效track，该流无效`，本次没有出现）。
+
+于是留下一个**自相矛盾的观测**：
+
+| 观测手段 | 结果 |
+|---|---|
+| `getMediaList`（每 200ms 采样） | 该流的 `fmp4/hls/rtmp/rtsp/ts` 全程都在 |
+| 服务端 `findAsync`（DESCRIBE 路径） | `no such stream` |
+
+同一时刻「池里有」和「find 找不到」并存 ⇒ 差异只可能在**查找键**上：
+`_media_info`（vhost/app/stream，来自 DESCRIBE 的 URL）与池中条目的 tuple 不一致，
+或者 `findAsync` 走的不是 `s_media_source_map` 这一份表，或者转码路径下 RTSP 源
+被注册到了一个 `getMediaList` 也会列、但 `find` 不认的位置。
+
+### 下一步（仍是插桩，别猜）
+
+在 `RtspSession::onAuthSuccess` 的 `!rtsp_src` 分支打印：
+`_media_info.vhost/app/stream` + `MediaSource::find` 各协议表的命中情况；
+再和池里该条目实际的 vhost/app/stream 对比。**两个 tuple 一比就出结论。**

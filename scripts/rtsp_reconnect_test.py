@@ -243,6 +243,16 @@ def case(tag, src, want_codec, video, enable=1):
         time.sleep(0.3)
         if FAIL and len(FAIL) > len(fail_snapshot):
             timeline_dump(tag)
+            # 服务端 404 的两个分支：找不到源 / SDP 里没有有效 track。
+            # 这两句能一次定性，别再靠猜（实测被误判过两轮）。
+            try:
+                hits = [l for l in open(LOG, errors="replace").read().splitlines()
+                        if "无有效track" in l or "no such stream" in l or "404" in l]
+                print(f"     ↳ 服务端 404 相关日志 {len(hits)} 行：")
+                for l in hits[-4:]:
+                    print("        " + l[-160:])
+            except Exception as e:
+                print(f"     ↳ 读服务端日志失败：{e}")
 
 print("=" * 76)
 print("RTSP 断连续推验收（模拟摄像机重连）")
