@@ -68,3 +68,4 @@ config.reverse.ini
 config.camera.ini
 config.reconnect.ini
 config.liveness.ini
+config.release.ini
