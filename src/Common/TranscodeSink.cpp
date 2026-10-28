@@ -685,21 +685,40 @@ void TranscodeSink::onSilenceTick() {
 }
 
 void TranscodeSink::teardown(int index) {
-    lock_guard<mutex> lck(_mtx);
-    auto it = _contexts.find(index);
-    if (it == _contexts.end()) {
-        return;
+    // 不能在持 _mtx 的情况下 flush / 析构：解码器 flush 会同步回调 onDecoded()，
+    // 那里要拿 _mtx，非递归锁 ⇒ 同一线程自死锁（与 ~TranscodeSink 完全同一个坑，
+    // 那边已修）。这里先把 TrackContext 移出来，锁外再 flush/停线程。
+    //
+    // 现状：本函数目前没有调用方（resetTracks 走的是别的路径），所以这是潜在陷阱
+    // 而不是活跃缺陷；仍按同样模式修掉，避免以后接上调用时踩同一个坑。
+    //
+    // Never flush or destroy while holding _mtx: a decoder flush re-enters
+    // onDecoded() synchronously, which takes _mtx (non-recursive) and deadlocks the
+    // calling thread — the exact bug already fixed in ~TranscodeSink. Move the
+    // context out first, then flush and stop threads outside the lock.
+    //
+    // Note: this function currently has no callers (resetTracks takes another path),
+    // so this is a latent trap rather than an active defect; fixed anyway so wiring
+    // it up later cannot reintroduce the deadlock.
+    TrackContext ctx;
+    {
+        lock_guard<mutex> lck(_mtx);
+        auto it = _contexts.find(index);
+        if (it == _contexts.end()) {
+            return;
+        }
+        ctx = std::move(it->second);
+        _contexts.erase(it);
     }
-    if (it->second.decoder) {
-        it->second.decoder->flush();
-        it->second.decoder->stopThread(true);
+    if (ctx.decoder) {
+        ctx.decoder->flush();
+        ctx.decoder->stopThread(true);
     }
-    if (it->second.encoder) {
-        it->second.encoder->flush();
-        it->second.encoder->stopThread(true);
+    if (ctx.encoder) {
+        ctx.encoder->flush();
+        ctx.encoder->stopThread(true);
     }
-    InfoL << "transcode stopped, index=" << index << ", frames=" << it->second.frame_count;
-    _contexts.erase(it);
+    InfoL << "transcode stopped, index=" << index << ", frames=" << ctx.frame_count;
 }
 
 void TranscodeSink::resetTracks() {
