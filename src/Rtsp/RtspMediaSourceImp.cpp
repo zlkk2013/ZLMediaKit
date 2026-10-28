@@ -46,6 +46,15 @@ void RtspMediaSource::onWrite(RtpPacket::Ptr rtp, bool keyPos) {
     PacketCache<RtpPacket>::inputPacket(stamp, is_video, std::move(rtp), keyPos);
 }
 
+RtspMediaSourceImp::~RtspMediaSourceImp() {
+    if (_muxer && _option.enable_rtsp) {
+        // 只有本流自己占着对外 RTSP 源时才需要主动释放（见头文件说明）
+        // Only needed when this stream owns the published RTSP source
+        InfoL << "pusher gone, release published sources of " << getUrl();
+        _muxer->releaseMediaSources();
+    }
+}
+
 RtspMediaSourceImp::RtspMediaSourceImp(const MediaTuple& tuple, int ringSize): RtspMediaSource(tuple, ringSize)
 {
     _demuxer = std::make_shared<RtspDemuxer>();
@@ -123,6 +132,15 @@ void RtspMediaSourceImp::setProtocolOption(const ProtocolOption &option)
     _transcode_enabled = resolveTranscodeEnable();
     _option.enable_rtsp = direct_proxy ? _transcode_enabled : true;
     _muxer = std::make_shared<MultiMediaSourceMuxer>(_tuple, _demuxer->getDuration(), _option);
+    if (_option.enable_rtsp) {
+        // 让 muxer 的 RTSP 输出源认回推流端：断连重推时 ANNOUNCE 靠这条弱引用
+        // 找回本对象做所有权转移，而不是只看到一个“陌生”的 muxer 源就回 406。
+        // Link the muxer's RTSP source back to the pusher: on reconnect ANNOUNCE
+        // uses it to find this object for an ownership takeover instead of 406ing.
+        if (auto rtsp_src = std::dynamic_pointer_cast<RtspMediaSource>(_muxer->getRtspMediaSource())) {
+            rtsp_src->setPushSource(std::static_pointer_cast<RtspMediaSource>(shared_from_this()));
+        }
+    }
     _muxer->setMediaListener(getListener());
     _muxer->setTrackListener(std::static_pointer_cast<RtspMediaSourceImp>(shared_from_this()));
     // 让_muxer对象拦截一部分事件(比如说录像相关事件)  [AUTO-TRANSLATED:32320477]

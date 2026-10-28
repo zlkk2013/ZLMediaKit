@@ -687,6 +687,53 @@ EventPoller::Ptr MultiMediaSourceMuxer::getOwnerPoller(MediaSource &sender) {
     }
 }
 
+MediaSource::Ptr MultiMediaSourceMuxer::getRtspMediaSource() const {
+    return _rtsp ? _rtsp->getMediaSource() : nullptr;
+}
+
+void MultiMediaSourceMuxer::releaseMediaSources() {
+#if defined(ENABLE_FFMPEG)
+    // 先丢转码节点：TranscodeSink 里的编解码器持有源 Track，而源 Track 的 delegate
+    // 又强引用本 muxer（FrameDispatcher::_delegates 存的是 shared_ptr）。
+    // Drop the transcode node first: the codecs inside TranscodeSink hold the source
+    // Track, whose delegate keeps this muxer alive (FrameDispatcher stores shared_ptr).
+    _transcode = nullptr;
+#endif//ENABLE_FFMPEG
+    // 再显式注销每个转协议输出源。
+    //
+    // 不能只靠析构：上面那条引用链（以及转码帧在环形缓冲里的残留引用）会让
+    // muxer 或其源对象活着但不工作，而媒体源池里的键只有 unregist() 才摘得掉，
+    // 否则同名推流重连时 regist() 直接抛 media source already existed。
+    //
+    // Unregister every published source explicitly. Relying on destruction is not
+    // enough: the chain above (plus leftover ring-buffer references) can keep the
+    // muxer or its sources alive; only unregist() clears the pool key, otherwise a
+    // reconnecting publisher hits "media source already existed" in regist().
+    MediaSource::Ptr published[] = {
+            getRtspMediaSource(),
+            _rtmp ? _rtmp->getMediaSource() : nullptr,
+            _ts ? _ts->getMediaSource() : nullptr,
+            _fmp4 ? _fmp4->getMediaSource() : nullptr,
+            _hls ? _hls->getMediaSource() : nullptr,
+            _hls_fmp4 ? _hls_fmp4->getMediaSource() : nullptr,
+    };
+    for (auto &src : published) {
+        if (src) {
+            src->releaseFromPool();
+        }
+    }
+    _rtmp = nullptr;
+    _rtsp = nullptr;
+    _fmp4 = nullptr;
+    _ts = nullptr;
+    _mp4 = nullptr;
+    _hls = nullptr;
+    _hls_fmp4 = nullptr;
+#if defined(ENABLE_RTPPROXY)
+    _rtp_sender.clear();
+#endif // ENABLE_RTPPROXY
+}
+
 bool MultiMediaSourceMuxer::close(MediaSource &sender) {
     MediaSourceEventInterceptor::close(sender);
     _rtmp = nullptr;

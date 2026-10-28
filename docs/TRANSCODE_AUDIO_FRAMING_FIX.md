@@ -329,20 +329,131 @@ DESCRIBE 仍返回推流端原始 SDP（`a=control:streamid=`），即 direct-pr
 **持续吞吐（15 秒连续拉流）**：H265→H264 单视频 227 包 / 期望 225，音视频同转 229 / 225，
 均 0 解码错误 —— 转码不会是 "前 5 秒正常、后面卡住"。
 
-**新增已知限制（本次改动暴露，但不是本次引入）**：转码流的 RTSP **断连续推**会失败。
-对外 RTSP 源变成 muxer 的 `RtspMediaSource` 后，`RtspSession::handleReq_ANNOUNCE` 里
-`dynamic_pointer_cast<RtspMediaSourceImp>(src)` 拿不到推流端对象，直接 406。实测：
+---
 
-| 配置 | 重推后推流进程 | 日志 |
-|---|---|---|
-| 开转码（H265→H264） | 立即退出 | `ANNOUNCE: Already publishing` ×1 |
-| 不开转码（direct-proxy） | 存活，继续出流 | 无 |
+## 10.5 RTSP 推流断连重推 406（`Already publishing`）：已修复
 
-这与上游 `directProxy=0` 的行为完全一致（非 direct-proxy 时 Imp 本来就不注册），但启用转码后
-**默认**落到这个模式，运营上必须知道。要修得让 muxer 的 RTSP 源能找回 `RtspMediaSourceImp`
-做所有权转移，单独一轮。
+现场最痛的一条：**启用转码后，摄像机断开重连（重新 ANNOUNCE）拿 406 立即退出，再也不上来**；
+不开转码时重推正常。本节是 §10.4 遗留限制的修复记录，复现与验收脚本为
+`scripts/rtsp_repush_check.py`（自带断点、跨断点观众、断点后再拉流验证）。
 
-**未验证**
+### 10.5.1 复现（修复前，真机）
+
+H265 源 → `video_codec=H264`，推流端 `kill -9` 后 2 秒重推：
+
+```
+== 重推 ffmpeg 返回码: 1
+   | [rtsp @ 0x13d80ff50] method ANNOUNCE failed: 406 Not Acceptable
+   | [out#0/rtsp @ 0x13d80fe90] Could not write header (incorrect codec parameters ?): Server returned 4XX Client Error, but not one of 40{0,1,3,4}
+   | Conversion failed!
+服务端: RtspSession.cpp | ANNOUNCE: Already publishing:__defaultVhost__/live/xxx
+```
+
+### 10.5.2 机制（三条叠加，缺一条都到不了“永久 406”）
+
+1. **池里的键换了主人**：启用转码后 `RtspMediaSourceImp` 不再透传源 RTP（§10.4），
+   它的 `_ring` 因此从不创建，`RtspMediaSource::onWrite` 里的 `regist()` 也就从不触发；
+   池里 `RTSP/live/<stream>` 这个键由 muxer 建的 `RtspMediaSource` 注册
+   （`RtspMediaSourceMuxer::addTrackCompleted` 写入 SDP 后首次 flush 即注册）。
+2. **ANNOUNCE 只认推流端对象**：`handleReq_ANNOUNCE` 拿到源后做
+   `dynamic_pointer_cast<RtspMediaSourceImp>(src)`，拿不到就 `push_failed = true` → 406。
+   于是 15 秒（`continue_push_ms`）宽限期内的重推必挂。
+3. **键永远不释放**（这才是“再也不上来”的原因，实测 gap=20s / 75s 仍然 406）：
+   推流端 `RtspMediaSourceImp` 会在宽限期结束时正常析构（加探针确认过），但 `MultiMediaSourceMuxer`
+   不死 —— 它 `_transcode`（`TranscodeSink`）里的解码器/编码器持有**源 Track**，而源 Track 的
+   `FrameDispatcher::_delegates` 存的是 muxer 的 `shared_ptr`（`track->addDelegate(_muxer)`），
+   构成引用环 `muxer → TranscodeSink → 编解码器 → 源 Track →(delegate)→ muxer`。
+   实测断开 25 秒后 `getStatistic` 里 `MultiMediaSourceMuxer` 仍为 1、
+   `isMediaOnline` 对 rtsp/rtmp/ts/fmp4/hls **全部 true**；重推在 gap=75s 时仍 406。
+   （不开转码时 muxer 正常析构，所以基线不受影响。）
+
+顺带查出的第二个坑：修第 3 条时第一次实现（在推流端析构里 `_transcode = nullptr`）直接把 poller
+线程卡死 —— `sample` 取样 1749/1749 帧停在：
+
+```
+~RtspMediaSourceImp → MultiMediaSourceMuxer::releaseMediaSources
+  → ~TranscodeSink → __deallocate_node → ~FFmpegDecoder → FrameMerger::flush
+    → FFmpegDecoder::decodeFrame → TranscodeSink::onDecoded → std::mutex::lock()
+```
+
+`~TranscodeSink()` 持着 `_mtx` 销毁 `TrackContext`，解码器析构会 flush 残留帧，flush 同步回调
+`onDecoded()` 里再取同一把**非递归** `_mtx` ⇒ 同一线程自死锁。
+
+### 10.5.3 修法（4 处，均只在“muxer 占着对外 RTSP 源”时生效）
+
+| 文件 | 改动 |
+|---|---|
+| `Rtsp/RtspMediaSource.h` | 新增 `setPushSource()` / `isPushShadow()` / `getPushSource()`：影子源上一个弱引用指回推流端；`_has_push_src` 在推流端销毁后仍为 true，用于区分“rtmp 推转 rtsp 生成的源” |
+| `Rtsp/RtspMediaSourceImp.cpp` `setProtocolOption` | 建完 muxer 后，若 `_option.enable_rtsp`（转码，或 `directProxy=0`），把本 Imp 挂到 muxer 的 RTSP 输出源上（`MultiMediaSourceMuxer::getRtspMediaSource()` 新增） |
+| `Rtsp/RtspSession.cpp` `handleReq_ANNOUNCE` | 直接 cast 失败时，顺着影子源的弱引用找回 `RtspMediaSourceImp`，**继续走既有的 `getOwnership()` 接管路径**（拿不到所有权仍 406，即“真有人在推”的语义不变） |
+| `Rtsp/RtspMediaSourceImp.cpp` 析构 + `Common/MultiMediaSourceMuxer.*` | 推流端析构（= 宽限期到期，这条流真的结束）调用 `releaseMediaSources()`：先 `_transcode = nullptr` 断环，再对 rtsp/rtmp/ts/fmp4/hls 输出源逐个 `releaseFromPool()`（`MediaSource` 新增的公开入口，把键从池里摘掉，不依赖对象析构） |
+| `Common/TranscodeSink.cpp` 析构 | 先把 `_contexts` 换出来再在锁外 `stopThread` / 析构，消掉上面那个自死锁 |
+
+设计取舍：**宽限期内不重建流水线**，而是接管原来的 `RtspMediaSourceImp`（和 direct-proxy 完全一致的语义），
+因此观众在断点前后继续看同一条流，转码参数与 demuxer 也都沿用；宽限期过后才释放全部输出源、
+下一次推流是全新的源（与基线“流结束就注销”一致）。
+
+### 10.5.4 实测（真机，macOS，RTSP 推 → RTSP 拉，`scripts/rtsp_repush_check.py`）
+
+修复后同一用例（gap=2s，推流端 SIGKILL 后重推）：
+
+```
+== 重推 ffmpeg 返回码: 仍在运行 (None)
+   | frame=    0 fps=0.0 q=-1.0 size=       0kB time=-00:00:00.13 bitrate=  -0.0kbits/s
+   | frame=   17 fps= 17 q=-1.0 size=N/A time=00:00:01.00 bitrate=N/A speed=0.995x
+   | frame=   48 fps= 16 q=-1.0 size=N/A time=00:00:03.04 bitrate=N/A speed=   1x
+   | frame=   86 fps= 15 q=-1.0 size=N/A time=00:00:05.57 bitrate=N/A speed=   1x
+```
+
+| 用例 | 重推 | 重推后 SDP | 重推后拉流 | 5 秒包数 / 解码 | 跨断点观众 |
+|---|---|---|---|---|---|
+| H265→H264（gap 2s） | 存活，无 406 | `H264/90000` + `trackID=0` | h264 640x360 | 77 包 / 0 错误 | 录像 14.01s / 217 包，**不断流** |
+| H264→H265（gap 2s） | 存活，无 406 | `H265/90000` + `trackID=0` | hevc 640x360 | 77 包 / 0 错误 | 录像 14.05s / 219 包，**不断流** |
+| H264→VP8（gap 2s） | 存活，无 406 | `VP8/90000` + `trackID=0` | vp8 640x360 | 76 包 / 0 错误 | 录像 13.99s / 212 包（存 `.ivf`，mp4 装不了 VP8） |
+| H265→H264（gap 25s，宽限期外） | 存活，无 406 | `H264/90000` + `trackID=0` | h264 640x360 | 75 包 / 0 错误 | 断点后观众被断开（流真结束，基线同） |
+
+宽限期外重推后 `getStatistic`：`MultiMediaSourceMuxer` 1 → 0、`MediaSource` 8 → 1，
+`isMediaOnline` 全部 false —— 池里没有残留键，所以新推流能正常注册。
+
+**基线回归（不开转码，direct-proxy 语义必须一模一样）**
+
+| 用例 | 重推 | 重推后 SDP | 拉流 | 5 秒包数 / 解码 |
+|---|---|---|---|---|
+| H264 基线（gap 2s） | 存活，无 406 | 仍是推流端原始 SDP（`a=control:streamid=0`） | h264 640x360（未重编码） | 73 包 / 0 错误 |
+| H265 基线（gap 2s） | 存活，无 406 | 同上（`streamid=0`） | hevc 640x360（未重编码） | 57 包 / 0 错误 |
+
+基线路径本身没被改：`_option.enable_rtsp` 为 false 时 `~RtspMediaSourceImp` 不做任何释放，
+`ANNOUNCE` 的第一分支（直接拿到 Imp）照旧命中，转码节点根本不存在。
+
+**负向用例（不能为了修重推就放开接管）**
+
+| 场景 | 结果 |
+|---|---|
+| 原推流端还在推，第二个推流端 ANNOUNCE 同一路 | 406（影子源找回了 Imp，但 `getOwnership()` 失败） |
+| rtmp 推流 `live/rto` 进行中，rtsp ANNOUNCE 同一路 | 406（该 muxer 源不是影子源，无弱引用可跟） |
+
+日志会把占键的源类型打出来，便于现场区分这两种情况：
+
+```
+ANNOUNCE: take over published RTSP source of __defaultVhost__/live/dup1 (muxer-owned, transcode/direct-proxy off)
+ANNOUNCE refused, stream already in use by rtsp://__defaultVhost__/live/dup1 (mediakit::RtspMediaSource)
+```
+
+### 10.5.5 本次未做 / 已知仍有问题
+
+- **rtmp 推流 + 转码同样有那个引用环**：`RtmpMediaSourceImp` 没有对应的 `releaseMediaSources()`，
+  所以 muxer 仍然泄漏（rtmp 键由 Imp 自己占着，重推不受影响，真正受影响的是 rtmp/ts/hls
+  输出源残留在池里）。修法同构，未做也未验证。
+- `TranscodeSink::teardown()`（`resetTracks` 路径）同样是“持 `_mtx` 调 `decoder->flush()`”，
+  理论上有同款自死锁，未实测、未改。
+- 宽限期内重推沿用的是第一次的 demuxer/SDP：摄像机重连后若 SDP 变了（改分辨率/换编码），
+  要等宽限期（默认 15s）过后重推才会按新 SDP 建源。未实测。
+- 只验证 RTSP 推 → RTSP 拉；转码叠加 `directProxy=0` 的 rtmp/webrtc 拉流未重跑。
+- Windows / Linux 未跑。
+
+---
+
+**未验证（10.4 当时的口径，重推这一项已在 10.5 修掉并验收）**
 
 - 只验证了 RTSP 推 → RTSP 拉；RTSP 推 → RTMP/HLS/WebRTC 拉在关掉 direct-proxy 后走既有非代理
   路径，本次未重跑回归（之前 `[rtsp] directProxy=0` 的既有行为未变，但转码叠加后未实测）

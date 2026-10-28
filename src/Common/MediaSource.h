@@ -534,6 +534,28 @@ public:
     // 遍历所有流  [AUTO-TRANSLATED:a39b2399]
     // Traverse all streams
     static void for_each_media(const std::function<void(const Ptr &src)> &cb, const std::string &schema = "", const std::string &vhost = "", const std::string &app = "", const std::string &stream = "");
+    /**
+     * 主动把本源从媒体源池里摘掉（对象本身不销毁）。
+     *
+     * 正常生命周期里由析构函数调用 unregist()，但转码链路存在引用环
+     * （muxer → TranscodeSink → 编解码器 → 源 Track →(FrameDispatcher 的 delegate)→ muxer），
+     * 推流端退出后 muxer 和它发布的源可能永远不析构，池里的同名键也就永远不释放，
+     * 推流端重连时 ANNOUNCE 只能回 406 Already publishing。
+     * 这个入口给“推流端已经走了，把对外源摘掉”的场景用。
+     *
+     * Remove this source from the pool without destroying the object.
+     *
+     * The destructor normally calls unregist(), but the transcode pipeline has a
+     * reference cycle (muxer -> TranscodeSink -> codecs -> source Track ->
+     * (FrameDispatcher delegate) -> muxer), so after the pusher exits the muxer and
+     * its published sources may never destruct and the pool key is never freed,
+     * leaving reconnects with 406 Already publishing. This entry point exists for
+     * the "pusher is gone, drop the published source" case.
+     */
+    bool releaseFromPool() {
+        return unregist();
+    }
+
     // 从mp4文件生成MediaSource  [AUTO-TRANSLATED:7df9762e]
     // Generate MediaSource from mp4 file
     static MediaSource::Ptr createFromMP4(const std::string &schema, const std::string &vhost, const std::string &app, const std::string &stream, const std::string &file_path = "", bool check_app = true);

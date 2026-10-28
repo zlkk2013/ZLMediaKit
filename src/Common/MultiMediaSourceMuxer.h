@@ -88,6 +88,36 @@ public:
     bool isEnabled();
 
     /**
+     * 本 muxer 的 RTSP 输出源（未开启 RTSP 转协议时为空）。
+     *
+     * 推流端（RtspMediaSourceImp）需要拿到它，把自己登记成它的“推流源”，
+     * 否则推流端断连重推时 ANNOUNCE 只找到这个 muxer 源，认不出它背后还有
+     * 一个可接管的推流端，只能回 406 Already publishing。
+     *
+     * RTSP output source of this muxer (null when RTSP conversion is off).
+     * The RTSP pusher needs it to register itself as its push source; otherwise a
+     * reconnecting pusher only finds this muxer source in the pool and cannot
+     * realize a takeover is possible, and answers 406 Already publishing.
+     */
+    MediaSource::Ptr getRtspMediaSource() const;
+
+    /**
+     * 推流端对象销毁时调用：丢弃本 muxer 的全部转协议输出源。
+     *
+     * 启用转码后 muxer 内部存在引用环：
+     * `muxer → TranscodeSink → 编解码器 → 源 Track →(FrameDispatcher 的 delegate)→ muxer`，
+     * 环不断开则 muxer 永不析构，它对外发布的源（含 RTSP 源）会一直留在媒体源池里，
+     * 推流端重连时 ANNOUNCE 永远拿到 Already publishing。
+     *
+     * Called when the pusher object is destroyed: drop every output source.
+     * With transcoding there is a reference cycle
+     * `muxer -> TranscodeSink -> codec -> source Track -> (FrameDispatcher delegate) -> muxer`,
+     * so without breaking it the muxer never dies and its published sources keep the
+     * pool keys, making every reconnect answer "Already publishing".
+     */
+    void releaseMediaSources();
+
+    /**
      * 重置track
      * Reset track
      
