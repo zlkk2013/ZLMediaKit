@@ -145,6 +145,8 @@ def hard_errors(stream, secs=4):
 _TL = []          # 采样到的媒体源存在性时间轴
 _TL_ON = [False]
 
+_HTTP_PID = [None]
+
 def _sampler(stream, stop):
     """每 200ms 记一次该流的协议源列表，用来把「源在不在」和 404 的时刻对齐。
     之前只能看到『404 空窗 16s』这个结论，却不知道键是什么时候没的 —— 就是因为没有时间轴。"""
@@ -162,7 +164,13 @@ def _sampler(stream, stop):
                                 for d in data if d.get("stream") == stream})
             except Exception:
                 names = ["<api-fail>"]
-            _TL.append((round(time.time() - t0, 2), names))
+            if _HTTP_PID[0] is None:
+                # 记下「谁在服务 HTTP」：若与 RTSP 端口不是同一个 pid，
+                # 说明池里的源和 DESCRIBE 根本不是同一个进程在看
+                p = sh(f"/usr/sbin/lsof -nP -tiTCP:{HTTP} -sTCP:LISTEN").stdout.strip().split()
+                _HTTP_PID[0] = f"http_pid={p[0] if p else '?'} rtsp_pid=" \
+                               f"{sh(f'/usr/sbin/lsof -nP -tiTCP:{RTSP} -sTCP:LISTEN').stdout.strip() or '?'}"
+            _TL.append((round(time.time() - t0, 2), names + [_HTTP_PID[0]]))
             time.sleep(0.2)
     t = threading.Thread(target=run, daemon=True)
     t.start()
@@ -250,7 +258,8 @@ def case(tag, src, want_codec, video, enable=1):
             # 这两句能一次定性，别再靠猜（实测被误判过两轮）。
             try:
                 hits = [l for l in open(LOG, errors="replace").read().splitlines()
-                        if "无有效track" in l or "no such stream" in l or "404" in l]
+                        if "无有效track" in l or "no such stream" in l or "404" in l
+                        or "DIAG pool" in l]
                 print(f"     ↳ 服务端 404 相关日志 {len(hits)} 行：")
                 for l in hits[-4:]:
                     print("        " + l[-160:])

@@ -667,3 +667,25 @@ RtspSession.cpp:62 onError | RTSP播放器(__defaultVhost__/live/rc_h265_h264)�
 
 > 记录：本条先后被误判为 on_demand、注册空窗、SDP 为空、键不一致，四次都被实测否掉。
 > 教训是**每次都要先问「这个假设用什么观测能证伪」，而不是顺着上一个假设往下推**。
+
+### 第五轮：进程内枚举 vs HTTP 枚举，结论相反（关键矛盾）
+
+在 `RtspSession::onAuthSuccess` 的 404 分支插入诊断（对 app+stream 匹配的源全部打印）：
+
+```
+DIAG pool | no source at all for __defaultVhost__/live/rc_h265_h264 (schema=rtsp)
+```
+
+即：**进程内 `MediaSource::for_each_media` 一条都没有**。而同一时刻脚本通过
+`/index/api/getMediaList` 反复读到该流的 `fmp4/hls/rtmp/rtsp/ts` 五条都在。
+
+两者的键（`__defaultVhost__/live`）完全一致，`regist()` 对过期 weak_ptr 也会覆盖，
+所以「过期条目卡住」不成立。**唯一还能同时成立的解释是：HTTP 与 RTSP 落在了两个不同的
+MediaServer 进程上**（例如上一用例的进程没退干净，仍占用 HTTP 端口，于是 `getMediaList`
+回答的是旧进程；而 DESCRIBE 走 RTSP 端口，命中的是新进程，它确实什么都没有）。
+
+### 验证方法（下一步，一次运行即可）
+
+采样时**持续**记录 `lsof -nP -tiTCP:57080` 和 `:56554` 的 pid，两者不同即坐实。
+（本次尝试失败：pid 只在第一次采样时取，那时服务还没起来，缓存成了 `?`。
+ 教训：诊断代码本身也要有判据，不能「取一次就缓存」。）

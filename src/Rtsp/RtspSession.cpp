@@ -462,6 +462,33 @@ void RtspSession::onAuthSuccess() {
         auto rtsp_src = dynamic_pointer_cast<RtspMediaSource>(src);
         if (!rtsp_src) {
             //未找到相应的MediaSource
+            //
+            // 诊断：把「404 那一刻池里到底有什么」打出来。
+            // 之前观测到「getMediaList 列出该流、这里却找不到」的自相矛盾，靠这一行定性：
+            // 若池里同 tuple 的源存在但 schema 不是 rtsp（或指针为空），说明找错了层；
+            // 若一条都没有，说明池里的键已经空（weak_ptr 过期但条目没摘）。
+            {
+                auto &info = strong_self->_media_info;
+                int matched = 0;
+                MediaSource::for_each_media([&](const MediaSource::Ptr &s) {
+                    if (!s) {
+                        WarnL << "DIAG pool | null entry under " << info.shortUrl();
+                        return;
+                    }
+                    auto t = s->getMediaTuple();
+                    if (t.app == info.app && t.stream == info.stream) {
+                        ++matched;
+                        WarnL << "DIAG pool | hit schema=" << s->getSchema()
+                              << " vhost=" << t.vhost << " app=" << t.app << " stream=" << t.stream
+                              << " readerCount=" << s->readerCount()
+                              << " findSchema=" << info.schema;
+                    }
+                });
+                if (matched == 0) {
+                    WarnL << "DIAG pool | no source at all for " << info.shortUrl()
+                          << " (schema=" << info.schema << ")";
+                }
+            }
             string err = StrPrinter << "no such stream:" << strong_self->_media_info.shortUrl();
             strong_self->send_StreamNotFound();
             strong_self->shutdown(SockException(Err_shutdown,err));
