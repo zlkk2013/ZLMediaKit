@@ -164,13 +164,14 @@ def _sampler(stream, stop):
                                 for d in data if d.get("stream") == stream})
             except Exception:
                 names = ["<api-fail>"]
-            if _HTTP_PID[0] is None:
-                # 记下「谁在服务 HTTP」：若与 RTSP 端口不是同一个 pid，
-                # 说明池里的源和 DESCRIBE 根本不是同一个进程在看
-                p = sh(f"/usr/sbin/lsof -nP -tiTCP:{HTTP} -sTCP:LISTEN").stdout.strip().split()
-                _HTTP_PID[0] = f"http_pid={p[0] if p else '?'} rtsp_pid=" \
-                               f"{sh(f'/usr/sbin/lsof -nP -tiTCP:{RTSP} -sTCP:LISTEN').stdout.strip() or '?'}"
-            _TL.append((round(time.time() - t0, 2), names + [_HTTP_PID[0]]))
+            # 每次采样都取端口归属（不能缓存！上一版只在首次取样，那时服务还没起来，
+            # 缓存成了 '?'，白跑一轮）。若 HTTP 与 RTSP 不是同一个 pid，
+            # 说明 getMediaList 与 DESCRIBE 根本不在同一个进程里 —— 那 404 就是双实例。
+            if len(_TL) % 5 == 0:      # 每 ~1 秒取一次，别把采样拖慢
+                hp = sh(f"/usr/sbin/lsof -nP -tiTCP:{HTTP} -sTCP:LISTEN").stdout.strip().split()
+                rp = sh(f"/usr/sbin/lsof -nP -tiTCP:{RTSP} -sTCP:LISTEN").stdout.strip().split()
+                _HTTP_PID[0] = f"pid http={hp[0] if hp else '?'} rtsp={rp[0] if rp else '?'}"
+            _TL.append((round(time.time() - t0, 2), names + ([_HTTP_PID[0]] if _HTTP_PID[0] else [])))
             time.sleep(0.2)
     t = threading.Thread(target=run, daemon=True)
     t.start()

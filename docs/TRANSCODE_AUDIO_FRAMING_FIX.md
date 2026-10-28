@@ -689,3 +689,47 @@ MediaServer 进程上**（例如上一用例的进程没退干净，仍占用 HT
 采样时**持续**记录 `lsof -nP -tiTCP:57080` 和 `:56554` 的 pid，两者不同即坐实。
 （本次尝试失败：pid 只在第一次采样时取，那时服务还没起来，缓存成了 `?`。
  教训：诊断代码本身也要有判据，不能「取一次就缓存」。）
+
+### 第六轮：确认同一进程，双实例假设否掉
+
+持续采样端口归属（每 ~1 秒一次，不再缓存）：
+
+```
+2.40s  pid http=86486 rtsp=86486
+3.72s  pid http=86486 rtsp=86486
+24.40s pid http=86486 rtsp=86486
+```
+
+HTTP 与 RTSP 是**同一个 pid** ⇒「两个实例互相看不见」不成立。
+
+### 现在的矛盾（第 6 条假设后的剩余事实）
+
+同一个进程里：
+- `getMediaList`（HTTP 接口）在整个窗口内都能列出该流的 5 条协议源；
+- `for_each_media`（DESCRIBE 路径内部）打出来的是 `no source at all`。
+
+两者都自称读的是 `s_media_source_map`。这说明 **`getMediaList` 并不只是枚举注册表**，
+它可能触发/返回了别的东西（例如按 `MediaSource::find(..., from_mp4=true)` 创建/复活源，
+或枚举的是另一个缓存层）。这一点尚未读透 `server/WebApi.cpp` 里 `getMediaList` 的实现。
+
+### 下一步（精确到函数）
+
+1. 读 `server/WebApi.cpp` 的 `getMediaList` 实现，确认它到底遍历哪个结构；
+2. 在 DIAG 那行把时间戳一起打全（测试日志尾部截断丢了前缀，无法与 404 时刻对齐）；
+3. 若 `getMediaList` 走的是 `find(from_mp4=true)`，那它显示的「源在」本身就是假象 ——
+   **采样器这个观测手段从根上就不可靠**，得换成在 `regist()/unregist()` 里打点。
+
+### 复盘：六条假设
+
+| # | 假设 | 结果 |
+|---|---|---|
+| 1 | on_demand 下架 | 否 |
+| 2 | 注册空窗 | 否（键一直在，但那是假象） |
+| 3 | SDP 为空 | 否（no such stream） |
+| 4 | 查找键不一致 | 否（tuple 相同） |
+| 5 | weak_ptr 过期卡键 | 否（regist 会覆盖） |
+| 6 | HTTP/RTSP 双实例 | 否（同一 pid） |
+
+六条全否，说明**观测手段本身有问题**：`getMediaList` 被当成了「池里有没有」的判据，
+而它显然不等于 `for_each_media`。下一步应先把观测手段换成 `regist/unregist` 打点，
+再谈根因 —— 否则还会继续在错误的观测上推假设。
