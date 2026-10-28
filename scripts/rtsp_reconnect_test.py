@@ -14,7 +14,7 @@
 用法：env -u PYTHONPATH python3 scripts/rtsp_reconnect_test.py
 端口：RTMP 56900 / RTSP 56554 / HTTP 57080
 """
-import json, os, re, signal, socket, subprocess, sys, time
+import json, os, re, signal, socket, subprocess, sys, time, urllib.request
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = f"{WT}/release/darwin/Release/MediaServer"
@@ -24,6 +24,7 @@ HTTP, RTMP, RTSP = 57080, 56900, 56554
 LOG = "/tmp/reconnect.log"
 SRC_H265 = "/tmp/src_h265.mp4"
 SRC_H264 = "/tmp/av_test.mp4"
+SECRET = "5j9gfMmxP1l7Ox1lrhUm1l3SsWA5dz4z"   # 本机测试用，仅内网
 
 PASS, FAIL = [], []
 
@@ -141,6 +142,41 @@ def hard_errors(stream, secs=4):
     return hard
 
 
+_TL = []          # 采样到的媒体源存在性时间轴
+_TL_ON = [False]
+
+def _sampler(stream, stop):
+    """每 200ms 记一次该流的协议源列表，用来把「源在不在」和 404 的时刻对齐。
+    之前只能看到『404 空窗 16s』这个结论，却不知道键是什么时候没的 —— 就是因为没有时间轴。"""
+    import threading
+    def run():
+        t0 = time.time()
+        while not stop.is_set():
+            try:
+                body = urllib.request.urlopen(
+                    f"http://127.0.0.1:{HTTP}/index/api/getMediaList?secret={SECRET}", timeout=2).read()
+                data = json.loads(body).get("data") or []
+                names = sorted({d.get("schema") for d in data if d.get("stream") == stream})
+            except Exception:
+                names = ["<api-fail>"]
+            _TL.append((round(time.time() - t0, 2), names))
+            time.sleep(0.2)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+def timeline_dump(stream):
+    """把时间轴压缩成「状态变化」几行打出来。"""
+    if not _TL:
+        return
+    print(f"     ↳ 媒体源时间轴（{stream}）：")
+    prev = None
+    for ts, names in _TL:
+        if tuple(names) != prev:
+            print(f"        {ts:6.2f}s  {names}")
+            prev = tuple(names)
+
+
 def check_errors(label, stream, retries=4):
     """断言拉流无硬错误。
 
@@ -169,6 +205,10 @@ def check_errors(label, stream, retries=4):
 
 def case(tag, src, want_codec, video, enable=1):
     print(f"--- {tag} ---")
+    _TL.clear()
+    fail_snapshot = list(FAIL)
+    stop_ev = __import__("threading").Event()
+    _sampler(tag, stop_ev)
     make_cfg(enable=enable, video=video)
     p = start(tag)
     try:
@@ -199,6 +239,10 @@ def case(tag, src, want_codec, video, enable=1):
         except Exception: pass
     finally:
         stop(p)
+        stop_ev.set()
+        time.sleep(0.3)
+        if FAIL and len(FAIL) > len(fail_snapshot):
+            timeline_dump(tag)
 
 print("=" * 76)
 print("RTSP 断连续推验收（模拟摄像机重连）")
