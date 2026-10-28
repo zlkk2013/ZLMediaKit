@@ -89,14 +89,25 @@ preflight() {
     return 1
   fi
   echo "✅ 二进制比源码新：$(/usr/bin/stat -f '%Sm' "$BIN")"
-  # 残留监听进程：只报告，不盲杀
+  # 残留 MediaServer 必须清掉再开跑 —— 上一轮被打断（Ctrl-C / 工具超时）留下的孤儿进程
+  # 会占着端口，导致后续套件「启动失败」，而症状看起来像产品坏了（Connection refused）。
+  #
+  # 只杀「命令行里就是本 worktree 这个二进制」的进程：这是精确匹配，不会误伤其它 worktree
+  # 的实例（那些路径不同）。绝不用 pkill -f MediaServer 这种模糊匹配。
+  local mine
+  mine=$(ps -axo pid=,command= | grep -F "$BIN" | grep -v grep | awk '{print $1}')
+  if [ -n "$mine" ]; then
+    echo "🧹 清理本 worktree 的残留进程：$(echo $mine | tr '\n' ' ')"
+    echo "$mine" | xargs -r kill -9 2>/dev/null
+    sleep 1
+  fi
   local busy=""
   for port in 56900 56554 57080 63554 64080; do
     p=$(/usr/sbin/lsof -nP -tiTCP:$port -sTCP:LISTEN 2>/dev/null | head -1)
     [ -n "$p" ] && busy="$busy $port(pid=$p)"
   done
   if [ -n "$busy" ]; then
-    echo "⚠️  以下端口已有进程在听（各套件会自己清理）：$busy"
+    echo "⚠️  以下端口被别的进程占着（不是本 worktree 的 MediaServer）：$busy"
   else
     echo "✅ 相关端口空闲"
   fi

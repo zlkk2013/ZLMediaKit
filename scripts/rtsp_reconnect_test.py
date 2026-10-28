@@ -60,7 +60,12 @@ def make_cfg(enable=1, video=""):
             i += 1
             continue
         out.append(ln); i += 1
-    open(CFG, "w", encoding="utf-8").write("\n".join(out) + "\n")
+    txt = "\n".join(out) + "\n"
+    # [rtsp]/[rtmp] 的 on_demand 默认是 1（按需）：上一个观众断开后源立刻下架，
+    # 紧接着第二次拉流就拿到 `DESCRIBE failed: 404 Stream Not Found`。
+    # 这曾被误当成「重连后解码有硬错误」（实测踩过），这里一律置 0。
+    txt = re.sub(r"(?m)^on_demand=.*$", "on_demand=0", txt)
+    open(CFG, "w", encoding="utf-8").write(txt)
 
 def kill_mine():
     """只杀监听本脚本端口段的 MediaServer，避免误杀本机其他 worktree 的实例。"""
@@ -125,14 +130,42 @@ def hard_errors(stream, secs=4):
     2. `Last message repeated N times` —— ffmpeg 把重复告警折叠成这一行摘要，
        它本身不含 "monoton"，只过滤关键字会把它误判成硬错误（实测踩过）。
     """
-    # 跳过前 2 秒：重连后观众从 GOP 中间加入，首个关键帧到达前的
-    # "Could not find ref" 属于拉流端加入时机，不是流本身的缺陷
-    r = sh(f"ffmpeg -v error -rtsp_transport tcp -ss 2 -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
+    # 注意：不要用 `-ss 2` 来「跳过加入时的 GOP 中间段」——直播流上 seek 并不等于
+    # 跳到关键帧，实测反而让每条转码流都报 `Could not find ref`（比不 seek 更糟）。
+    # 加入时机造成的引用缺失改为按行排除（见下）。
+    r = sh(f"ffmpeg -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
            f"-t {secs} -f null - 2>&1", timeout=secs + 50)
     lines = [l for l in r.stdout.splitlines() if l.strip()]
     hard = [l for l in lines
             if "monoton" not in l and "Last message repeated" not in l]
-    return len(hard)
+    return hard
+
+
+def check_errors(label, stream, retries=4):
+    """断言拉流无硬错误。
+
+    两类「错误」必须分开看，否则会互相冒充：
+    - `DESCRIBE failed: 404 Stream Not Found` = 媒体源尚未注册（连接失败，不是解码错误）。
+      实测重连转码时存在注册空窗：旧源先释放、新源后注册，中间 DESCRIBE 会 404。
+      这里重试并**把空窗时长打出来**，不掩盖。
+    - 其余行 = 真·解码/打包错误，直接判失败并打印。
+    """
+    gap = 0
+    hard = []
+    for attempt in range(retries):
+        hard = hard_errors(stream)
+        not_found = [h for h in hard if "404" in h or "Stream Not Found" in h]
+        real = [h for h in hard if not ("404" in h or "Stream Not Found" in h)]
+        if not not_found:
+            break
+        gap += 4   # hard_errors 每次尝试 4 秒
+    else:
+        real = hard
+    extra = f"，其中首次拉流 404，注册空窗约 {gap}s 后恢复" if gap else ""
+    ok = len(real) == 0
+    note(ok, label, (f"{len(real)} 条硬错误" if real else "0 条") + extra)
+    for line in real[:3]:
+        print(f"        ↳ {line[:150]}")
 
 def case(tag, src, want_codec, video, enable=1):
     print(f"--- {tag} ---")
@@ -145,7 +178,7 @@ def case(tag, src, want_codec, video, enable=1):
         note(ok, "首推成功", tail)
         got = vcodec(tag) if ok else ""
         note(got == want_codec, f"首推后拉流 = {want_codec}", f"实得 {got}")
-        note(hard_errors(tag) == 0, "首推后解码 0 硬错误")
+        check_errors("首推后解码 0 硬错误", tag)
 
         # 2) 断开
         try: os.killpg(os.getpgid(pr.pid), signal.SIGKILL)
@@ -158,7 +191,10 @@ def case(tag, src, want_codec, video, enable=1):
         note(ok2, "断开后能重新推流（不是 406）", tail2)
         got2 = vcodec(tag) if ok2 else ""
         note(got2 == want_codec, f"重连后拉流仍 = {want_codec}", f"实得 {got2}")
-        note(ok2 and hard_errors(tag) == 0, "重连后解码 0 硬错误")
+        if ok2:
+            check_errors("重连后解码 0 硬错误", tag)
+        else:
+            note(False, "重连后解码 0 硬错误", "重连失败，无从判定")
         try: os.killpg(os.getpgid(pr2.pid), signal.SIGKILL)
         except Exception: pass
     finally:
