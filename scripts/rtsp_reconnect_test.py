@@ -263,7 +263,9 @@ def case(tag, src, want_codec, video, enable=1):
                         or "DIAG pool" in l]
                 print(f"     ↳ 服务端 404 相关日志 {len(hits)} 行：")
                 for l in hits[-4:]:
-                    print("        " + l[-160:])
+                    # 不要截断：时间戳前缀是判断「404 与源存在是否同一时刻」的唯一依据，
+                    # 上一版截到末 160 字符正好把它砍掉了，导致七轮假设都没法对齐时间
+                    print("        " + l)
             except Exception as e:
                 print(f"     ↳ 读服务端日志失败：{e}")
 

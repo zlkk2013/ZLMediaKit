@@ -772,3 +772,37 @@ api_regist("/index/api/getMediaList", [](API_ARGS_MAP_ASYNC) {
 | 7 | 观测手段不可靠（两个结构） | 否（同一 for_each_media） |
 
 七条全否，唯一的缺口是**日志时间戳被截断，没法做时间对齐**。
+
+### 第八轮：时间戳对齐，矛盾更尖了
+
+服务端日志（已保留完整时间戳）：
+
+```
+23:00:45.756 W RtspSession.cpp:62 | 243-49 RTSP播放器(__defaultVhost__/live/rc_h265_h264)
+                                   断开:no such stream...,耗时(s):15
+23:01:00.786 W RtspSession.cpp:488 | DIAG pool | no source at all for .../rc_h265_h264
+23:01:00.786 W RtspSession.cpp:62 | 311-49 ... 耗时(s):15
+```
+
+阅读方式：`findAsync` 的 15 秒重试耗尽后才回调，所以
+**DESCRIBE 发起于 23:00:45.7，DIAG 打印于 23:01:00.8（15 秒后）**。
+用例起点 23:00:41 左右 ⇒ 发起时刻约为用例内 **+4.7 秒**。
+
+而采样时间轴显示该流在 **+1.85 秒 ~ +24.4 秒** 之间都在池里 —— 即 +4.7 秒时确实存在。
+
+⇒ 发起时刻源在池里、`find_l` 却当场找不到；15 秒后重试耗尽时，DIAG 那一刻池里也确实空了。
+这两件事拼在一起说明：**`find_l` 在 +4.7 秒那一次就没命中**，而不是「等待期间源消失」。
+
+所以问题重新回到**查找路径本身**：`find_l(schema=rtsp, vhost=__defaultVhost__, app=live, id=rc_h265_h264)`
+没有命中，而同一个 `for_each_media`（不带 schema/vhost 过滤）能枚举到它。
+差异只剩两个入参：**`schema` 过滤** 与 **`vhost` 过滤**（`enableVhost` 为假时会被强制改成
+`DEFAULT_VHOST`，两者此时相同）。
+
+⇒ 下一步只查一件事：在 DIAG 里把 `for_each_media` **带上 `schema=rtsp` 过滤**再枚举一次，
+若带过滤就找不到，则说明池中该条目注册的 `_schema` 不是 `"rtsp"`（例如为空或别的值），
+而 `getMediaList` 显示的 schema 字段来自别处 —— 这就同时解释了一切。
+
+### 复盘（八轮，全部走了死路）
+
+on_demand / 注册空窗 / SDP 空 / 键不一致 / weak_ptr 过期 / 双实例 / 观测结构不同，全部否定。
+现在线索收窄到一个具体可测的点：**池中 RTSP 条目的 `_schema` 实际值**。
