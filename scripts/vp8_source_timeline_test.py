@@ -37,7 +37,9 @@ import urllib.request
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = f"{WT}/release/darwin/Release/MediaServer"
 CFG = "/tmp/zlm_vp8_timeline.ini"  # 放 /tmp，避免污染工作区
-BASE_CFG = f"{WT}/config.av.ini"
+# 基线配置：优先用主干统一的那份；config.av.ini 只存在于 a7 worktree，别写死
+BASE_CFG = next((p for p in (f"{WT}/config.joint.base.ini", f"{WT}/config.av.ini") if os.path.exists(p)),
+                f"{WT}/config.joint.base.ini")
 LOG = "/tmp/zlm_vp8_timeline.log"
 WORK = "/tmp/zlm_vp8_timeline"
 HTTP, RTMP, RTSP = 64080, 63900, 63554
