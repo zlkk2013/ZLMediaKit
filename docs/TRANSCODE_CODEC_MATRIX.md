@@ -1,6 +1,7 @@
 # VP8 / VP9 / AV1 / H266 作为转码目标的实测矩阵
 
-> 分支 `dev/a5`（基于主干 085c9e5a）。本文所有数据都是**真机实测**：起服务 → 推流 →
+> 分支 `dev/a5`（基于主干 085c9e5a）；`dev/a7` 在此基础上修掉 §6.6 的
+> 「VP8/VP9 作为源时时间轴 2× 速」。本文所有数据都是**真机实测**：起服务 → 推流 →
 > RTSP 拉流 → ffprobe 看 codec/分辨率 → 数包 → 完整解码数错误行。
 > 复现命令见 §7，脚本在 `scripts/`。
 
@@ -8,9 +9,9 @@
 
 | codec | 作为**目标**（源 H264/HEVC → 该 codec） | 作为**源**（该 codec → H264） |
 |---|---|---|
-| **VP8** | ✅ 打通（真机验证） | ✅ 链路通，但时间轴 2× 速（见 §6.6） |
-| **VP9** | ✅ 打通（真机验证） | ✅ 链路通，但时间轴 2× 速（见 §6.6） |
-| **AV1** | ✅ 打通（真机验证，服务端 RTP 合规；ffmpeg 客户端无 AV1 解包器，用自写解包器验证） | ⚠️ 未实测（ffmpeg 造不出 AV1 的 RTSP 源） |
+| **VP8** | ✅ 打通（真机验证） | ✅ 打通且**时间轴正确**（§6.6.1：拉 5s 内容 4.2s，解出 5.02s / 74 包） |
+| **VP9** | ✅ 打通（真机验证） | ✅ 打通且**时间轴正确**（同 §6.6.1） |
+| **AV1** | ✅ 打通（真机验证，服务端 RTP 合规；ffmpeg 客户端无 AV1 解包器，用自写解包器验证） | ⚠️ 未实测（ffmpeg 造不出 AV1 的 RTSP 源；代码路径同 VP8/VP9） |
 | **H266** | ❌ 打不通：**依赖缺失**，ffmpeg 无 VVC 编码器 | ❌ 打不通：ZLM 侧无 H266 插件/解包器，ffmpeg 造源也无从谈起 |
 
 **没有一条是靠「能出包」蒙过去的**：每一格都要求 ①拉流端 codec/分辨率正确
@@ -238,18 +239,93 @@ ffmpeg 既没有 AV1 的 RTP 解包器也没有**打包器**，造不出 AV1 的
 ZLM 侧的解码链路是齐的（`AV1RtpDecoder` + `AV1Track` 已注册），但没有可用的造源
 工具，所以记为「未实测」，不写成「支持」。
 
-### 6.6 VP8/VP9 作为源：转码时间轴 2× 速（**未修**）
+### 6.6 VP8/VP9 作为源：转码时间轴 2× 速（**已修**，见 §6.6.1）
 
-实测：VP8 经 RTSP 推入（15fps），配 `video_codec=h264`，拉 5.0 秒内容
-**实际花了 9.97 秒**，输出 153 帧 / 5.016 秒（= 30.5fps）。
+实测（修复前）：VP8 经 RTSP 推入（15fps），配 `video_codec=h264`，拉 5.0 秒内容
+**实际花了 9.47 秒**（时间轴斜率 0.493 = 快一倍），输出 153 帧（= 30.5fps），
+源侧日志 `src_fps=30`。
 
 根因：VP8/VP9 的码流和 SDP 里都没有帧率信息，`VideoTrackImp(CodecId)` 的默认
 `_fps=30` 被 `TranscodeSink` 当成源帧率传给编码器，于是每帧按 33ms 打时间戳，
-而真实帧是 66ms 一帧 → 输出快一倍。H264/H265 不受影响（SPS/VUI 里有帧率）。
+而真实帧是 66ms 一帧 → 输出时间轴快一倍。H264/H265 不受影响（SPS/VUI 里有帧率）。
 
-修法需要按 RTP 时间戳估算源帧率（或在 `RtspDemuxer` 里给轨设 fps），属于解复用层
-改动，未在本轮做。**因此上表的「作为源 ✅」只代表「能解、能转、能拉」，
-不代表时间轴正确。**
+#### 6.6.1 修法与实测（`dev/a7`）
+
+**修法**：裸帧 codec（VP8/VP9/AV1）的源帧率改为**实测**，不再采用轨上的默认值。
+
+* `FFmpegEncoder::updateSrcFpsEstimate()`：对「解码帧时间戳间隔」做 16 帧滑动窗口、
+  去掉一个最小/最大值后取平均。丢帧造成的 2 倍间隔和瞬间抖动被剔除；15fps 的源在
+  90000/15=6000 tick/帧下间隔是 66/67 交替，平均正好回到 66.5ms（误差 <1%，不漂）。
+  只收 `0 < delta <= 1000ms` 的样本，断流/跳变不会污染估算；变化 <1% 时不更新，
+  避免时间轴被 jitter 来回拉扯。实测拿到 `15.0376fps / 66.5ms`。
+* 实测值同时写回 `_src_fps`，降帧判断（`shouldKeepFrame`）也用它 —— 否则
+  「15fps 源 → 15fps 目标」会被当成 30→15 抽掉一半的帧。
+* 时间轴步进改成 `videoStepMs()`：显式配置的输出帧率 > 实测/声明的源帧率 > 兜底。
+* 时间轴推进从「序号 × 步进」改成**累加器**（`_video_in_ms` / `_video_out_ms` 各一个）：
+  步进会在实测收敛时变化，序号乘会让时间轴在那一刻整段跳变；两个累加器分开是因为
+  输入帧 pts 和输出包 dts 各推进一次，共用同一个会让时间轴变成 2 倍速（这个坑实测踩过：
+  输出 dts 每帧前进 133ms，客户端只收到 1 帧）。
+* H264/H265/AV1 目标源路径**未改行为**：`_src_fps_measure` 只对「VP8/VP9/AV1 源」
+  或「源轨帧率 <=0」为真，H264/H265 的 SPS/VUI 帧率照旧直接用，步进是常量，
+  累加器等价于原来的 `序号 × 步进`。
+
+**实测对比**（同一套 harness：RTSP/RTMP 推 15fps 源 → `addTranscode` 下发目标 → RTSP 拉 5 秒内容）
+
+判据三条：①**时间轴斜率**（ffmpeg `-progress` 里「输出时间轴推进 / 墙钟推进」，1.0 =
+同步，0.5 = 快一倍）②拉 5 秒内容的墙钟耗时 ③解出时长与包数。改前的库
+（`1cd18252` 编译的 `/tmp/MS_base`）与改后是**同一套脚本、同一批判据**。
+
+| 用例 | 修复前 斜率/墙钟/包数 | 修复后 斜率/墙钟/解出时长/包数 |
+|---|---|---|
+| VP8 源 → H264 | **0.493** / **9.47s** / **153 包** | **0.982** / 4.20s / 5.020s / **74 包** |
+| VP9 源 → H264 | **0.493** / **9.47s** / **153 包** | **0.981** / 4.20s / 5.020s / **74 包** |
+| H264 源 → H265（回归） | 0.953 / 5.00s / 77 包 | 0.983 / 4.87s / 5.012s / 75 包 |
+| H265 源 → H264（回归） | 0.949 / 4.82s / 75 包 | 0.991 / 4.67s / 5.042s / 73 包 |
+| H264 源（RTMP 推）→ H265 | 0.998 / 4.75s / 73 包 | 0.998 / 4.75s / 5.047s / 71 包 |
+
+斜率 0.493 ≈ 1/2 就是「2 倍速」的定量结论：输出时间轴每前进 1 秒，真实时间过了
+2 秒。修复后三个源都是 0.98~1.00（差值是 RTSP 客户端自己的时间戳取整）。
+
+顺带：改前 VP8/VP9/H264 源的产物里各有 1 个**重复 pts**（`dup_pts=1`，整数毫秒
+`序号×33/67` 取整造成），改后小数累加让所有用例 `dup_pts=0`。
+
+**连跑 3 轮 ×5 用例 = 15/15 PASS**，每轮数字几乎完全一致（VP8/VP9 都是
+wall 4.20~4.21s、slope 0.981~0.983、74 包、dup_pts=0；回归两项 wall 4.67~4.87s、
+75/73 包，与改前同量级）。墙钟比 5 秒短是因为接入时拿到了 GOP 缓存里的关键帧；
+墙钟判据留了「内容 + 2.5s（至多一个 GOP 的关键帧等待）」的余量。
+
+**未验证 / 已知边界**：
+* AV1 作为源仍未实测 —— ffmpeg 没有 AV1 的 RTP 打包器，造不出源（同 §6.5）。
+  代码路径与 VP8/VP9 相同（同一个 `_src_fps_measure` 分支），但没有真机数据。
+* 编码器 `open2` 时的 `framerate`/`gop_size` 仍按轨上的 30fps 打开（VP8/VP9 源），
+  实测时拿不到帧率，所以 GOP 是 30 帧（15fps 下约 2 秒关键帧间隔）。只影响关键帧
+  密度与自动码率估算，不影响时间轴。
+* 声音：这条「RTSP 推入 + 转码」拓扑里**源音频轨根本没有帧进来**（改前改后一致，
+  拉流端 aac 轨 0 包，`TranscodeSink` 也只登记了 index=0）。因此音频时长无法在本
+  harness 里度量，本次不做音频改动（按约定不动音频代码）。见 §6.7。
+
+### 6.7 源音频轨在「RTSP 推入」拓扑里没有帧（既有问题，未修）
+
+本次为了量时间轴，顺手核对了音频：**源端音频 RTP 一发帧都没进来**。
+
+证据（改前 `/tmp/MS_base` 与改后二进制表现完全一致）：
+
+```
+# 推流端 SDP 有 audio 轨，观众端 DESCRIBE 也拿到了
+m=audio 0 RTP/AVP 97 / a=rtpmap:97 mpeg4-generic/44100/1     ← 改后（aac 目标）
+m=audio 0 RTP/AVP 97 / a=rtpmap:97 aac/44100/1               ← 改前（不转音频时）
+
+# 但 TranscodeSink 只登记了视频轨
+TranscodeSink.cpp:384 addTrack | transcode track registered, ..., index=0, H265 -> H264
+
+# 拉流端 5 秒的产物里 aac 轨 0 个包（视频 74 个）
+packets {0: 74}
+```
+
+RTMP 推流、以及「不转码的透传」两条拓扑同样如此，所以**不是本次改动引入的**，
+也不是转码侧的：源媒体源里这条 aac 轨从头到尾没有帧。音频时长的判定因此在
+本次 harness 里无法成立（判据里记为 `n/a`，不计入 PASS 计数），按约定本次不动
+音频代码，留作独立问题。
 
 ## 7. 复现
 
@@ -263,6 +339,8 @@ cmake --build build-wt -j4 --target MediaServer
 env -u PYTHONPATH python3 scripts/video_codec_matrix_test.py
 # 反向矩阵（VP8/VP9 作为源）
 env -u PYTHONPATH python3 scripts/codec_source_matrix_test.py
+# 反向矩阵 + 时间轴判据（本次修 2× 速用的 harness，墙钟/解出时长/包数/解码错误）
+env -u PYTHONPATH python3 scripts/vp8_source_timeline_test.py --rounds 3
 # AV1 单独验证（自写 RFC 9628 解包器）
 python3 scripts/av1_rtp_verify.py rtsp://127.0.0.1:60554/live/<stream> 5 320 240 15
 ```
@@ -272,15 +350,24 @@ MediaServer` 并核对监听 pid）。`config.codec_matrix.ini` 由脚本从 `co
 派生：`[transcode]` 全局段清空（codec 走 `addTranscode` 接口按流下发）、
 `[rtsp] directProxy=0`、`enable_hls/enable_ts=0`。
 
+`scripts/vp8_source_timeline_test.py` 用**自己独占**的端口 RTMP 63900 / RTSP 63554 /
+HTTP 64080（本 worktree），配置派生到 `/tmp/zlm_vp8_timeline.ini`，起服务只按端口核对
+pid、绝不 `pkill -f MediaServer`；用例 = VP8/VP9 源→H264、H264 源→H265、H265 源→H264、
+H264 源（RTMP 推）→H265，判据是「时间轴斜率 0.85~1.15（`ffmpeg -progress` 的
+输出时间轴推进 / 墙钟推进）、拉 5 秒内容的墙钟 ≤7.5s、解出时长 5±0.7s、
+包数 5×帧率 ±15%、解码 0 错误」；`--bin` 可以指定改前的二进制做基线对比。
+
 ## 8. 改了哪些文件
 
 | 文件 | 改动 |
 |---|---|
-| `src/Codec/Transcoder.cpp` | ①`findEncoder` 加 AV1（libaom-av1）、H266（显式失败并说明）②`openVideoCodec` 给 libvpx 上实时档、给 libaom 关 lookahead ③`warmup` 加裸帧 codec 分支 ④`onEncode` 裸帧 codec 原样输出（prefixSize=0）⑤`TranscodedFrame` 支持编码器给出的关键帧标志 |
+| `src/Codec/Transcoder.cpp` | ①`findEncoder` 加 AV1（libaom-av1）、H266（显式失败并说明）②`openVideoCodec` 给 libvpx 上实时档、给 libaom 关 lookahead ③`warmup` 加裸帧 codec 分支 ④`onEncode` 裸帧 codec 原样输出（prefixSize=0）⑤`TranscodedFrame` 支持编码器给出的关键帧标志 ⑥**（a7）`updateSrcFpsEstimate` 按源帧间隔实测帧率、`videoStepMs` 决定时间轴步进、`nextVideoStamp` 用两个累加器推进输入 pts / 输出 dts** |
+| `src/Codec/Transcoder.h` | **（a7）上述三个成员函数与实测状态（`_src_fps_measure`/`kSrcFpsWindow`/`_src_fps_deltas`/`_video_in_ms`/`_video_out_ms`），删掉原来只用于「序号×步进」的 `_video_frame_index`/`_video_pkt_index`** |
 | `src/Common/PacketCache.h` | 合写缓存加锁（修 SIGSEGV 竞争，先决条件） |
 | `ext-codec/VP8Rtp.cpp` | 修正 N 位（non-reference）取反 |
 | `scripts/video_codec_matrix_test.py` | 新增：目标方向矩阵 |
 | `scripts/codec_source_matrix_test.py` | 新增：反向矩阵（作为源） |
+| `scripts/vp8_source_timeline_test.py` | **（a7）新增：反向矩阵 + 时间轴判据（墙钟/解出时长/包数/解码错误），改前改后同一套 harness** |
 | `scripts/av1_rtp_verify.py` | 新增：AV1 over RTSP 的独立验证器（RFC 9628 解包） |
 | `docs/TRANSCODE_CODEC_MATRIX.md` | 本文 |
 | `docs/TRANSCODE_AUDIO_FRAMING_FIX.md` | §10.3 旧结论加更正指引 |
