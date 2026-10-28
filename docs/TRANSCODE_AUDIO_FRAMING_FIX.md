@@ -561,279 +561,56 @@ AV1 目标、默认开 fmp4、每轮推流 + 观众拉流触发落盘，**连跑
   每次重连都在宽限期内，就会一直沿用旧 SDP
 - 画面**十几秒后自己变对** → 正常，宽限期已过，源已重建，无需干预
 
-## 10.9 转码模式重连后 DESCRIBE 404：**源在池里，但拿不到 SDP**（实测定位到这一层）
+## 10.9 结案：那个「转码重连后 404」是**测试脚本的 bug**，不是产品缺陷
 
-### 决定性证据：媒体源时间轴
+九轮排查的结论：**测试脚本重连时推的是另一个流名。**
 
-测试脚本现在每 200ms 采样一次 `getMediaList`（`_sampler()` / `timeline_dump()`），
-一次失败用例的时间轴：
-
-```
- 1.45s  []                                    # 推流前
- 1.86s  ['fmp4','rtmp','rtsp','ts']           # 首推注册
- 3.69s  ['fmp4','hls','rtmp','rtsp','ts']
-24.53s  []                                    # 用例结束、停服务
+```python
+pr2, plog2 = push(src, tag + "_re")   # ← 错在这里
 ```
 
-**整段 404 期间（约 6~22 秒）该流的协议源一直挂在池里。**
+正确的「重连」必须是**同一个流名**。写成 `tag + "_re"` 之后：
 
-⇒ 之前的两个假设都被否掉：
-1. 「关流（on_demand）把源下架」—— 源没下架；
-2. 「注册空窗，键被摘掉又重建」—— 键一直在。
+1. 重推实际创建了一条新流 `rc_h265_h264_re`；
+2. 紧接着的 `vcodec(tag)` 读到的是**仍在宽限期内的旧流**，所以「重连后拉流 = h264」通过；
+3. 15 秒后旧流宽限期到期被注销（日志：`媒体注销:rtsp://…/rc_h265_h264`），
+   之后任何对 `rc_h265_h264` 的拉流都是 404 —— 这就是那个「≥16 秒空窗」。
 
-真正的问题变成：**`MediaSource::find()` 能找得到源，但 DESCRIBE 仍然回 404**。
-在 ZLM 里 DESCRIBE 404 的另一个来源是**源对象的 SDP 为空**（已注册 ≠ 已就绪）。
-
-### 为什么会这样（现有证据支持的推断）
-
-重连发生在 15 秒宽限期内时走「接管」路径：
-- `vcodec()` 在重连后 +5 秒仍能探到 `h264` ⇒ 那一刻 DESCRIBE 是**成功**的（命中的还是宽限期里
-  那个旧源对象，它有 SDP）；
-- 随后宽限期到期 / 接管完成，旧源被释放，**新源在池里但 SDP 还没建好**；
-- 于是紧接着的连续拉流全部 404，直到新 SDP 就绪（实测约 16 秒）。
-
-这条链路与 a6 的改动直接相关（宽限期由它引入的接管/释放路径决定），但**尚未插桩证实**。
-
-### 下一步（一条命令能验）
-
-在 `RtspSession::handleReq_DESCRIBE` 的 404 分支前打一行日志，把 `src.get()`、
-`src->getSdp().size()`、`src->ready()` 一起输出。若 404 都伴随 `sdp=0`，
-结论即成立，修法方向是「接管完成前不要让 SDP 空的新源对外可见」
-（或接管时把旧 SDP 一并搬过去）。
-
-**在此之前不写进对外问题清单。**（本条曾被我误报为「源被摘掉的产品缺陷」，已纠正两次。）
-
-### 服务端日志定性（2026-10-28 补）
-
-在测试里把服务端 404 相关日志一并捞出来后，答案不再是「SDP 空」：
+### 决定性证据（`MediaSource::emitEvent` 自带的注册/注销日志）
 
 ```
-RtspSession.cpp:62 onError | RTSP播放器(__defaultVhost__/live/rc_h265_h264)断开:
-                          no such stream:__defaultVhost__/live/rc_h265_h264,耗时(s):15
+23:11:20.185 媒体注册:rtsp://__defaultVhost__/live/rc_h265_h264_re
+23:11:32.536 媒体注销:rtsp://__defaultVhost__/live/rc_h265_h264
 ```
 
-走的是**「找不到源」分支**（`MediaSource::findAsync` 返回空），不是「SDP 里无有效 track」
-（那支会打 `sdp中无有效track，该流无效`，本次没有出现）。
+注册名与注销名**不是同一个流**，一眼就能看出。
 
-于是留下一个**自相矛盾的观测**：
+改成同流名重推后，该套件 **18/18 全过**，而且耗时从 100+ 秒降到 60 秒
+（没有了 15 秒重试等待）。
 
-| 观测手段 | 结果 |
-|---|---|
-| `getMediaList`（每 200ms 采样） | 该流的 `fmp4/hls/rtmp/rtsp/ts` 全程都在 |
-| 服务端 `findAsync`（DESCRIBE 路径） | `no such stream` |
+### 顺带的重要修正
 
-同一时刻「池里有」和「find 找不到」并存 ⇒ 差异只可能在**查找键**上：
-`_media_info`（vhost/app/stream，来自 DESCRIBE 的 URL）与池中条目的 tuple 不一致，
-或者 `findAsync` 走的不是 `s_media_source_map` 这一份表，或者转码路径下 RTSP 源
-被注册到了一个 `getMediaList` 也会列、但 `find` 不认的位置。
+这个 bug 还意味着：**「断开后能重新推流（不是 406）」这一项此前从未真正测过重推** ——
+它推的也是 `_re`，根本没碰 `Already publishing` 那条路径。所以 a6 那轮「已验证重连不 406」
+的说法缺了有效证据。现在改对了流名，这一项才是真的过了。
 
-### 下一步（仍是插桩，别猜）
+### 复盘：九次误判的根源
 
-在 `RtspSession::onAuthSuccess` 的 `!rtsp_src` 分支打印：
-`_media_info.vhost/app/stream` + `MediaSource::find` 各协议表的命中情况；
-再和池里该条目实际的 vhost/app/stream 对比。**两个 tuple 一比就出结论。**
-
-### 再排除一条：查找键一致
-
-让采样器记录完整 tuple（vhost/app/schema）后：
-
-```
-1.85s  ['__defaultVhost__/live/fmp4', '__defaultVhost__/live/rtmp',
-        '__defaultVhost__/live/rtsp',  '__defaultVhost__/live/ts']
-```
-
-池中 rtsp 源的 vhost/app 与 DESCRIBE 的 `__defaultVhost__/live/rc_h265_h264`
-**完全一致** ⇒ 「tuple 不一致导致 find 不到」也排除。
-
-### 至此已排除（4 条）
-
-| # | 假设 | 排除依据 |
+| 轮次 | 假设 | 否掉的依据 |
 |---|---|---|
-| 1 | on_demand 把源下架 | 强制 on_demand=0 后依旧；且池里一直在 |
-| 2 | 注册空窗（键被摘又重建） | 200ms 采样显示整段时间键都在 |
-| 3 | SDP 为空（无有效 track） | 服务端日志是 `no such stream`，不是 `sdp中无有效track` |
-| 4 | 查找键（vhost/app/stream）不一致 | 采样到的 tuple 与 DESCRIBE 完全一致 |
+| 1 | on_demand 下架 | 强制 0 依旧 |
+| 2 | 注册空窗 | 采样显示键一直在 |
+| 3 | SDP 为空 | 日志是 no such stream |
+| 4 | 查找键不一致 | tuple 相同 |
+| 5 | weak_ptr 过期 | regist 会覆盖 |
+| 6 | HTTP/RTSP 双实例 | 同一 pid |
+| 7 | 两个枚举结构不同 | 同一个 for_each_media |
+| 8 | 时间错位 | 时间戳对齐后仍矛盾 |
+| 9 | 字段用错 | MediaTuple 定义核对无误 |
 
-### 剩下的唯一方向：池里那个 weak_ptr 与 find 的实际路径
+**真正的错误是：我从没怀疑「被测对象是不是我以为的那个流」。**
+所有观测都围绕 `rc_h265_h264`，而重推实际发生在 `rc_h265_h264_re` 上。
+直到去读服务端自带的「媒体注册/注销」日志（写方视角），一眼就露出来了。
 
-`getMediaList` 能列出来、`findAsync` 却返回空，而两者的键完全一样 ⇒ 差异只可能在
-**对象存活 / 查找实现**这一层。首要怀疑：池里存的是 `weak_ptr`，对象已被销毁但条目还在
-（`getMediaList` 枚举时可能顺手 `lock()` 复活或读到未过期的临时强引用），而 `find` 拿到
-空 `lock()` 就当没有 ⇒ 报 `no such stream`。
-
-**验证方法（C++ 插桩，下一步）：** 在 `RtspSession::onAuthSuccess` 的 `!rtsp_src` 分支打印
-该键对应 weak_ptr 的 `expired()` 与 `use_count()`。若是 `expired()==true`，则根因是
-「转码接管路径释放了 RTSP 源对象，但池里的键没被摘干净」。
-
-> 记录：本条先后被误判为 on_demand、注册空窗、SDP 为空、键不一致，四次都被实测否掉。
-> 教训是**每次都要先问「这个假设用什么观测能证伪」，而不是顺着上一个假设往下推**。
-
-### 第五轮：进程内枚举 vs HTTP 枚举，结论相反（关键矛盾）
-
-在 `RtspSession::onAuthSuccess` 的 404 分支插入诊断（对 app+stream 匹配的源全部打印）：
-
-```
-DIAG pool | no source at all for __defaultVhost__/live/rc_h265_h264 (schema=rtsp)
-```
-
-即：**进程内 `MediaSource::for_each_media` 一条都没有**。而同一时刻脚本通过
-`/index/api/getMediaList` 反复读到该流的 `fmp4/hls/rtmp/rtsp/ts` 五条都在。
-
-两者的键（`__defaultVhost__/live`）完全一致，`regist()` 对过期 weak_ptr 也会覆盖，
-所以「过期条目卡住」不成立。**唯一还能同时成立的解释是：HTTP 与 RTSP 落在了两个不同的
-MediaServer 进程上**（例如上一用例的进程没退干净，仍占用 HTTP 端口，于是 `getMediaList`
-回答的是旧进程；而 DESCRIBE 走 RTSP 端口，命中的是新进程，它确实什么都没有）。
-
-### 验证方法（下一步，一次运行即可）
-
-采样时**持续**记录 `lsof -nP -tiTCP:57080` 和 `:56554` 的 pid，两者不同即坐实。
-（本次尝试失败：pid 只在第一次采样时取，那时服务还没起来，缓存成了 `?`。
- 教训：诊断代码本身也要有判据，不能「取一次就缓存」。）
-
-### 第六轮：确认同一进程，双实例假设否掉
-
-持续采样端口归属（每 ~1 秒一次，不再缓存）：
-
-```
-2.40s  pid http=86486 rtsp=86486
-3.72s  pid http=86486 rtsp=86486
-24.40s pid http=86486 rtsp=86486
-```
-
-HTTP 与 RTSP 是**同一个 pid** ⇒「两个实例互相看不见」不成立。
-
-### 现在的矛盾（第 6 条假设后的剩余事实）
-
-同一个进程里：
-- `getMediaList`（HTTP 接口）在整个窗口内都能列出该流的 5 条协议源；
-- `for_each_media`（DESCRIBE 路径内部）打出来的是 `no source at all`。
-
-两者都自称读的是 `s_media_source_map`。这说明 **`getMediaList` 并不只是枚举注册表**，
-它可能触发/返回了别的东西（例如按 `MediaSource::find(..., from_mp4=true)` 创建/复活源，
-或枚举的是另一个缓存层）。这一点尚未读透 `server/WebApi.cpp` 里 `getMediaList` 的实现。
-
-### 下一步（精确到函数）
-
-1. 读 `server/WebApi.cpp` 的 `getMediaList` 实现，确认它到底遍历哪个结构；
-2. 在 DIAG 那行把时间戳一起打全（测试日志尾部截断丢了前缀，无法与 404 时刻对齐）；
-3. 若 `getMediaList` 走的是 `find(from_mp4=true)`，那它显示的「源在」本身就是假象 ——
-   **采样器这个观测手段从根上就不可靠**，得换成在 `regist()/unregist()` 里打点。
-
-### 复盘：六条假设
-
-| # | 假设 | 结果 |
-|---|---|---|
-| 1 | on_demand 下架 | 否 |
-| 2 | 注册空窗 | 否（键一直在，但那是假象） |
-| 3 | SDP 为空 | 否（no such stream） |
-| 4 | 查找键不一致 | 否（tuple 相同） |
-| 5 | weak_ptr 过期卡键 | 否（regist 会覆盖） |
-| 6 | HTTP/RTSP 双实例 | 否（同一 pid） |
-
-六条全否，说明**观测手段本身有问题**：`getMediaList` 被当成了「池里有没有」的判据，
-而它显然不等于 `for_each_media`。下一步应先把观测手段换成 `regist/unregist` 打点，
-再谈根因 —— 否则还会继续在错误的观测上推假设。
-
-### 第七轮：更正 —— getMediaList 用的就是 for_each_media，矛盾是「时间对不上」
-
-`server/WebApi.cpp:1056`：
-
-```cpp
-api_regist("/index/api/getMediaList", [](API_ARGS_MAP_ASYNC) {
-    ...
-    MediaSource::for_each_media([&](const MediaSource::Ptr &media) { ... });
-```
-
-与 DIAG 那行**是同一个函数**。所以上一节「两个枚举结构不同 / 采样手段不可靠」的说法**是错的**，
-予以更正。
-
-同一函数不可能同时返回「有 5 条」和「一条都没有」⇒ 唯一的解释是**这两个观测不在同一时刻**。
-而现在的测试日志把服务端行截断到末 160 字符，**丢掉了时间戳前缀**，无法与采样时间轴对齐 ——
-这才是本轮真正的缺口。
-
-### 下一步（一步到位）
-
-把 DIAG 那行的完整时间戳保留（不要截断），并让采样时间轴也记录绝对时间，
-两者对齐后就能看出 404 到底发生在「源存在」的那一段还是「源已消失」的那一段。
-
-如果 404 落在「源已消失」的时段（例如用例结束、推流端被 kill 之后），
-那它就是**测试时序问题**（拉流发起得太晚），不是产品缺陷 —— 这与 §10.6、§10.8 的教训同源。
-
-### 复盘（七轮）
-
-| # | 假设 | 结果 |
-|---|---|---|
-| 1 | on_demand 下架 | 否 |
-| 2 | 注册空窗 | 否 |
-| 3 | SDP 为空 | 否 |
-| 4 | 查找键不一致 | 否 |
-| 5 | weak_ptr 过期卡键 | 否 |
-| 6 | HTTP/RTSP 双实例 | 否（同一 pid） |
-| 7 | 观测手段不可靠（两个结构） | 否（同一 for_each_media） |
-
-七条全否，唯一的缺口是**日志时间戳被截断，没法做时间对齐**。
-
-### 第八轮：时间戳对齐，矛盾更尖了
-
-服务端日志（已保留完整时间戳）：
-
-```
-23:00:45.756 W RtspSession.cpp:62 | 243-49 RTSP播放器(__defaultVhost__/live/rc_h265_h264)
-                                   断开:no such stream...,耗时(s):15
-23:01:00.786 W RtspSession.cpp:488 | DIAG pool | no source at all for .../rc_h265_h264
-23:01:00.786 W RtspSession.cpp:62 | 311-49 ... 耗时(s):15
-```
-
-阅读方式：`findAsync` 的 15 秒重试耗尽后才回调，所以
-**DESCRIBE 发起于 23:00:45.7，DIAG 打印于 23:01:00.8（15 秒后）**。
-用例起点 23:00:41 左右 ⇒ 发起时刻约为用例内 **+4.7 秒**。
-
-而采样时间轴显示该流在 **+1.85 秒 ~ +24.4 秒** 之间都在池里 —— 即 +4.7 秒时确实存在。
-
-⇒ 发起时刻源在池里、`find_l` 却当场找不到；15 秒后重试耗尽时，DIAG 那一刻池里也确实空了。
-这两件事拼在一起说明：**`find_l` 在 +4.7 秒那一次就没命中**，而不是「等待期间源消失」。
-
-所以问题重新回到**查找路径本身**：`find_l(schema=rtsp, vhost=__defaultVhost__, app=live, id=rc_h265_h264)`
-没有命中，而同一个 `for_each_media`（不带 schema/vhost 过滤）能枚举到它。
-差异只剩两个入参：**`schema` 过滤** 与 **`vhost` 过滤**（`enableVhost` 为假时会被强制改成
-`DEFAULT_VHOST`，两者此时相同）。
-
-⇒ 下一步只查一件事：在 DIAG 里把 `for_each_media` **带上 `schema=rtsp` 过滤**再枚举一次，
-若带过滤就找不到，则说明池中该条目注册的 `_schema` 不是 `"rtsp"`（例如为空或别的值），
-而 `getMediaList` 显示的 schema 字段来自别处 —— 这就同时解释了一切。
-
-### 复盘（八轮，全部走了死路）
-
-on_demand / 注册空窗 / SDP 空 / 键不一致 / weak_ptr 过期 / 双实例 / 观测结构不同，全部否定。
-现在线索收窄到一个具体可测的点：**池中 RTSP 条目的 `_schema` 实际值**。
-
-### 第九轮：schema 对照跑完，仍是 0/0 —— 矛盾无法在本轮收敛
-
-```
-23:04:59.548 DIAG pool | no source at all for __defaultVhost__/live/rc_h265_h264
-             | unfiltered=0 filtered=0
-```
-
-同时核对了 `MediaTuple` 的定义（`src/Record/Recorder.h:22`）：字段就是 `vhost/app/stream`，
-**我的判据没有用错字段**。因此「那一刻池里一条都没有」是真实的观测，不是插桩 bug。
-
-而采样器（同一进程、同一 `for_each_media`、0.2 秒间隔）在重叠的时间段里一直读到 5 条源，
-且**没有任何状态变化的记录**（采样器只在变化时打印）。
-
-同一个函数、同一个进程、时间重叠，却给出相反结果 —— 这已经超出本轮能用现有手段解释的范围。
-
-### 留给下一个人的完整事实（不要重复已验证的否定）
-
-**已排除**：on_demand、注册空窗、SDP 空、键不一致、weak_ptr 过期、双实例、
-观测结构不同、时间错位、字段用错。
-
-**已确定**：
-1. 转码两例必现，基线必不现（`h265->h264`、`h264->h265` 各失败一次；`enable=0` 通过）。
-2. 服务端走的是 `no such stream` 分支（不是 SDP 无 track）。
-3. `findAsync` 15 秒重试耗尽才回调，404 在耗尽时才发出。
-4. 池里 tuple 与请求完全一致（`__defaultVhost__/live/...`）。
-
-**建议的下一步（换手段，别再读同一个 API）**：
-直接在 `MediaSource::regist()` 和 `unregist()` 里打点（带 `this` 指针、schema、tuple、时间戳），
-把「这个流在池里的生命周期」由**写方**记录下来，而不是由读方（`for_each_media`）去猜。
-写方日志能一次性回答「DESCRIBE 那个时刻键在不在」，不会再有观测角度的歧义。
+教训：**排查时先确认「你观测的标识符，和被观测对象实际使用的标识符，是同一个」**。
+这比换任何工具都有效 —— 前面八轮全在读同一个错误对象的不同侧面。

@@ -238,7 +238,10 @@ def case(tag, src, want_codec, video, enable=1):
         time.sleep(2.5)
 
         # 3) 重连
-        pr2, plog2 = push(src, tag + "_re")
+        # 必须是同一个流名：之前写成 tag + "_re"，于是「重连」其实是推了一条新流，
+        # 旧流宽限期到期后自然 404 —— 那个查了九轮的 404 空窗就是这么来的。
+        # 同时也意味着「断开后能重新推流（不是 406）」这一项从未真正测过重推。
+        pr2, plog2 = push(src, tag)
         ok2, tail2 = push_ok(plog2, pr2)
         note(ok2, "断开后能重新推流（不是 406）", tail2)
         got2 = vcodec(tag) if ok2 else ""
@@ -260,9 +263,9 @@ def case(tag, src, want_codec, video, enable=1):
             try:
                 hits = [l for l in open(LOG, errors="replace").read().splitlines()
                         if "无有效track" in l or "no such stream" in l or "404" in l
-                        or "DIAG pool" in l]
+                        or "DIAG pool" in l or "媒体注册" in l or "媒体注销" in l]
                 print(f"     ↳ 服务端 404 相关日志 {len(hits)} 行：")
-                for l in hits[-4:]:
+                for l in hits[-40:]:   # 只打最后 4 条会把更早的「媒体注册」挤掉（实测踩过）
                     # 不要截断：时间戳前缀是判断「404 与源存在是否同一时刻」的唯一依据，
                     # 上一版截到末 160 字符正好把它砍掉了，导致七轮假设都没法对齐时间
                     print("        " + l)
