@@ -632,3 +632,38 @@ RtspSession.cpp:62 onError | RTSP播放器(__defaultVhost__/live/rc_h265_h264)�
 在 `RtspSession::onAuthSuccess` 的 `!rtsp_src` 分支打印：
 `_media_info.vhost/app/stream` + `MediaSource::find` 各协议表的命中情况；
 再和池里该条目实际的 vhost/app/stream 对比。**两个 tuple 一比就出结论。**
+
+### 再排除一条：查找键一致
+
+让采样器记录完整 tuple（vhost/app/schema）后：
+
+```
+1.85s  ['__defaultVhost__/live/fmp4', '__defaultVhost__/live/rtmp',
+        '__defaultVhost__/live/rtsp',  '__defaultVhost__/live/ts']
+```
+
+池中 rtsp 源的 vhost/app 与 DESCRIBE 的 `__defaultVhost__/live/rc_h265_h264`
+**完全一致** ⇒ 「tuple 不一致导致 find 不到」也排除。
+
+### 至此已排除（4 条）
+
+| # | 假设 | 排除依据 |
+|---|---|---|
+| 1 | on_demand 把源下架 | 强制 on_demand=0 后依旧；且池里一直在 |
+| 2 | 注册空窗（键被摘又重建） | 200ms 采样显示整段时间键都在 |
+| 3 | SDP 为空（无有效 track） | 服务端日志是 `no such stream`，不是 `sdp中无有效track` |
+| 4 | 查找键（vhost/app/stream）不一致 | 采样到的 tuple 与 DESCRIBE 完全一致 |
+
+### 剩下的唯一方向：池里那个 weak_ptr 与 find 的实际路径
+
+`getMediaList` 能列出来、`findAsync` 却返回空，而两者的键完全一样 ⇒ 差异只可能在
+**对象存活 / 查找实现**这一层。首要怀疑：池里存的是 `weak_ptr`，对象已被销毁但条目还在
+（`getMediaList` 枚举时可能顺手 `lock()` 复活或读到未过期的临时强引用），而 `find` 拿到
+空 `lock()` 就当没有 ⇒ 报 `no such stream`。
+
+**验证方法（C++ 插桩，下一步）：** 在 `RtspSession::onAuthSuccess` 的 `!rtsp_src` 分支打印
+该键对应 weak_ptr 的 `expired()` 与 `use_count()`。若是 `expired()==true`，则根因是
+「转码接管路径释放了 RTSP 源对象，但池里的键没被摘干净」。
+
+> 记录：本条先后被误判为 on_demand、注册空窗、SDP 为空、键不一致，四次都被实测否掉。
+> 教训是**每次都要先问「这个假设用什么观测能证伪」，而不是顺着上一个假设往下推**。

@@ -156,7 +156,10 @@ def _sampler(stream, stop):
                 body = urllib.request.urlopen(
                     f"http://127.0.0.1:{HTTP}/index/api/getMediaList?secret={SECRET}", timeout=2).read()
                 data = json.loads(body).get("data") or []
-                names = sorted({d.get("schema") for d in data if d.get("stream") == stream})
+                # 记完整 tuple：池里的 vhost 若与 DESCRIBE 用的 __defaultVhost__ 不一致，
+                # 就会出现「getMediaList 有、findAsync 找不到」的自相矛盾
+                names = sorted({f'{d.get("vhost")}/{d.get("app")}/{d.get("schema")}'
+                                for d in data if d.get("stream") == stream})
             except Exception:
                 names = ["<api-fail>"]
             _TL.append((round(time.time() - t0, 2), names))
