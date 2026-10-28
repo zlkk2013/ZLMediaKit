@@ -282,7 +282,50 @@ private:
     /** 把 FFmpegFrame 转成编码器要求的像素格式/采样格式 */
     FFmpegFrame::Ptr formatFrame(const FFmpegFrame::Ptr &frame);
 
-private:
+    /**
+     * 用解码帧时间戳间隔实测源帧率（仅裸帧 codec）
+     *
+     * VP8/VP9/AV1 的码流、SDP、RTMP metadata 都不带帧率，源轨的 getVideoFps()
+     * 只是 VideoTrackImp 的默认值 30 —— 15fps 的源会被当成 30fps 打时间戳，
+     * 输出时间轴只剩一半长度（拉 5 秒内容要 10 秒）。这里对最近若干帧的
+     * 源时间戳间隔做「去极值平均」得到真实帧间隔：丢帧造成的 2 倍间隔与瞬间
+     * 抖动都被剔除，CFR 源的误差在 1% 以内。
+     *
+     * Measure the source frame rate from decoded-frame timestamp deltas. VP8/VP9/
+     * AV1 carry no frame rate anywhere (bitstream, SDP, RTMP metadata), so the
+     * source track's getVideoFps() is just VideoTrackImp's default 30 — a 15fps
+     * source gets 30fps timestamps and the output timeline ends up half as long
+     * (pulling 5s of content took 10s). Take a trimmed mean over recent source
+     * timestamp deltas: dropped frames (2x interval) and jitter are trimmed off,
+     * CFR error stays under 1%.
+     */
+    void updateSrcFpsEstimate(int64_t src_ms);
+
+    /**
+     * 当前视频帧的时间步进（毫秒，带小数）
+     *
+     * 优先级：显式配置的输出帧率 > 实测/声明的源帧率 > 40ms 兜底。
+     * Priority: configured output rate > measured/declared source rate > 40ms.
+     */
+    double videoStepMs() const;
+
+    /**
+     * 取下一个视频时间戳（毫秒）并推进时钟
+     *
+     * 用累加而不是「序号 × 步进」：步进会在实测帧率收敛时变化，序号乘法
+     * 会让时间轴在那一刻整段跳变。累加保持时间轴连续。
+     * Accumulate instead of "index * step": the step changes while the measured
+     * rate converges, and index multiplication would jump the whole timeline at
+     * that moment. Accumulation keeps it continuous.
+     *
+     * @param acc 该时间轴的累加器；输入帧 pts 与输出包 dts 各用一个，
+     *            否则两条路径都推进同一个累加器，时间轴会以两倍速前进。
+     *            The accumulator for this timeline: input pts and output dts use
+     *            two separate ones, otherwise both paths advance the same
+     *            accumulator and the timeline runs at double speed.
+     */
+    int64_t nextVideoStamp(double &acc);
+
     onEnc _cb;
     CodecId _codec_id;
     const AVCodec *_codec = nullptr;
@@ -322,8 +365,27 @@ private:
     /** 降帧抽帧用的累计计数（按源帧序号 × 目标/源帧率比取整判断） */
     int64_t _drop_index = 0;
     int64_t _keep_index = 0;
-    int64_t _video_frame_index = 0;
-    int64_t _video_pkt_index = 0;
+    /**
+     * 源帧率需要实测：裸帧 codec（VP8/VP9/AV1）没有任何地方带帧率，
+     * 源轨给的 30 只是 VideoTrackImp 的默认值。
+     * The source frame rate must be measured: raw-packet codecs (VP8/VP9/AV1)
+     * carry no frame rate anywhere and the track's 30 is just VideoTrackImp's
+     * default.
+     */
+    bool _src_fps_measure = false;
+    /** 实测源帧间隔的统计窗口长度（帧） */
+    static constexpr int kSrcFpsWindow = 16;
+    int64_t _src_fps_deltas[kSrcFpsWindow] = {0};
+    int _src_fps_delta_count = 0;
+    int _src_fps_delta_pos = 0;
+    /** 上一帧的源时间戳（毫秒），仅用于帧率实测 */
+    int64_t _src_fps_last_ms = AV_NOPTS_VALUE;
+    /** 实测得到的源帧率，0 表示还没收敛 */
+    float _src_fps_measured = 0;
+    /** 视频时间戳累加器（毫秒，保留小数避免长时间累积漂移）：输入 pts 用 _video_in_ms */
+    double _video_in_ms = 0;
+    /** 视频输出包 dts 的累加器 */
+    double _video_out_ms = 0;
     /** 首个源帧时间戳（毫秒），用于把输出对齐到源时间轴 */
     int64_t _src_base_ms = -1;
     /** 最近一次输入帧的源时间戳 */

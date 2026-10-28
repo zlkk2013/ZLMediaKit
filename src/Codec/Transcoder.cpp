@@ -13,6 +13,8 @@
 #include "Transcoder.h"
 #include "Common/config.h"
 #include "Util/util.h"
+#include <algorithm>
+#include <cmath>
 
 using namespace std;
 using namespace toolkit;
@@ -406,6 +408,16 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
     _video_params = video_params;
     _video_fps = (_video_params.fps > 0) ? _video_params.fps : src_fps;
     _codec_id = track->getCodecId();
+    // 源帧率是否需要实测：裸帧 codec（VP8/VP9/AV1）的码流与 SDP 都不带帧率，
+    // 源轨的 getVideoFps() 只是 VideoTrackImp 的默认 30；任何 codec 只要源轨
+    // 没给出帧率（<=0）同样只能实测。有 SPS/VUI 帧率的 H264/H265 不走这条路。
+    // Whether the source rate must be measured: raw-packet codecs (VP8/VP9/AV1)
+    // carry no frame rate in the bitstream or SDP, so the track's getVideoFps() is
+    // just VideoTrackImp's default 30; any codec whose track reports no rate (<=0)
+    // needs measuring too. H264/H265 (rate present in SPS/VUI) never take this path.
+    _src_fps_measure = track->getTrackType() == TrackVideo && src_video &&
+                       (src_fps <= 0.5f || src_video->getCodecId() == CodecVP8 ||
+                        src_video->getCodecId() == CodecVP9 || src_video->getCodecId() == CodecAV1);
     _codec = findEncoder(_codec_id);
     if (!_codec) {
         throw std::runtime_error("未找到编码器: " + string(::mediakit::getCodecName(_codec_id)));
@@ -563,6 +575,116 @@ bool FFmpegEncoder::shouldKeepFrame() {
         return true;
     }
     return false;
+}
+
+/**
+ * 实测源帧间隔
+ *
+ * VP8/VP9/AV1 的源没有任何帧率元数据，只能看解码帧的时间戳间隔。做法：
+ * 保留最近 kSrcFpsWindow 个正向间隔（<=1000ms，排除断流/跳变），去掉一个
+ * 最小值和最大值后取平均 —— 丢帧造成的 2 倍间隔、以及个别抖动都被剔除，
+ * 而 CFR 源在 90000/15 = 6000 tick/帧这种除不尽的情况下间隔是 66/67 交替，
+ * 平均正好回到 66.67ms（误差 <0.5%，长期不漂）。
+ *
+ * Measure the source frame interval. VP8/VP9/AV1 sources carry no frame rate at
+ * all, so the only evidence is the spacing of decoded frame timestamps. Keep the
+ * last kSrcFpsWindow positive deltas (<=1000ms; drops/stalls excluded), trim the
+ * min and max, and average the rest: a missed frame (2x interval) and one-off
+ * jitter are trimmed while a CFR source whose interval does not divide evenly
+ * (90000/15 = 6000 ticks) alternates 66/67 and averages back to 66.67ms
+ * (<0.5% error, no long-term drift).
+ */
+void FFmpegEncoder::updateSrcFpsEstimate(int64_t src_ms) {
+    if (src_ms == (int64_t) AV_NOPTS_VALUE || src_ms < 0) {
+        return;
+    }
+    if (_src_fps_last_ms != (int64_t) AV_NOPTS_VALUE) {
+        int64_t delta = src_ms - _src_fps_last_ms;
+        // 只收正常帧间隔：<=0 是乱序/重复，>1000ms 是断流或时间戳跳变，
+        // 都不代表帧率，收进去会把估算拉偏。
+        // Only normal intervals: <=0 means reorder/duplicate, >1000ms means a stall
+        // or a timestamp jump; feeding either would skew the estimate.
+        if (delta > 0 && delta <= 1000) {
+            _src_fps_deltas[_src_fps_delta_pos] = delta;
+            _src_fps_delta_pos = (_src_fps_delta_pos + 1) % kSrcFpsWindow;
+            if (_src_fps_delta_count < kSrcFpsWindow) {
+                ++_src_fps_delta_count;
+            }
+        }
+    }
+    _src_fps_last_ms = src_ms;
+
+    // 两个样本才有一个间隔，样本不足时保持上一次的结果（首帧就是 0）
+    // One interval needs two samples; keep the previous value while starved
+    // (it is 0 on the very first frame, so the caller falls back to the
+    // declared rate for the first couple of frames).
+    if (_src_fps_delta_count < 2) {
+        return;
+    }
+
+    int64_t sorted[kSrcFpsWindow];
+    for (int i = 0; i < _src_fps_delta_count; ++i) {
+        sorted[i] = _src_fps_deltas[i];
+    }
+    std::sort(sorted, sorted + _src_fps_delta_count);
+    // 样本够多时去掉一个最小/最大值；样本很少时不敢丢，直接平均
+    // Trim one min/max once there are enough samples; with very few samples
+    // trimming could throw away the only real evidence.
+    int trim = _src_fps_delta_count >= 5 ? 1 : 0;
+    int64_t sum = 0;
+    int count = _src_fps_delta_count - trim * 2;
+    for (int i = trim; i < trim + count; ++i) {
+        sum += sorted[i];
+    }
+    double avg_ms = (double) sum / count;
+    if (avg_ms < 8.0) {
+        // 120fps 以上不可能是视频，多半是时间戳错了，别把步进压到 1ms
+        // Above 120fps is not video; the timestamps are wrong, so never squeeze
+        // the step toward 1ms.
+        avg_ms = 8.0;
+    } else if (avg_ms > 1000.0) {
+        avg_ms = 1000.0;
+    }
+    float fps = (float) (1000.0 / avg_ms);
+    // 只在有明显变化时更新：±1% 以内不动，避免时间轴被 jitter 来回拉扯
+    // Only update on a material change: within ±1% keep the current value so
+    // jitter cannot wobble the timeline.
+    if (_src_fps_measured > 0.5f && fabs(fps - _src_fps_measured) < _src_fps_measured * 0.01f) {
+        return;
+    }
+    InfoL << "source fps measured: " << fps << " (interval=" << avg_ms
+          << "ms, samples=" << _src_fps_delta_count << ", declared=" << _src_fps
+          << "), using it for the output timeline";
+    _src_fps_measured = fps;
+    // 写回 _src_fps：降帧判断（shouldKeepFrame）也要用真实源帧率，否则
+    // 「15fps 源 → 15fps 目标」会被当成 30→15 而丢掉一半的帧。
+    // Write it back to _src_fps: decimation needs the real rate too, otherwise
+    // "15fps source -> 15fps target" looks like 30->15 and loses half the frames.
+    _src_fps = fps;
+}
+
+double FFmpegEncoder::videoStepMs() const {
+    // 显式配置的输出帧率优先：此时按目标帧率匀速输出，源多了由 shouldKeepFrame 抽掉
+    // An explicitly configured output rate wins: output at that rate and let
+    // shouldKeepFrame decimate the surplus.
+    if (_video_params.fps > 0.5f) {
+        return 1000.0 / _video_params.fps;
+    }
+    // 实测的源帧率优先于轨上声明的帧率：裸帧 codec 只有前者是真的
+    // The measured source rate wins over the declared one: for raw-packet codecs
+    // only the former is real.
+    if (_src_fps > 0.5f) {
+        return 1000.0 / _src_fps;
+    }
+    // 两者都没有（首帧、样本未收敛）时的保守回退
+    // Conservative fallback when neither is known yet (first frames).
+    return _video_fps > 0.5f ? 1000.0 / _video_fps : 40.0;
+}
+
+int64_t FFmpegEncoder::nextVideoStamp(double &acc) {
+    int64_t stamp = (int64_t) llround(acc);
+    acc += videoStepMs();
+    return stamp;
 }
 
 bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVCodec *codec) {
@@ -1091,6 +1213,14 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     _last_src_ms = src_dts;
 
     if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
+        // 裸帧 codec 的源没有帧率元数据，先按解码帧时间戳间隔实测；
+        // 实测值会写进 _src_fps，降帧判断与时间轴步进都用它。
+        // Raw-packet codecs carry no source frame rate: measure it from decoded
+        // frame timestamp deltas. The result lands in _src_fps and drives both
+        // decimation and the timeline step.
+        if (_src_fps_measure) {
+            updateSrcFpsEstimate(src_dts);
+        }
         // 降帧：目标帧率低于源时，按「源帧序号 × 目标/源」跳帧，替代方案（按时钟
         // 累计）在源帧间隔抖动时会一次连丢/连留，这里的整数累加是确定性的。
         // Decimation: when the target fps is below the source, skip frames by
@@ -1104,7 +1234,7 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
             return false;
         }
         auto av_frame = converted->get();
-        // 编码器的 time_base 是 1/1000，pts 单位就是毫秒，必须按帧率推进，
+        // 编码器的 time_base 是 1/1000，pts 单位就是毫秒，必须按帧间隔推进，
         // 不能填帧序号：填序号等于每帧只前进 1ms，15fps 的流会被压缩成 1000fps
         // 的时间轴，下游按源流时间判定时几乎每帧都"过旧"被丢，
         // 观众端表现为帧数远低于源、且参考帧缺失（Could not find ref with POC）。
@@ -1113,25 +1243,25 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
         // compressing a 15fps stream onto a 1000fps timeline. Downstream then judges
         // almost every frame stale against the source clock and drops it, so the viewer
         // sees far fewer frames plus missing references ("Could not find ref with POC").
-        int64_t step_ms = (_frame_interval_ms > 0)
-                          ? _frame_interval_ms
-                          : (int64_t) (1000.0 / (_video_fps > 0 ? _video_fps : 25.0));
+        int64_t step_ms = (int64_t) llround(videoStepMs());
         if (step_ms <= 0) {
             step_ms = 40;
         }
-        // 一律按源帧率匀速推进，不跟源 pkt_dts。
+        // 一律按（实测/声明的）源帧率匀速推进，不跟源 pkt_dts。
         // 原因：RTMP 源的 pkt_dts 经 1/1000 时基换算后抖动很大（实测 15fps 的源
         // 算出 ~53ms/帧 = 19fps），用它做时间轴会让转码流比源流跑快 25%，
         // 下游按源流时间判定就会把 2/3 的帧当"过旧"丢弃。
-        // 转码是恒帧率输出，按 1000/fps 匀速推进才是正确的时间轴。
-        // Always advance at the source frame rate instead of following the source
-        // pkt_dts: after the 1/1000 timebase conversion an RTMP source's pkt_dts
-        // jitters badly (a 15fps source measured at ~53ms/frame = 19fps), and using it
-        // as the timeline makes the transcoded stream run 25% faster than the source,
-        // so downstream judges 2/3 of the frames stale and drops them. Transcoding is a
-        // constant-frame-rate output, so advancing at 1000/fps is the correct timeline.
-        av_frame->pts = _video_frame_index * step_ms;
-        _video_frame_index++;
+        // 转码是恒帧率输出，按 1000/fps 匀速推进才是正确的时间轴；步进本身
+        // 不再取常量，而是「目标帧率 > 实测源帧率 > 兜底」。
+        // Always advance at the (measured/declared) source frame rate instead of
+        // following the source pkt_dts: after the 1/1000 timebase conversion an RTMP
+        // source's pkt_dts jitters badly (a 15fps source measured at ~53ms/frame =
+        // 19fps), and using it as the timeline makes the transcoded stream run 25%
+        // faster than the source, so downstream judges 2/3 of the frames stale and
+        // drops them. Transcoding is a constant-frame-rate output, so advancing at
+        // 1000/fps is the correct timeline; the step itself is no longer a constant
+        // but "configured target rate > measured source rate > fallback".
+        av_frame->pts = nextVideoStamp(_video_in_ms);
         // 让 onEncode 出口的单调守卫也用视频帧间隔，否则它退回 20ms 的默认值
         // 会把视频时间轴按 20ms 拉扯。
         // Let the onEncode monotonic guard use the video interval too; otherwise it
@@ -1410,11 +1540,10 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     // downstream sees strictly monotonic dts starting at 0.
     int64_t next_ms;
     if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
-        // 视频时间轴完全由 inputFrame_l 按帧率匀速决定（见那里的说明），
-        // 这里直接用包序号 × 帧间隔，不再另起时钟。
-        // The video timeline is fully decided by inputFrame_l advancing at the frame
-        // rate (see the note there); use packet index times the frame interval here
-        // instead of running a second clock.
+        // 视频时间轴完全由 videoStepMs() 决定的步进累加（见那里的说明），
+        // 这里不另起时钟。
+        // The video timeline is the accumulation of videoStepMs() (see there); no
+        // second clock is started here.
         // 不用 packet->pts 也不用编码器 time_base：libx265 会把时基重新缩放
         // （实测输入 6600 ticks/1ms 时基，输出算出 5280ms，恰好 0.8 倍），
         // 换算结果与源帧率不符，下游按源流时间判定就会大量丢帧。
@@ -1422,14 +1551,7 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
         // the timebase (an input of 6600 ticks on a 1ms base measured out as 5280ms,
         // exactly 0.8x), so the converted timeline disagrees with the source frame rate
         // and downstream drops most frames as stale.
-        int64_t vstep = (_frame_interval_ms > 0)
-                        ? _frame_interval_ms
-                        : (int64_t) (1000.0 / (_video_fps > 0 ? _video_fps : 25.0));
-        if (vstep <= 0) {
-            vstep = 40;
-        }
-        next_ms = _video_pkt_index * vstep;
-        _video_pkt_index++;
+        next_ms = nextVideoStamp(_video_out_ms);
     } else if (!_silence_encoding && _last_src_ms != AV_NOPTS_VALUE && _src_base_ms > 0) {
         // 音频跟随源流时间轴
         // Audio follows the source timeline
