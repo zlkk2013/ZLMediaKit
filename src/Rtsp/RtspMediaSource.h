@@ -139,6 +139,43 @@ public:
     void updateSdpCache(const std::string &sdp);
 
     /**
+     * 登记“本源的推流端对象”。
+     *
+     * 只在 muxer 生成了对外 RTSP 源时调用（转码、或 `[rtsp] directProxy=0`）：
+     * 此时推流端的 `RtspMediaSourceImp` 不再注册进媒体源池，池里是 muxer 建的
+     * `RtspMediaSource`，推流端断连重推时 `handleReq_ANNOUNCE` 只查到后者，
+     * 认不出它背后还有可接管的推流端（→ 406 Already publishing）。
+     * 这个弱引用就是那条回去的路。
+     *
+     * Register the pusher object behind this source. Only used when the muxer
+     * publishes the RTSP source (transcoding, or `[rtsp] directProxy=0`): the
+     * pusher's RtspMediaSourceImp is then not in the pool, so a reconnecting
+     * pusher only finds this source and 406s out. This weak link leads back.
+     */
+    void setPushSource(const std::weak_ptr<RtspMediaSource> &push_src) {
+        _push_src = push_src;
+        _has_push_src = true;
+    }
+
+    /**
+     * 是否“由推流端转协议/转码产生的对外源”（即使推流端已销毁也为真）。
+     *
+     * True when this source is the published shadow of an RTSP pusher, even after
+     * the pusher object itself is gone.
+     */
+    bool isPushShadow() const {
+        return _has_push_src;
+    }
+
+    /**
+     * 取回推流端对象；推流端已销毁或本源不是影子源时为空。
+     * The pusher object, empty when it was destroyed or this is not a shadow.
+     */
+    RtspMediaSource::Ptr getPushSource() const {
+        return _push_src.lock();
+    }
+
+    /**
      * 输入rtp
      * @param rtp rtp包
      * @param keyPos 该包是否为关键帧的第一个包
@@ -177,6 +214,10 @@ private:
     int _ring_size;
     std::string _sdp;
     RingType::Ptr _ring;
+    // 见 setPushSource()；_has_push_src 在推流端销毁后仍为 true
+    // See setPushSource(); _has_push_src stays true after the pusher was destroyed
+    bool _has_push_src = false;
+    std::weak_ptr<RtspMediaSource> _push_src;
 };
 
 } /* namespace mediakit */

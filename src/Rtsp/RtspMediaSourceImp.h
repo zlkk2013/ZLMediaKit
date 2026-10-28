@@ -141,6 +141,23 @@ public:
 
     RtspMediaSource::Ptr clone(const std::string& stream) override;
 
+    /**
+     * 推流端对象销毁 = 这条流真的结束了（含 `continue_push_ms` 的延时注销窗口）。
+     *
+     * 必须在这里显式释放 muxer 的输出源：启用转码时 muxer 内部存在引用环
+     * （详见 MultiMediaSourceMuxer::releaseMediaSources()），自然析构不会发生，
+     * 它对外发布的 RTSP 源会一直占着媒体源池里的键，推流端重连时 ANNOUNCE
+     * 永远回 406 Already publishing。
+     *
+     * The pusher object dying means the stream is really over (including the
+     * continue_push_ms grace window). The muxer's output sources must be released
+     * here: with transcoding there is a reference cycle inside the muxer (see
+     * MultiMediaSourceMuxer::releaseMediaSources()), so it never destructs on its
+     * own and its published RTSP source keeps the pool key forever, which makes
+     * every reconnect answer 406 Already publishing.
+     */
+    ~RtspMediaSourceImp() override;
+
 private:
     /**
      * 本流是否启用转码（读 [transcode] 配置 + API 覆盖）。

@@ -29,8 +29,27 @@ TranscodeSink::TranscodeSink(const TranscodeOption &option, std::function<size_t
 
 TranscodeSink::~TranscodeSink() {
     cancelSilenceTimer();
-    lock_guard<mutex> lck(_mtx);
-    for (auto &pr : _contexts) {
+    // 不能在持 _mtx 的情况下销毁 TrackContext：解码器析构会 flush 残留帧，flush 会
+    // 同步回调进 onDecoded()，那里要拿 _mtx，而非递归锁 → 同一线程自死锁。
+    // 实测：推流端断连、延时注销结束时释放 muxer 的输出源，poller 线程就卡在
+    // `~FFmpegDecoder → FrameMerger::flush → onDecoded → mutex::lock`，
+    // muxer 和它对外发布的源从此永不释放（重推永远 406）。
+    // 先把 _contexts 换出来，在锁外停止线程并销毁。
+    //
+    // Never destroy TrackContext while holding _mtx: the decoder destructor flushes
+    // its buffered frames, and that flush synchronously re-enters onDecoded(), which
+    // takes _mtx — a non-recursive mutex, so the same thread deadlocks. Measured: the
+    // poller thread hung in
+    // `~FFmpegDecoder -> FrameMerger::flush -> onDecoded -> mutex::lock` when the
+    // muxer's output sources were released after the pusher disconnected, and the
+    // muxer plus its published sources were never freed (reconnect always 406).
+    // Swap the contexts out first, then stop threads and destroy outside the lock.
+    decltype(_contexts) contexts;
+    {
+        lock_guard<mutex> lck(_mtx);
+        contexts.swap(_contexts);
+    }
+    for (auto &pr : contexts) {
         if (pr.second.decoder) {
             pr.second.decoder->stopThread(true);
         }
@@ -38,7 +57,7 @@ TranscodeSink::~TranscodeSink() {
             pr.second.encoder->stopThread(true);
         }
     }
-    _contexts.clear();
+    contexts.clear();
 }
 
 void TranscodeSink::setOption(const TranscodeOption &option) {

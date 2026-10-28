@@ -234,8 +234,26 @@ void RtspSession::handleReq_ANNOUNCE(const Parser &parser) {
             //尝试断连后继续推流
             auto rtsp_src = dynamic_pointer_cast<RtspMediaSourceImp>(src);
             if (!rtsp_src) {
-                //源不是rtsp推流产生的
-                break;
+                // 源不是rtsp推流产生的（例如 rtmp 推流 + rtsp 转协议），不允许接管。
+                // 但启用转码（或 `[rtsp] directProxy=0`）时，推流端自己不再注册，
+                // 池里是 muxer 生成的对外源；它登记了它背后的推流端对象，靠这条
+                // 弱引用找回推流端，才能像 direct-proxy 那样做所有权转移。
+                // 拿不到（推流端已销毁/本源不是影子源）就仍然按“已被占用”拒绝。
+                //
+                // Not produced by an RTSP pusher (e.g. rtmp push + rtsp muxer): no takeover.
+                // While transcoding (or with `[rtsp] directProxy=0`) the pusher's own
+                // source is not registered; the pool holds the muxer's source, which
+                // links back to the pusher. Follow that link so the takeover works
+                // exactly like direct-proxy. Failing that, keep answering 406.
+                auto shadow = dynamic_pointer_cast<RtspMediaSource>(src);
+                if (shadow && shadow->isPushShadow()) {
+                    rtsp_src = dynamic_pointer_cast<RtspMediaSourceImp>(shadow->getPushSource());
+                }
+                if (!rtsp_src) {
+                    break;
+                }
+                InfoL << "ANNOUNCE: take over published RTSP source of "
+                      << _media_info.shortUrl() << " (muxer-owned, transcode/direct-proxy off)";
             }
             auto ownership = rtsp_src->getOwnership();
             if (!ownership) {
@@ -249,6 +267,15 @@ void RtspSession::handleReq_ANNOUNCE(const Parser &parser) {
         }
 
         if (push_failed) {
+            if (src) {
+                // 把占着这个键的源类型打出来：转码/关闭 direct-proxy 时是 muxer 源，
+                // rtmp 推转 rtsp 时也是它，只有前者允许接管，排障时一眼能分清。
+                // Log which source holds the key: for transcoding / directProxy=0 it is
+                // the muxer source (takeover allowed), while an rtmp push converted to
+                // rtsp also shows up as one — the type tells them apart.
+                WarnL << "ANNOUNCE refused, stream already in use by "
+                      << src->getUrl() << " (" << toolkit::demangle(typeid(*src).name()) << ")";
+            }
             sendRtspResponse("406 Not Acceptable", { "Content-Type", "text/plain" }, "Already publishing.");
             string err = StrPrinter << "ANNOUNCE: Already publishing:" << _media_info.shortUrl() << endl;
             throw SockException(Err_shutdown, err);
