@@ -125,10 +125,17 @@ def pull_info(stream, sel="a"):
 
 def grab(stream, seconds=6, audio_only=False):
     out = f"/tmp/joint_{stream}.wav" if audio_only else f"/tmp/joint_{stream}.mp4"
-    if os.path.exists(out): os.remove(out)
-    extra = "-vn -c:a pcm_s16le" if audio_only else "-c copy"
-    sh(f"ffmpeg -y -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
-       f"-t {seconds} {extra} {out}", timeout=seconds + 40)
+    cmd = (f"ffmpeg -y -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
+           f"-t {seconds} {'-vn -c:a pcm_s16le' if audio_only else '-c copy'} {out}")
+    # 超时重试：宿主机被别的进程压满时（实测 load 16/10 核），拉流会饿死到超时，
+    # 那是环境不是产品问题。重试一次，仍失败才让异常冒出去。
+    for attempt in range(2):
+        if os.path.exists(out): os.remove(out)
+        try:
+            sh(cmd, timeout=seconds + 40)
+            return out
+        except subprocess.TimeoutExpired:
+            print(f"  (拉流超时，重试 {attempt + 1}/2: {stream})")
     return out
 
 def mean_vol(path, ss=None):

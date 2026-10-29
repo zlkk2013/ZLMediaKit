@@ -93,6 +93,19 @@ preflight() {
     return 1
   fi
   echo "✅ 二进制比源码新：$(/usr/bin/stat -f '%Sm' "$BIN")"
+  # 宿主负载：这是开发机，Hermes/Chrome/WindowServer 常态占着大半 CPU。
+  # 负载高于核数时，时间敏感套件（adapt_fps 的帧率判据、拉流超时）会假红，
+  # 这里提前说清楚，免得把环境问题当成产品回归。
+  local load1 cores
+  # sysctl 在 /usr/sbin（本机 PATH 只有 /usr/bin:/bin，裸调会静默失败）
+  load1=$(/usr/sbin/sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+  cores=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
+  [ -z "$load1" ] && load1=0
+  [ -z "$cores" ] && cores=1
+  awk -v l="$load1" -v c="$cores" 'BEGIN{
+    if (l > c * 0.8) printf "⚠️  宿主负载 %.2f / %d 核（偏高）：adapt_fps 等时间敏感套件可能假红\n", l, c;
+    else printf "✅ 宿主负载 %.2f / %d 核\n", l, c }'
+
   # 残留 MediaServer 必须清掉再开跑 —— 上一轮被打断（Ctrl-C / 工具超时）留下的孤儿进程
   # 会占着端口，导致后续套件「启动失败」，而症状看起来像产品坏了（Connection refused）。
   #
