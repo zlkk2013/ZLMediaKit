@@ -72,3 +72,4 @@ config.release.ini
 config.av1stab.ini
 logs/
 config.scale.ini
+config.filter.ini

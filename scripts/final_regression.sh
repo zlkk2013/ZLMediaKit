@@ -33,6 +33,7 @@ CORE=(
   "rtsp_reconnect_test:480:断连续推：kill 推流端后重连不再 406，转码仍生效"
   "codec_reverse_test:420:反向方向：H265->H264、G711A/MP3 作源"
   "scale_param_test:420:分辨率倍数与 API 宽高（拉流端实际尺寸判据）"
+  "filter_test:420:视频滤镜/OSD（luma 反相与亮度变化判据）"
   "vp8_source_timeline_test:420:VP8/VP9 作源的时间轴（防 2 倍速）"
   "joint_accept:600:联合验收：API/视频参数/静音兜底/多轨并发"
   "source_release_check:300:媒体源释放：断开后源必须清空（泄漏检查）"

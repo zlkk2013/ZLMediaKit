@@ -182,3 +182,52 @@ if (_on_output) {
   不是服务端日志里的 target_size。
   坑：kill 推流端后 15 秒内重推会接管旧流水线并沿用旧参数，多例必须用不同流名，
   否则只有第一例生效。
+
+## 视频滤镜 / OSD（2026-10-29 增）
+
+### 能力
+
+在「解码 → 缩放/像素格式转换 → **滤镜** → 编码」之间插入一条 **libavfilter 单输入滤镜链**，
+支持任意不改变尺寸的滤镜：OSD 文字（`drawtext`）、`negate`、`hflip`、`boxblur`、`delogo` 等。
+
+**位置很关键**：滤镜在缩放之后 —— OSD 字号按**输出分辨率**算才有意义，
+放在缩放之前、缩小后文字会跟着糊掉。
+
+### 配置与 API
+
+```ini
+[transcode]
+; OSD 示例：左上角打摄像头名，白字黑底框
+video_filter=drawtext=text='CAM-01':x=40:y=40:fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=8
+```
+
+```
+/index/api/addTranscode?secret=..&app=live&stream=cam1&video_codec=H265&filter=<urlencoded 滤镜串>
+```
+
+响应里回显 `video_filter`。空串 = 不启用。
+
+### 硬约束
+
+| 约束 | 原因 |
+|---|---|
+| 滤镜**不能改变输出尺寸/像素格式** | 编码器是按输入尺寸配置的，尺寸变了 `avcodec_send_frame` 返回 EINVAL，报错信息完全看不出是滤镜导致 |
+| 只支持单输入滤镜 | `overlay`（叠加 logo 图片）需要第二路输入，暂不支持 |
+| 建图失败只停用滤镜、不断流 | 观众宁可没有 OSD，也不该整路黑掉；失败会打 `ErrorL` 且不重试（避免刷屏） |
+| 改尺寸请用 `video_scale` / `video_width` | 见上一条 |
+
+### 验收
+
+`scripts/filter_test.py`（12 项）：
+
+- 基线可解；`negate` 后 YAVG ≈ 255 − 原始（实测 125.7 → 129.4）
+- `drawtext` 后 YAVG 有可见变化（125.7 → 123.9），尺寸不变、0 硬错误
+- 服务端日志出现 `transcode filter ready`
+- 非法滤镜名（`no_such_filter=1`）→ 流照常、按原样直通
+- 改变尺寸的滤镜（`crop=iw:ih/2`）→ init 阶段被拒，并给出可读原因
+- 抽帧看图：OSD 文字 `CAM-01 AEGIS 2026-10-29` 清晰可读（人工确认）
+
+判据用 **luma 均值** 而不是逐像素比对：编码器输出不保证逐字节可复现，亮度统计是稳定量纲。
+
+坑：`signalstats,metadata=print` 会把每帧统计打到 stdout，错误统计必须排除
+`lavfi.signalstats.*` 与 `frame:` 开头的行为，否则会凭空多出 1300+ 条「硬错误」。

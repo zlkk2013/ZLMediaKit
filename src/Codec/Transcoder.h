@@ -16,6 +16,11 @@
 #include <memory>
 #include "Codec/Transcode.h"
 
+namespace mediakit {
+// 滤镜图：只需要指针成员，定义在 TranscodeFilter.h（.cpp 里包含）
+class TranscodeFilter;
+}
+
 // 注意：ffmpeg 头必须放在 extern "C" 里，Transcode.h 已包裹大部分；
 // 但 opt.h 未在其中，漏掉会导致 av_opt_set 被当 C++ 符号而链接失败
 // NOTE: ffmpeg headers must be wrapped in extern "C"; Transcode.h covers most of them,
@@ -196,6 +201,20 @@ public:
 
     /** 冲刷编码器内部缓冲，流结束时必须调用，否则尾部若干帧丢失 */
     void flush();
+
+    /**
+     * 设置视频滤镜（libavfilter 单输入描述串，如 OSD 文字 drawtext=...）。
+     *
+     * 必须在构造后、喂第一帧前调用：滤镜图要按编码器的输出尺寸/像素格式建，
+     * 而那是 open2 之后才确定的。空串表示不启用。
+     * 滤镜**不允许改变尺寸/像素格式**，需要改尺寸请用 video_scale / video_width。
+     *
+     * Set a single-input libavfilter chain (e.g. drawtext OSD). Must be called before
+     * the first frame; the graph is built from the encoder's output size/pix_fmt.
+     * Empty string disables it. The filter must not change size or pixel format —
+     * use video_scale / video_width for resizing.
+     */
+    void setVideoFilter(const std::string &desc) { _filter_desc = desc; }
 
     /**
      * 预热：编码一帧纯色画面并把得到的 config NAL（H265 的 VPS/SPS/PPS、
@@ -409,6 +428,11 @@ private:
      * through the _emitted_ms guard.
      */
     bool _silence_encoding = false;
+    /** 视频滤镜描述串与图对象（懒建：等编码器 open2 确定尺寸后再建图） */
+    std::string _filter_desc;
+    std::shared_ptr<TranscodeFilter> _filter;
+    /** 建图失败过就不再重试（避免每帧都打一条错误日志刷爆） */
+    bool _filter_failed = false;
     bool _flush_done = false;
     int64_t _frame_index = 0;
 };

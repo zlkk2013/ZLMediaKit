@@ -12,6 +12,7 @@
 
 #include "Transcoder.h"
 #include "Common/config.h"
+#include "Transcode/TranscodeFilter.h"
 #include "Util/util.h"
 #include <algorithm>
 #include <cmath>
@@ -1267,6 +1268,50 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
         // Let the onEncode monotonic guard use the video interval too; otherwise it
         // falls back to a 20ms default and drags the video timeline along at 20ms.
         _frame_interval_ms = step_ms;
+
+        // ---- 滤镜（可选）----
+        // 位置很关键：放在「缩放 + 像素格式转换」之后、编码之前。
+        // 放在之前会让 drawtext 在源分辨率上绘制，缩小后文字跟着糊掉 —— OSD 文字
+        // 必须按**输出分辨率**算字号才有意义。
+        //
+        // 滤镜出错时只关闭滤镜并打一次 Error，绝不丢弃帧：观众宁可看到没有 OSD 的画面，
+        // 也不该整路断掉。
+        //
+        // Filters run AFTER sws scaling and BEFORE encoding: drawing OSD text at the
+        // source resolution and then downscaling would blur it, so text size must be
+        // relative to the OUTPUT resolution. On filter errors we disable the filter and
+        // keep passing frames through — losing OSD is better than losing the stream.
+        if (!_filter_desc.empty()) {
+            if (!_filter && !_filter_failed) {
+                _filter = std::make_shared<TranscodeFilter>();
+                _filter_failed = true;   // 先置位：init 失败不再重试同一张图
+                if (_filter->init(_filter_desc, _context->width, _context->height,
+                                  _context->pix_fmt, _context->time_base.num,
+                                  _context->time_base.den)) {
+                    _filter_failed = false;
+                } else {
+                    ErrorL << "transcode filter init failed, disabled: " << _filter_desc;
+                    _filter = nullptr;
+                }
+            }
+            if (_filter) {
+                AVFrame *filtered = nullptr;
+                int ret = _filter->filter(av_frame, &filtered);
+                if (ret < 0) {
+                    ErrorL << "transcode filter 出错，已停用: " << _filter_desc;
+                    _filter = nullptr;
+                    _filter_failed = true;
+                } else if (ret == 0) {
+                    // 滤镜内部还在缓冲（如 fps/重叠类滤镜），这帧先不下发
+                    return true;
+                } else {
+                    filtered->pts = av_frame->pts;
+                    bool ok = encodeFrame(filtered);
+                    av_frame_free(&filtered);
+                    return ok;
+                }
+            }
+        }
         return encodeFrame(av_frame);
     }
 

@@ -203,6 +203,8 @@ TranscodeOption loadGlobalTranscodeOption() {
     // 分辨率倍数：与 video_width/height 互斥，显式尺寸优先（见 TranscodeOption 注释）
     // Resolution multiplier; explicit width/height take precedence (see TranscodeOption)
     option.video_scale = parseFloat(ini[kTranscodeVideoScale].as<string>(), 0);
+    // 滤镜串：原样保留（libavfilter 自己会校验语法），只有空串表示不启用
+    option.video_filter = trim(ini[kTranscodeVideoFilter].as<string>());
     // 静音兜底的两项：P6 引入，重构到本文件时曾漏读，导致配置文件里改它们不生效
     // Silence fallback settings (from P6). The refactor into this file once dropped
     // these, so editing them in the ini had no effect at all.

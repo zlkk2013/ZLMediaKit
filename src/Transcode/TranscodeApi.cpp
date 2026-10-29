@@ -139,6 +139,7 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_fps"] = option.video_fps;
     val["video_bitrate"] = option.video_bitrate;
     val["video_scale"] = option.video_scale;
+    val["video_filter"] = option.video_filter;
 }
 
 }//namespace
@@ -249,6 +250,18 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         option.enable = enable_value;
     }
 
+    // 视频滤镜（单输入 libavfilter 描述串）。空串 = 关闭滤镜。
+    // 不做语法校验：libavfilter 的报错比我们自己写的提示准确，且建图失败时
+    // 编码器会打 Error 并停用滤镜，不影响出流。
+    bool filter_given = false;
+    {
+        auto raw = trim(argValue(args, "filter"));
+        if (!raw.empty()) {
+            option.video_filter = raw;
+            filter_given = true;
+        }
+    }
+
     // 显式宽高：0 = 跟随源。与 scale 同时给时显式值优先（绝对尺寸更明确）
     // Explicit width/height, 0 = follow source. Wins over scale when both are given.
     bool size_given = false;
@@ -304,9 +317,9 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
 
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
     if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
-        && !scale_given && !size_given) {
+        && !scale_given && !size_given && !filter_given) {
         return makeError(kApiInvalidArgs,
-                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width");
+                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter");
     }
     // 没显式 enable=0，但全局段/规则/本次请求都凑不出目标 codec：
     // 这条覆盖永远转不了任何东西，报错比留一条空覆盖好排查

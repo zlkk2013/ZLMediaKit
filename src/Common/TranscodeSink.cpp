@@ -316,6 +316,11 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
                                                       is_audio ? nullptr : track,
                                                       is_audio ? VideoTargetParams() : video_params);
+        // 滤镜必须在喂第一帧前设置：图是按编码器 open2 之后的输出尺寸建的
+        if (!is_audio && !_option.video_filter.empty()) {
+            ctx.encoder->setVideoFilter(_option.video_filter);
+            InfoL << "transcode video filter: " << _option.video_filter;
+        }
         if (!is_audio) {
             // 关键：转码轨必须在 addTrack 之前 ready。
             // RtspMuxer/MP4Muxer 的 addTrack 见到 ready()==false 的轨会直接丢弃

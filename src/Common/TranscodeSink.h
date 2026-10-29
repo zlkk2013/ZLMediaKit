@@ -57,6 +57,16 @@ struct TranscodeOption {
      * 0 disables it. Explicit video_width/video_height win when both are given.
      */
     float video_scale = 0;
+    /**
+     * 视频滤镜描述串（libavfilter 单输入），如 `drawtext=text='CAM-01':x=10:y=10:fontsize=28:fontcolor=white`。
+     * 空串表示不启用。滤镜**不能改变尺寸/像素格式**（要改尺寸用 video_scale/video_width）。
+     * 多输入滤镜（overlay 叠加 logo 图片）暂不支持。
+     *
+     * Single-input libavfilter chain (e.g. drawtext OSD). Empty disables it. The filter
+     * must not change size/pixel format; multi-input filters (overlay with a logo image)
+     * are not supported yet.
+     */
+    std::string video_filter;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
     /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */
