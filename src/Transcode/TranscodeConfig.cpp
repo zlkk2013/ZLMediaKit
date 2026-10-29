@@ -101,6 +101,20 @@ static int parseInt(const string &value, int fallback) {
     return (int) ret;
 }
 
+static float parseFloat(const string &value, float fallback) {
+    auto str = trim(string(value));
+    if (str.empty()) {
+        return fallback;
+    }
+    char *end = nullptr;
+    double ret = ::strtod(str.data(), &end);
+    if (end == str.data() || ret < 0) {
+        WarnL << "invalid transcode number: '" << value << "', keep " << fallback;
+        return fallback;
+    }
+    return (float) ret;
+}
+
 static bool parseBool(const string &value, bool fallback) {
     auto str = strToLower(trim(string(value)));
     if (str.empty()) {
@@ -154,6 +168,15 @@ bool applyTranscodeItems(const map<string, string> &items, TranscodeOption &opti
             }
         } else if (key == "on_demand") {
             option.on_demand = parseBool(value, option.on_demand);
+        } else if (key == "video_scale") {
+            auto str = trim(string(value));
+            char *end = nullptr;
+            double num = str.empty() ? 0 : ::strtod(str.data(), &end);
+            if (!str.empty() && (end == str.data() || *end != '\0' || num < 0)) {
+                fail("invalid transcode video_scale: '" + value + "'");
+                continue;
+            }
+            option.video_scale = (float) num;
         } else {
             WarnL << "unknown transcode option '" << key << "', ignored";
         }
@@ -177,6 +200,9 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_height = parseInt(ini[kTranscodeVideoHeight].as<string>(), 0);
     option.video_fps = (float) parseInt(ini[kTranscodeVideoFps].as<string>(), 0);
     option.video_bitrate = parseInt(ini[kTranscodeVideoBitrate].as<string>(), 0);
+    // 分辨率倍数：与 video_width/height 互斥，显式尺寸优先（见 TranscodeOption 注释）
+    // Resolution multiplier; explicit width/height take precedence (see TranscodeOption)
+    option.video_scale = parseFloat(ini[kTranscodeVideoScale].as<string>(), 0);
     // 静音兜底的两项：P6 引入，重构到本文件时曾漏读，导致配置文件里改它们不生效
     // Silence fallback settings (from P6). The refactor into this file once dropped
     // these, so editing them in the ini had no effect at all.

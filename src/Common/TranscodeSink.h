@@ -48,6 +48,15 @@ struct TranscodeOption {
     float video_fps = 0;
     /** 视频专用码率(bps)，0=沿用 bitrate/源。优先于 bitrate */
     int video_bitrate = 0;
+    /**
+     * 分辨率倍数：按源宽高等比缩放，如 0.5 表示一半、2.0 表示两倍。
+     * 0 = 不缩放（默认）。显式给了 video_width / video_height 时以显式值为准
+     * （绝对尺寸比倍数更明确，避免两者同时配置时语义含糊）。
+     *
+     * Resolution multiplier relative to the source (0.5 = half, 2.0 = double).
+     * 0 disables it. Explicit video_width/video_height win when both are given.
+     */
+    float video_scale = 0;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
     /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */

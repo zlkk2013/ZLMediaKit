@@ -71,3 +71,4 @@ config.liveness.ini
 config.release.ini
 config.av1stab.ini
 logs/
+config.scale.ini

@@ -88,6 +88,27 @@ int parseNonNegative(const TranscodeApiArgs &args, const char *key, int *out) {
     return 1;
 }
 
+/**
+ * 解析可选的正浮点参数（分辨率倍数这类）。
+ * @return 1 已设置；0 参数缺省；-1 非法
+ *
+ * 与 parseNonNegative 同样的道理：`scale=abc` 必须报错，
+ * 静默当成 0（= 跟随源）会让调用方以为缩放生效了。
+ */
+int parseNonNegativeFloat(const TranscodeApiArgs &args, const char *key, float *out) {
+    auto raw = trim(argValue(args, key));
+    if (raw.empty()) {
+        return 0;
+    }
+    char *end = nullptr;
+    double num = ::strtod(raw.data(), &end);
+    if (end == raw.data() || *end != '\0' || num < 0) {
+        return -1;
+    }
+    *out = (float) num;
+    return 1;
+}
+
 /** 解析可选的布尔参数；@return 1 已设置；0 缺省；-1 非法 */
 int parseBoolArg(const TranscodeApiArgs &args, const char *key, bool *out) {
     auto raw = strToLower(trim(argValue(args, key)));
@@ -112,6 +133,12 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["sample_rate"] = option.sample_rate;
     val["on_demand"] = option.on_demand;
     val["enable"] = option.enable;
+    // 视频侧参数一并回显：只回 codec 会让调用方不知道分辨率/帧率/码率到底生效了没有
+    val["video_width"] = option.video_width;
+    val["video_height"] = option.video_height;
+    val["video_fps"] = option.video_fps;
+    val["video_bitrate"] = option.video_bitrate;
+    val["video_scale"] = option.video_scale;
 }
 
 }//namespace
@@ -222,6 +249,43 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         option.enable = enable_value;
     }
 
+    // 显式宽高：0 = 跟随源。与 scale 同时给时显式值优先（绝对尺寸更明确）
+    // Explicit width/height, 0 = follow source. Wins over scale when both are given.
+    bool size_given = false;
+    {
+        int w = option.video_width, h = option.video_height;
+        auto rw = parseNonNegative(args, "width", &w);
+        auto rh = parseNonNegative(args, "height", &h);
+        if (rw < 0 || rh < 0) {
+            return makeError(kApiInvalidArgs, "invalid width/height, must be a non-negative integer");
+        }
+        // 只给一个会得到「宽变了高没变」的怪尺寸，直接拒绝
+        if ((rw == 1) != (rh == 1)) {
+            return makeError(kApiInvalidArgs, "width and height must be given together");
+        }
+        if (rw == 1 && w > 0 && h > 0 && (w % 2 || h % 2)) {
+            return makeError(kApiInvalidArgs, "width/height must be even (YUV420)");
+        }
+        size_given = (rw == 1);
+        option.video_width = w;
+        option.video_height = h;
+    }
+
+    // 分辨率倍数：0 表示取消缩放（回到跟随源），0.1~4.0 有效
+    bool scale_given = false;
+    {
+        float v = option.video_scale;
+        auto ret = parseNonNegativeFloat(args, "scale", &v);
+        if (ret < 0 || v > 4.0f) {
+            return makeError(kApiInvalidArgs, "invalid scale, must be 0 or 0.1~4.0");
+        }
+        if (ret == 1 && v > 0 && v < 0.1f) {
+            return makeError(kApiInvalidArgs, "invalid scale, must be 0 or 0.1~4.0");
+        }
+        scale_given = (ret == 1);
+        option.video_scale = v;
+    }
+
     bool on_demand_given = false;
     {
         bool v = option.on_demand;
@@ -239,9 +303,10 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
     }
 
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
-    if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given) {
+    if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
+        && !scale_given && !size_given) {
         return makeError(kApiInvalidArgs,
-                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable");
+                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width");
     }
     // 没显式 enable=0，但全局段/规则/本次请求都凑不出目标 codec：
     // 这条覆盖永远转不了任何东西，报错比留一条空覆盖好排查

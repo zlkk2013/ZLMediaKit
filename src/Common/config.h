@@ -675,6 +675,7 @@ extern const std::string kTranscodeVideoWidth;
 extern const std::string kTranscodeVideoHeight;
 extern const std::string kTranscodeVideoFps;
 extern const std::string kTranscodeVideoBitrate;
+extern const std::string kTranscodeVideoScale;
 #endif//ENABLE_FFMPEG
 } // namespace mediakit
 

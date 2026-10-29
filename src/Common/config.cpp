@@ -444,6 +444,7 @@ const string kTranscodeVideoWidth = TRANSCODE_FIELD "video_width";
 const string kTranscodeVideoHeight = TRANSCODE_FIELD "video_height";
 const string kTranscodeVideoFps = TRANSCODE_FIELD "video_fps";
 const string kTranscodeVideoBitrate = TRANSCODE_FIELD "video_bitrate";
+const string kTranscodeVideoScale = TRANSCODE_FIELD "video_scale";
 
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷

@@ -283,6 +283,30 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         VideoTargetParams video_params;
         video_params.width = _option.video_width;
         video_params.height = _option.video_height;
+        // 分辨率倍数：只有在没给绝对宽高时才生效（显式尺寸比倍数更明确）。
+        // YUV420 要求偶数宽高，这里统一向上取偶；源尺寸未知（还没解析到 SPS）时
+        // 退回跟随源，等首帧到了再由编码器自己定尺寸。
+        //
+        // Resolution multiplier, only when no explicit width/height was given.
+        // YUV420 needs even dimensions, so round up to even. If the source size is
+        // still unknown (SPS not parsed yet), fall back to following the source.
+        if (!is_audio && _option.video_scale > 0 && video_params.width <= 0 && video_params.height <= 0) {
+            auto v = static_pointer_cast<VideoTrack>(track);
+            int sw = v ? v->getVideoWidth() : 0;
+            int sh = v ? v->getVideoHeight() : 0;
+            if (sw > 0 && sh > 0) {
+                auto even = [](double v) {
+                    int r = (int) (v / 2.0 + 0.5) * 2;
+                    return r < 2 ? 2 : r;
+                };
+                video_params.width = even(sw * (double) _option.video_scale);
+                video_params.height = even(sh * (double) _option.video_scale);
+                InfoL << "transcode scale=" << _option.video_scale << ", " << sw << "x" << sh
+                      << " -> " << video_params.width << "x" << video_params.height;
+            } else {
+                WarnL << "transcode scale ignored: source size unknown (" << sw << "x" << sh << ")";
+            }
+        }
         video_params.fps = _option.video_fps;
         // video_bitrate 优先于通用的 bitrate：同一个进程里音频想保持 64k、
         // 视频想给 1M 是常见需求，共用一个字段做不到。
