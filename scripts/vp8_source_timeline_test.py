@@ -95,9 +95,19 @@ def prepare_config():
         if head == "[transcode]":
             blk = re.sub(r"(?m)^(video_codec|audio_codec)=.*$", r"\1=", blk)
             blk = re.sub(r"(?m)^enable=.*$", "enable=0", blk)
+        if head in ("[rtsp]", "[rtmp]", "[http]"):
+            # 端口必须按本脚本的常量重写：原来假设 BASE_CFG 里已经是 63900/63554/64080，
+            # 换成主干基线（56900/56554/57080）后服务起在别的端口，脚本却去敲 64080，
+            # 于是永远 "MediaServer did not come up"（实测踩过，白等 40 秒）。
+            want = {"[rtsp]": RTSP, "[rtmp]": RTMP, "[http]": HTTP}[head]
+            if re.search(r"(?m)^port=", blk):
+                blk = re.sub(r"(?m)^port=.*$", f"port={want}", blk, count=1)
+            else:
+                blk = blk.rstrip("\n") + f"\nport={want}\n"
         if head == "[rtsp]":
             # 转码输出要能被观众拿到：directProxy=1 时 RTSP 源的 RTP 直接透传
             blk = re.sub(r"(?m)^directProxy=.*$", "directProxy=0", blk)
+            blk = re.sub(r"(?m)^on_demand=.*$", "on_demand=0", blk)
         if head == "[general]" or head == "":
             blk = re.sub(r"(?m)^enable_hls=.*$", "enable_hls=0", blk)
             blk = re.sub(r"(?m)^enable_ts=.*$", "enable_ts=0", blk)
