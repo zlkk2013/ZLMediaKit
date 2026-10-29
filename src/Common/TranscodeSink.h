@@ -73,6 +73,15 @@ struct TranscodeOption {
      * Logo watermark image (png/jpg); empty disables it. Negative x/y mean distance
      * from the right/bottom edge; 0 width keeps the original size.
      */
+    /**
+     * 负载自适应降帧：编码跟不上时主动降帧（避免卡顿），有余量时自动恢复。
+     * adapt_min_fps 是下限，默认 5。
+     * adapt_selftest_delay_ms 仅用于自测（人为放大测得耗时以复现过载），生产必须 0。
+     */
+    bool adapt_fps = false;
+    float adapt_min_fps = 5;
+    int adapt_selftest_delay_ms = 0;
+
     std::string video_logo;
     int video_logo_x = 10;
     int video_logo_y = 10;

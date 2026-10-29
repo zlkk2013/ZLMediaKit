@@ -15,6 +15,7 @@
 #include "Transcode/TranscodeFilter.h"
 #include "Util/util.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 using namespace std;
@@ -554,15 +555,20 @@ int FFmpegEncoder::estimateBitrate(int width, int height, int fps) const {
  * did not send). Integer accumulation avoids float drift: the n-th source frame
  * sits at n*out/src on the target timeline, and is emitted when that integer steps.
  */
-bool FFmpegEncoder::shouldKeepFrame() {
-    if (_src_fps <= 0.5f || _video_fps <= 0.5f || _video_fps >= _src_fps - 0.01f) {
+bool FFmpegEncoder::shouldKeepFrame(const AVFrame *frame) {
+    // 目标帧率：配置的目标与「过载降帧后的帧率」取小者
+    float target = _video_fps;
+    if (_adapt_fps && _adapt_fps_now > 0.5f && (_video_fps <= 0.5f || _adapt_fps_now < _video_fps)) {
+        target = _adapt_fps_now;
+    }
+    if (_src_fps <= 0.5f || target <= 0.5f || target >= _src_fps - 0.01f) {
         // 不降帧：不计数，避免计数器无意义增长
         // No decimation: skip the counters entirely
         return true;
     }
     // 目标帧率按整数比处理（如 30→15 是 1/2，30→12 是 2/5）
     // Treat the rates as an integer ratio (30->15 is 1/2, 30->12 is 2/5)
-    int64_t out = (int64_t) lroundf(_video_fps * 100.0f);
+    int64_t out = (int64_t) lroundf(target * 100.0f);
     int64_t src = (int64_t) lroundf(_src_fps * 100.0f);
     if (out <= 0 || src <= 0) {
         return true;
@@ -571,11 +577,19 @@ bool FFmpegEncoder::shouldKeepFrame() {
     // 第 n 帧（从 0 计）应落在 floor(n*out/src)；位置前进就保留
     // Frame n (0-based) lands on floor(n*out/src); keep it when that advances
     int64_t should_have = (_drop_index - 1) * out / src;
-    if (should_have >= _keep_index) {
+    bool keep = should_have >= _keep_index;
+    if (keep) {
         _keep_index = should_have + 1;
+    }
+    // 关键帧无条件保留，否则下游拿不到 GOP 起点，观众端就是「花屏/黑块」。
+    // 过载降帧时这一条尤其重要：降得越狠，越容易正好抽到 I 帧。
+    // Keyframes are always kept: dropping one leaves downstream without a GOP start,
+    // which shows up as corruption/black blocks on the viewer side. This matters most
+    // exactly when we drop aggressively.
+    if (frame && frame->pict_type == AV_PICTURE_TYPE_I) {
         return true;
     }
-    return false;
+    return keep;
 }
 
 /**
@@ -664,12 +678,102 @@ void FFmpegEncoder::updateSrcFpsEstimate(int64_t src_ms) {
     _src_fps = fps;
 }
 
+/**
+ * 负载自适应降帧的控制律。
+ *
+ * 判据是「单帧编码耗时 / 当前帧间隔」的比值 load：
+ *   - load > 0.85 且连续 15 帧 → 认为跟不上，帧率乘 0.8（下限 _adapt_min_fps）
+ *   - load < 0.55 且连续 60 帧 → 认为有余量，帧率乘 1.25（上限基准帧率）
+ *   - 中间区抖动不做动作，避免来回抖
+ *
+ * 为什么不用 CPU 占用率：多核机器上 30% 占用也可能已经喂不饱这条流，而别的进程
+ * 抢占 CPU 又会让我们误判。直接量「这一帧编了多久」才是可归因的指标。
+ *
+ * Control law: ratio of per-frame encode cost to the current frame interval. Rising
+ * load drops the rate by 20% (floored at min_fps), falling load restores by 25%.
+ * CPU usage is deliberately not used: on multi-core boxes it neither reflects whether
+ * this stream keeps up nor is attributable when another process steals CPU.
+ */
+/** 自测钩子：从环境变量读「人为放大的编码耗时」，生产环境不会设置。
+ *  用环境变量而不是配置项/API 参数，是为了不把「会让转码变慢」的开关暴露给运维。 */
+static int adaptSelftestDelayFromEnv() {
+    static int value = []() {
+        const char *env = ::getenv("ZLM_ADAPT_SELFTEST_DELAY_MS");
+        int v = env ? ::atoi(env) : 0;
+        if (v < 0) {
+            v = 0;
+        }
+        return v;
+    }();
+    return value;
+}
+
+void FFmpegEncoder::updateAdaptiveFps(double cost_ms) {
+    float base = _video_params.fps > 0.5f ? _video_params.fps
+                 : (_src_fps > 0.5f ? _src_fps : _video_fps);
+    if (base <= 0.5f) {
+        return;
+    }
+    if (_adapt_fps_now <= 0.5f) {
+        _adapt_fps_now = base;
+    }
+    // 自测延迟优先取环境变量（生产不设置即 0），配置项保留给离线调试
+    int selftest = adaptSelftestDelayFromEnv();
+    cost_ms += selftest > 0 ? selftest : _adapt_selftest_delay_ms;
+    _enc_cost_ewma_ms = _enc_cost_ewma_ms > 0 ? _enc_cost_ewma_ms * 0.9 + cost_ms * 0.1 : cost_ms;
+    double interval = 1000.0 / _adapt_fps_now;
+    double load = _enc_cost_ewma_ms / interval;
+
+    if (load > 0.85) {
+        _idle_frames = 0;
+        if (++_overload_frames >= 15) {
+            _overload_frames = 0;
+            float next = _adapt_fps_now * 0.8f;
+            if (next < _adapt_min_fps) {
+                next = _adapt_min_fps;
+            }
+            if (next < _adapt_fps_now - 0.01f) {
+                InfoL << "adapt: 编码跟不上(load=" << load << "), 降帧 "
+                      << _adapt_fps_now << " -> " << next << " fps, 累计丢 " << _adapt_dropped;
+                _adapt_fps_now = next;
+            }
+        }
+    } else if (load < 0.55) {
+        _overload_frames = 0;
+        if (++_idle_frames >= 60) {
+            _idle_frames = 0;
+            float next = _adapt_fps_now * 1.25f;
+            if (next > base) {
+                next = base;
+            }
+            if (next > _adapt_fps_now + 0.01f) {
+                InfoL << "adapt: 有余量(load=" << load << "), 恢复帧率 "
+                      << _adapt_fps_now << " -> " << next;
+                _adapt_fps_now = next;
+            }
+        }
+    } else {
+        _overload_frames = 0;
+        _idle_frames = 0;
+    }
+}
+
 double FFmpegEncoder::videoStepMs() const {
-    // 显式配置的输出帧率优先：此时按目标帧率匀速输出，源多了由 shouldKeepFrame 抽掉
-    // An explicitly configured output rate wins: output at that rate and let
-    // shouldKeepFrame decimate the surplus.
-    if (_video_params.fps > 0.5f) {
-        return 1000.0 / _video_params.fps;
+    // 基准帧率：显式配置的输出帧率优先，其次实测源帧率
+    // Base rate: an explicitly configured output rate wins, then the measured source rate
+    float base = _video_params.fps > 0.5f ? _video_params.fps
+                 : (_src_fps > 0.5f ? _src_fps : _video_fps);
+    // 过载降帧时，时间轴步进必须跟着降帧后的帧率走。
+    // 否则「每秒少编了帧、每帧还按原间隔推进」= 慢放：实测 15fps 降到 7.5fps 后
+    // 5 秒拉流只推进 2.5 秒内容，音画直接错位。
+    // When adaptive dropping lowers the frame rate, the timeline step must follow it.
+    // Otherwise fewer frames per second each still advance the old interval => slow
+    // motion (15 -> 7.5fps turned 5s of pull into 2.5s of content, desyncing audio).
+    if (_adapt_fps && _adapt_fps_now > 0.5f && _adapt_fps_now < base) {
+        base = _adapt_fps_now;
+    }
+    if (base > 0.5f) {
+        return 1000.0 / base;
     }
     // 实测的源帧率优先于轨上声明的帧率：裸帧 codec 只有前者是真的
     // The measured source rate wins over the declared one: for raw-packet codecs
@@ -1227,7 +1331,21 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
         // Decimation: when the target fps is below the source, skip frames by
         // "source index * target/source". A wall-clock accumulator would burst-skip
         // or burst-keep when the source jitters; this integer scheme is deterministic.
-        if (!shouldKeepFrame()) {
+        // 编码耗时用于负载判定：把 encodeFrame 包一层计时，两处出口共用
+        auto encode_and_measure = [this](AVFrame *f) -> bool {
+            auto t0 = std::chrono::steady_clock::now();
+            bool ok = encodeFrame(f);
+            if (_adapt_fps) {
+                double cost = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                updateAdaptiveFps(cost);
+            }
+            return ok;
+        };
+        if (!shouldKeepFrame(frame->get())) {
+            if (_adapt_fps) {
+                ++_adapt_dropped;
+            }
             return true;
         }
         auto converted = formatFrame(frame);
@@ -1309,13 +1427,13 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
                     return true;
                 } else {
                     filtered->pts = av_frame->pts;
-                    bool ok = encodeFrame(filtered);
+                    bool ok = encode_and_measure(filtered);
                     av_frame_free(&filtered);
                     return ok;
                 }
             }
         }
-        return encodeFrame(av_frame);
+        return encode_and_measure(av_frame);
     }
 
     // ---- 音频路径 ----

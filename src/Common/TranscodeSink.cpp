@@ -321,6 +321,12 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
             ctx.encoder->setVideoFilter(_option.video_filter);
             InfoL << "transcode video filter: " << _option.video_filter;
         }
+        if (!is_audio && _option.adapt_fps) {
+            ctx.encoder->setAdaptiveFps(true, _option.adapt_min_fps, _option.adapt_selftest_delay_ms);
+            InfoL << "transcode adaptive fps: min=" << _option.adapt_min_fps
+                  << ( _option.adapt_selftest_delay_ms ? " (selftest delay "
+                        + std::to_string(_option.adapt_selftest_delay_ms) + "ms)" : "");
+        }
         if (!is_audio && !_option.video_logo.empty()) {
             ctx.encoder->setVideoLogo(_option.video_logo, _option.video_logo_x,
                                       _option.video_logo_y, _option.video_logo_width);

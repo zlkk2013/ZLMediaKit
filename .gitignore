@@ -73,3 +73,4 @@ config.av1stab.ini
 logs/
 config.scale.ini
 config.filter.ini
+config.adapt.ini

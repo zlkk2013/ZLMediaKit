@@ -144,6 +144,8 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_logo_x"] = option.video_logo_x;
     val["video_logo_y"] = option.video_logo_y;
     val["video_logo_width"] = option.video_logo_width;
+    val["adapt_fps"] = option.adapt_fps;
+    val["adapt_min_fps"] = option.adapt_min_fps;
 }
 
 }//namespace
@@ -254,6 +256,29 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         option.enable = enable_value;
     }
 
+    // 负载自适应降帧：adapt_fps=1/0 开关，adapt_min_fps 下限
+    bool adapt_given = false;
+    {
+        bool v = option.adapt_fps;
+        auto ret = parseBoolArg(args, "adapt_fps", &v);
+        if (ret < 0) {
+            return makeError(kApiInvalidArgs, "invalid adapt_fps, must be 0/1/true/false");
+        }
+        if (ret == 1) {
+            option.adapt_fps = v;
+            adapt_given = true;
+        }
+        float mf = option.adapt_min_fps;
+        auto mret = parseNonNegativeFloat(args, "adapt_min_fps", &mf);
+        if (mret < 0 || (mret == 1 && mf < 1.0f)) {
+            return makeError(kApiInvalidArgs, "invalid adapt_min_fps, must be >= 1");
+        }
+        if (mret == 1) {
+            option.adapt_min_fps = mf;
+            adapt_given = true;
+        }
+    }
+
     // logo 角标：路径 + 位置 + 宽度。空路径 = 关闭。
     bool logo_given = false;
     {
@@ -357,9 +382,9 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
 
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
     if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
-        && !scale_given && !size_given && !filter_given && !logo_given) {
+        && !scale_given && !size_given && !filter_given && !logo_given && !adapt_given) {
         return makeError(kApiInvalidArgs,
-                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo");
+                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo/adapt_fps");
     }
     // 没显式 enable=0，但全局段/规则/本次请求都凑不出目标 codec：
     // 这条覆盖永远转不了任何东西，报错比留一条空覆盖好排查

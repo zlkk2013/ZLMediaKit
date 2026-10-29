@@ -221,6 +221,30 @@ public:
      * Logo watermark, also before the first frame. Negative x/y means distance from
      * the right/bottom edge.
      */
+    /**
+     * 负载自适应降帧（过载时主动降帧率，避免编码跟不上导致卡顿/丢帧）。
+     *
+     * 判据用「单帧编码耗时 / 帧间隔」的负载比，不是 CPU 占用：
+     * 后者受其它进程影响，且多核机器上占用率与「这条流来不来得及」不是一回事。
+     * 降帧靠抽帧实现（编码前丢弃，解码端不会花屏），且**永不放掉关键帧**。
+     *
+     * @param enable 是否启用
+     * @param min_fps 降帧下限，0 表示用 5
+     * @param selftest_delay_ms 仅用于自测：给测得的编码耗时人为加上这么多毫秒，
+     *                          用来在快机器上确定性地复现「过载」。生产必须为 0。
+     *
+     * Load-adaptive frame dropping. The metric is encode cost / frame interval, not CPU
+     * usage (which other processes distort). Dropping happens BEFORE encoding so the
+     * decoder never sees a broken reference chain, and keyframes are never dropped.
+     * selftest_delay_ms is a test hook to deterministically simulate overload; must be 0
+     * in production.
+     */
+    void setAdaptiveFps(bool enable, float min_fps = 5, int selftest_delay_ms = 0) {
+        _adapt_fps = enable;
+        _adapt_min_fps = min_fps > 0.5f ? min_fps : 5.0f;
+        _adapt_selftest_delay_ms = selftest_delay_ms;
+    }
+
     void setVideoLogo(const std::string &path, int x, int y, int width) {
         _logo_path = path;
         _logo_x = x;
@@ -308,7 +332,7 @@ private:
     int estimateBitrate(int width, int height, int fps) const;
 
     /** 按目标帧率决定这一源帧是否需要编码（降帧），返回 false 表示丢弃 */
-    bool shouldKeepFrame();
+    bool shouldKeepFrame(const AVFrame *frame);
 
     /** 把 FFmpegFrame 转成编码器要求的像素格式/采样格式 */
     FFmpegFrame::Ptr formatFrame(const FFmpegFrame::Ptr &frame);
@@ -339,6 +363,8 @@ private:
      * Priority: configured output rate > measured/declared source rate > 40ms.
      */
     double videoStepMs() const;
+    /** 负载自适应降帧的控制律，见 .cpp 里的说明 */
+    void updateAdaptiveFps(double cost_ms);
 
     /**
      * 取下一个视频时间戳（毫秒）并推进时钟
@@ -443,6 +469,19 @@ private:
     /** 视频滤镜描述串与图对象（懒建：等编码器 open2 确定尺寸后再建图） */
     std::string _filter_desc;
     std::shared_ptr<TranscodeFilter> _filter;
+    // ---- 负载自适应降帧 ----
+    bool _adapt_fps = false;
+    float _adapt_min_fps = 5;
+    /** 当前生效的帧率上限，0 表示未初始化（跟随源/目标） */
+    float _adapt_fps_now = 0;
+    /** 编码耗时的指数滑动平均（毫秒） */
+    double _enc_cost_ewma_ms = 0;
+    int _overload_frames = 0;
+    int _idle_frames = 0;
+    int _adapt_selftest_delay_ms = 0;
+    int64_t _adapt_dropped = 0;
+    int64_t _adapt_last_log_ms = 0;
+
     std::string _logo_path;
     int _logo_x = 10;
     int _logo_y = 10;

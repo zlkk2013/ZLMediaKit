@@ -450,6 +450,9 @@ const string kTranscodeVideoLogo = TRANSCODE_FIELD "video_logo";
 const string kTranscodeVideoLogoX = TRANSCODE_FIELD "video_logo_x";
 const string kTranscodeVideoLogoY = TRANSCODE_FIELD "video_logo_y";
 const string kTranscodeVideoLogoWidth = TRANSCODE_FIELD "video_logo_width";
+const string kTranscodeAdaptFps = TRANSCODE_FIELD "adapt_fps";
+const string kTranscodeAdaptMinFps = TRANSCODE_FIELD "adapt_min_fps";
+const string kTranscodeAdaptSelftestDelay = TRANSCODE_FIELD "adapt_selftest_delay_ms";
 
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷

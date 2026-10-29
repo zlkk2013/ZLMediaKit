@@ -225,6 +225,10 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_logo_x = parseSignedInt(ini[kTranscodeVideoLogoX].as<string>(), 10);
     option.video_logo_y = parseSignedInt(ini[kTranscodeVideoLogoY].as<string>(), 10);
     option.video_logo_width = parseInt(ini[kTranscodeVideoLogoWidth].as<string>(), 0);
+    // 负载自适应降帧：默认关闭，保持与未引入该特性时行为一致（基线回归靠这个）
+    option.adapt_fps = parseBool(ini[kTranscodeAdaptFps].as<string>(), false);
+    option.adapt_min_fps = parseFloat(ini[kTranscodeAdaptMinFps].as<string>(), 5);
+    option.adapt_selftest_delay_ms = parseInt(ini[kTranscodeAdaptSelftestDelay].as<string>(), 0);
     // 静音兜底的两项：P6 引入，重构到本文件时曾漏读，导致配置文件里改它们不生效
     // Silence fallback settings (from P6). The refactor into this file once dropped
     // these, so editing them in the ini had no effect at all.
