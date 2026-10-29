@@ -446,6 +446,10 @@ const string kTranscodeVideoFps = TRANSCODE_FIELD "video_fps";
 const string kTranscodeVideoBitrate = TRANSCODE_FIELD "video_bitrate";
 const string kTranscodeVideoScale = TRANSCODE_FIELD "video_scale";
 const string kTranscodeVideoFilter = TRANSCODE_FIELD "video_filter";
+const string kTranscodeVideoLogo = TRANSCODE_FIELD "video_logo";
+const string kTranscodeVideoLogoX = TRANSCODE_FIELD "video_logo_x";
+const string kTranscodeVideoLogoY = TRANSCODE_FIELD "video_logo_y";
+const string kTranscodeVideoLogoWidth = TRANSCODE_FIELD "video_logo_width";
 
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷

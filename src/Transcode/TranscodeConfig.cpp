@@ -101,6 +101,21 @@ static int parseInt(const string &value, int fallback) {
     return (int) ret;
 }
 
+/** 允许负数（logo 的 x/y 用负值表示「距右/下边缘」） */
+static int parseSignedInt(const string &value, int fallback) {
+    auto str = trim(string(value));
+    if (str.empty()) {
+        return fallback;
+    }
+    char *end = nullptr;
+    long ret = ::strtol(str.data(), &end, 10);
+    if (end == str.data() || *end != '\0') {
+        WarnL << "invalid transcode number: '" << value << "', keep " << fallback;
+        return fallback;
+    }
+    return (int) ret;
+}
+
 static float parseFloat(const string &value, float fallback) {
     auto str = trim(string(value));
     if (str.empty()) {
@@ -205,6 +220,11 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_scale = parseFloat(ini[kTranscodeVideoScale].as<string>(), 0);
     // 滤镜串：原样保留（libavfilter 自己会校验语法），只有空串表示不启用
     option.video_filter = trim(ini[kTranscodeVideoFilter].as<string>());
+    // logo 角标：路径可为空（不叠加）；x/y 允许负数（距右/下边缘）
+    option.video_logo = trim(ini[kTranscodeVideoLogo].as<string>());
+    option.video_logo_x = parseSignedInt(ini[kTranscodeVideoLogoX].as<string>(), 10);
+    option.video_logo_y = parseSignedInt(ini[kTranscodeVideoLogoY].as<string>(), 10);
+    option.video_logo_width = parseInt(ini[kTranscodeVideoLogoWidth].as<string>(), 0);
     // 静音兜底的两项：P6 引入，重构到本文件时曾漏读，导致配置文件里改它们不生效
     // Silence fallback settings (from P6). The refactor into this file once dropped
     // these, so editing them in the ini had no effect at all.

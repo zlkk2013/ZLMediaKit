@@ -217,6 +217,18 @@ public:
     void setVideoFilter(const std::string &desc) { _filter_desc = desc; }
 
     /**
+     * 设置 logo 角标（同样必须在喂第一帧前）。x/y 为负表示距右/下边缘的距离。
+     * Logo watermark, also before the first frame. Negative x/y means distance from
+     * the right/bottom edge.
+     */
+    void setVideoLogo(const std::string &path, int x, int y, int width) {
+        _logo_path = path;
+        _logo_x = x;
+        _logo_y = y;
+        _logo_width = width;
+    }
+
+    /**
      * 预热：编码一帧纯色画面并把得到的 config NAL（H265 的 VPS/SPS/PPS、
      * H264 的 SPS/PPS）喂给目标轨，使其 ready() 变 true。
      * 必要性：RtspMuxer/MP4Muxer 的 addTrack 直接丢弃 ready()==false 的轨
@@ -431,6 +443,10 @@ private:
     /** 视频滤镜描述串与图对象（懒建：等编码器 open2 确定尺寸后再建图） */
     std::string _filter_desc;
     std::shared_ptr<TranscodeFilter> _filter;
+    std::string _logo_path;
+    int _logo_x = 10;
+    int _logo_y = 10;
+    int _logo_width = 0;
     /** 建图失败过就不再重试（避免每帧都打一条错误日志刷爆） */
     bool _filter_failed = false;
     bool _flush_done = false;

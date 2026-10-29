@@ -231,3 +231,46 @@ video_filter=drawtext=text='CAM-01':x=40:y=40:fontsize=64:fontcolor=white:box=1:
 
 坑：`signalstats,metadata=print` 会把每帧统计打到 stdout，错误统计必须排除
 `lavfi.signalstats.*` 与 `frame:` 开头的行为，否则会凭空多出 1300+ 条「硬错误」。
+
+## logo 角标（overlay 双输入，2026-10-29 增）
+
+### 配置与 API
+
+```ini
+[transcode]
+video_logo=/var/lib/zlm/logo.png   ; png/jpg，空=不叠加
+video_logo_x=-20                   ; 负数表示距右边缘 20
+video_logo_y=20                    ; 负数表示距下边缘
+video_logo_width=240               ; 0=用原图宽度；高度按比例，且不超过画面 1/3
+```
+
+API 同名参数：`logo=`、`logo_x=`、`logo_y=`、`logo_width=`（`logo_x/y` 允许负数）。
+
+可以与 `video_filter`（如 drawtext）**同时使用**：图里先跑滤镜链，再叠 logo。
+
+### 三个实现坑（都实测踩过）
+
+1. **建图后不能立刻给 logo 输入发 EOF 并指望 `eof_action=repeat`**：
+   实测那样 overlay 在第一帧主画面到达前就结束，输出与输入完全一致 —— 看起来像「logo 没生效」。
+   正确做法是**每个主帧喂一次 logo 帧**（`av_frame_clone` + 设成同一个 pts）。
+2. **只有 logo、没有滤镜串是合法配置**：`init()` 里如果先把「空滤镜串」当非法返回，
+   纯角标场景会被静默关掉，日志是 `filter init failed, disabled: ` 后面跟个空串，非常费解。
+   判断顺序必须是「有 logo → 建 logo 图」在前。
+3. **坐标表达式别把 W/H 和 w/h 弄反**：`x=w-W-20` 是错的（叠加到画面外），
+   正确是 `x=W-w-20`（W/H=主画面，w/h=logo）。
+
+### 依赖
+
+logo 解码走 libavformat 的 demuxer（png/jpg），所以 **CMakeLists 里要额外链接 libavformat**；
+仅 avcodec 能编译，但链接期 `Undefined symbols: _avformat_open_input`。
+
+### 验收
+
+`scripts/filter_test.py` 扩展到 19 项，logo 部分：
+- 右上角（`logo_x=-20,logo_y=20`）区域 YAVG 157.1 → 184.4
+- 贴底边（`logo_y=-120`）区域亮度明显变化
+- 尺寸不变、0 硬错误、日志出现 `transcode logo ready`
+- logo 文件缺失时降级为不叠加，流照常
+
+判据用**区域**亮度而不是全画面：logo 只覆盖一角，全画面均值会被稀释。
+量测区域必须落在 logo 实际覆盖范围（`y=-120`、高 80 ⇒ y=520..600，量 590 之后就是空的）。

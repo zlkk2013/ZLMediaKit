@@ -272,6 +272,18 @@ if(ENABLE_FFMPEG)
     endif()
   endif()
 
+  # 查找 ffmpeg/libavformat 是否安装
+  # 转码的 logo 角标要解码 png/jpg 图片，需要 demuxer（avformat），仅 avcodec 不够。
+  # find ffmpeg/libavformat installed (needed to decode logo images: png/jpg go
+  # through libavformat's demuxer, avcodec alone is not enough).
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(AVFORMAT QUIET IMPORTED_TARGET libavformat)
+    if(AVFORMAT_FOUND)
+      update_cached_list(MK_LINK_LIBRARIES PkgConfig::AVFORMAT)
+      message(STATUS "found library: ${AVFORMAT_LIBRARIES}")
+    endif()
+  endif()
+
   # 查找 ffmpeg/libswscale 是否安装
   # find ffmpeg/libswscale installed
   if(PKG_CONFIG_FOUND)

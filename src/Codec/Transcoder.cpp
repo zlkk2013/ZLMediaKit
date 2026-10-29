@@ -1281,9 +1281,12 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
         // source resolution and then downscaling would blur it, so text size must be
         // relative to the OUTPUT resolution. On filter errors we disable the filter and
         // keep passing frames through — losing OSD is better than losing the stream.
-        if (!_filter_desc.empty()) {
+        if (!_filter_desc.empty() || !_logo_path.empty()) {
             if (!_filter && !_filter_failed) {
                 _filter = std::make_shared<TranscodeFilter>();
+                if (!_logo_path.empty()) {
+                    _filter->setLogo(_logo_path, _logo_x, _logo_y, _logo_width);
+                }
                 _filter_failed = true;   // 先置位：init 失败不再重试同一张图
                 if (_filter->init(_filter_desc, _context->width, _context->height,
                                   _context->pix_fmt, _context->time_base.num,

@@ -67,6 +67,16 @@ struct TranscodeOption {
      * are not supported yet.
      */
     std::string video_filter;
+    /**
+     * logo 角标：图片路径（png/jpg）。空串表示不叠加。
+     * x/y 为叠加位置，负数表示距右边缘/下边缘的距离；video_logo_width=0 用原始宽度。
+     * Logo watermark image (png/jpg); empty disables it. Negative x/y mean distance
+     * from the right/bottom edge; 0 width keeps the original size.
+     */
+    std::string video_logo;
+    int video_logo_x = 10;
+    int video_logo_y = 10;
+    int video_logo_width = 0;
     /** 是否按需转码：无人观看时跳过，省 CPU */
     bool on_demand = true;
     /** 转码轨静音兜底：源端断流后继续按目标 codec 补静音帧，观众端不断流 */

@@ -321,6 +321,12 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
             ctx.encoder->setVideoFilter(_option.video_filter);
             InfoL << "transcode video filter: " << _option.video_filter;
         }
+        if (!is_audio && !_option.video_logo.empty()) {
+            ctx.encoder->setVideoLogo(_option.video_logo, _option.video_logo_x,
+                                      _option.video_logo_y, _option.video_logo_width);
+            InfoL << "transcode video logo: " << _option.video_logo << " at "
+                  << _option.video_logo_x << "," << _option.video_logo_y;
+        }
         if (!is_audio) {
             // 关键：转码轨必须在 addTrack 之前 ready。
             // RtspMuxer/MP4Muxer 的 addTrack 见到 ready()==false 的轨会直接丢弃

@@ -140,6 +140,10 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_bitrate"] = option.video_bitrate;
     val["video_scale"] = option.video_scale;
     val["video_filter"] = option.video_filter;
+    val["video_logo"] = option.video_logo;
+    val["video_logo_x"] = option.video_logo_x;
+    val["video_logo_y"] = option.video_logo_y;
+    val["video_logo_width"] = option.video_logo_width;
 }
 
 }//namespace
@@ -250,6 +254,42 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         option.enable = enable_value;
     }
 
+    // logo 角标：路径 + 位置 + 宽度。空路径 = 关闭。
+    bool logo_given = false;
+    {
+        auto raw = trim(argValue(args, "logo"));
+        if (!raw.empty()) {
+            option.video_logo = raw;
+            logo_given = true;
+        }
+        // x/y 允许负数（距右/下边缘）；这里用带符号解析
+        for (auto pr : {std::make_pair("logo_x", &option.video_logo_x),
+                        std::make_pair("logo_y", &option.video_logo_y)}) {
+            auto val = trim(argValue(args, pr.first));
+            if (val.empty()) {
+                continue;
+            }
+            char *end = nullptr;
+            long num = ::strtol(val.data(), &end, 10);
+            if (end == val.data() || *end != '\0') {
+                return makeError(kApiInvalidArgs,
+                                 std::string("invalid ") + pr.first + ", must be an integer");
+            }
+            *pr.second = (int) num;
+            logo_given = true;
+        }
+        auto w = trim(argValue(args, "logo_width"));
+        if (!w.empty()) {
+            char *end = nullptr;
+            long num = ::strtol(w.data(), &end, 10);
+            if (end == w.data() || *end != '\0' || num < 0) {
+                return makeError(kApiInvalidArgs, "invalid logo_width, must be a non-negative integer");
+            }
+            option.video_logo_width = (int) num;
+            logo_given = true;
+        }
+    }
+
     // 视频滤镜（单输入 libavfilter 描述串）。空串 = 关闭滤镜。
     // 不做语法校验：libavfilter 的报错比我们自己写的提示准确，且建图失败时
     // 编码器会打 Error 并停用滤镜，不影响出流。
@@ -317,9 +357,9 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
 
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
     if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
-        && !scale_given && !size_given && !filter_given) {
+        && !scale_given && !size_given && !filter_given && !logo_given) {
         return makeError(kApiInvalidArgs,
-                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter");
+                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo");
     }
     // 没显式 enable=0，但全局段/规则/本次请求都凑不出目标 codec：
     // 这条覆盖永远转不了任何东西，报错比留一条空覆盖好排查
