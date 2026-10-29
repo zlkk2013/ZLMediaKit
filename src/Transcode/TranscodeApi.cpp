@@ -144,6 +144,7 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_logo_x"] = option.video_logo_x;
     val["video_logo_y"] = option.video_logo_y;
     val["video_logo_width"] = option.video_logo_width;
+    val["hw_encode"] = option.hw_encode;
     val["adapt_fps"] = option.adapt_fps;
     val["adapt_min_fps"] = option.adapt_min_fps;
 }
@@ -254,6 +255,20 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
     bool enable_given = (enable_ret == 1);
     if (enable_given) {
         option.enable = enable_value;
+    }
+
+    // 硬件编码：hw=1/0。拿不到硬件编码器时自动回落软件（不会失败）
+    bool hw_given = false;
+    {
+        bool v = option.hw_encode;
+        auto ret = parseBoolArg(args, "hw", &v);
+        if (ret < 0) {
+            return makeError(kApiInvalidArgs, "invalid hw, must be 0/1/true/false");
+        }
+        if (ret == 1) {
+            option.hw_encode = v;
+            hw_given = true;
+        }
     }
 
     // 负载自适应降帧：adapt_fps=1/0 开关，adapt_min_fps 下限
@@ -382,9 +397,10 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
 
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
     if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
-        && !scale_given && !size_given && !filter_given && !logo_given && !adapt_given) {
+        && !scale_given && !size_given && !filter_given && !logo_given && !adapt_given
+        && !hw_given) {
         return makeError(kApiInvalidArgs,
-                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo/adapt_fps");
+                         "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo/adapt_fps/hw");
     }
     // 没显式 enable=0，但全局段/规则/本次请求都凑不出目标 codec：
     // 这条覆盖永远转不了任何东西，报错比留一条空覆盖好排查

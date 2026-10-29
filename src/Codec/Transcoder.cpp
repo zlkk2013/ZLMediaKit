@@ -335,8 +335,43 @@ int TranscodeAudioFifo::size() const {
 //////////////////////////////////////////////////////////////////////////////////////////
 // FFmpegEncoder
 
+/** 判断一个 AVCodec 是不是硬件编码器（用于回落与日志） */
+static bool isHardwareEncoder(const AVCodec *codec) {
+    if (!codec || !codec->name) {
+        return false;
+    }
+    static const char *kMarks[] = {"videotoolbox", "nvenc", "vaapi", "qsv", "amf", "v4l2m2m", "mediacodec"};
+    for (auto mark : kMarks) {
+        if (strstr(codec->name, mark)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * 该 codec 的平台首选硬件编码器名。
+ *
+ * macOS 用 VideoToolbox；Linux/Windows 首选 NVENC（无 N 卡时再由 findEncoder 回落到
+ * 软件编码）。不硬编没有对应实现的 codec（VP8/VP9/AV1 暂不列）—— 它们会拿到 nullptr
+ * 从而直接走软件路径。
+ *
+ * Preferred hardware encoder per platform. macOS uses VideoToolbox; Linux/Windows prefer
+ * NVENC. Codecs without a hardware implementation return nullptr and stay software.
+ */
+static const char *hwEncoderName(CodecId codec_id) {
+#if defined(__APPLE__)
+    if (codec_id == CodecH264) return "h264_videotoolbox";
+    if (codec_id == CodecH265) return "hevc_videotoolbox";
+#elif defined(_WIN32) || defined(__linux__)
+    if (codec_id == CodecH264) return "h264_nvenc";
+    if (codec_id == CodecH265) return "hevc_nvenc";
+#endif
+    return nullptr;
+}
+
 /** 按 track codec 选编码器，返回 nullptr 表示不支持 */
-static const AVCodec *findEncoder(CodecId codec_id) {
+static const AVCodec *findEncoder(CodecId codec_id, bool prefer_hw = false) {
     auto find = [](const char *name, AVCodecID id) -> const AVCodec * {
         if (name) {
             auto codec = avcodec_find_encoder_by_name(name);
@@ -353,6 +388,18 @@ static const AVCodec *findEncoder(CodecId codec_id) {
         }
         return codec;
     };
+
+    // 硬件优先：拿到就用，拿不到继续走下面的软件路径（不报错、不影响出流）
+    // Hardware first: if unavailable, fall through to software silently.
+    if (prefer_hw) {
+        if (auto hw_name = hwEncoderName(codec_id)) {
+            if (auto hw = avcodec_find_encoder_by_name(hw_name)) {
+                InfoL << "got hardware encoder:" << hw_name;
+                return hw;
+            }
+            WarnL << "hardware encoder unavailable, using software:" << hw_name;
+        }
+    }
 
     switch (codec_id) {
         case CodecH264: return find("libx264", AV_CODEC_ID_H264);
@@ -420,7 +467,8 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
     _src_fps_measure = track->getTrackType() == TrackVideo && src_video &&
                        (src_fps <= 0.5f || src_video->getCodecId() == CodecVP8 ||
                         src_video->getCodecId() == CodecVP9 || src_video->getCodecId() == CodecAV1);
-    _codec = findEncoder(_codec_id);
+    _codec = findEncoder(_codec_id,
+                         _video_params.hw_encode && track->getTrackType() == TrackVideo);
     if (!_codec) {
         throw std::runtime_error("未找到编码器: " + string(::mediakit::getCodecName(_codec_id)));
     }
@@ -465,11 +513,35 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
         _out_height = height;
         if (_video_params.bitrate > 0) {
             bitrate = _video_params.bitrate;
+        } else if (_video_params.hw_encode && bitrate <= 0) {
+            // 硬件编码器必须给明确码率：VideoToolbox/NVENC 在 bit_rate 未设时没有
+            // 可预期的默认质量（实测会按极低码率出画面）。软编则允许留空由编码器决定。
+            // Hardware encoders need an explicit bitrate: with bit_rate unset VideoToolbox /
+            // NVENC have no predictable default and produced a very low-quality picture.
+            long px = (long) width * height;
+            bitrate = px >= 1920L * 1080 ? 6000000 : px >= 1280L * 720 ? 4000000
+                      : px >= 640L * 480 ? 1500000 : 800000;
+            InfoL << "hw encoder without explicit bitrate, defaulting to " << bitrate << "bps";
         }
         auto ret = openVideoCodec(width, height, bitrate, _codec);
+        if (!ret && _video_params.hw_encode && isHardwareEncoder(_codec)) {
+            // 硬件编码器存在但打不开（驱动异常、并发会话数上限、分辨率超出硬件能力）
+            // 必须回落软件编码：宁可用 CPU 也不能让这条流起不来。
+            // The hardware encoder exists but refuses to open (driver issue, session limit,
+            // resolution beyond capability). Fall back to software: burning CPU is better
+            // than refusing to start the stream.
+            WarnL << "hardware encoder open failed, falling back to software: " << _codec->name;
+            if (auto soft = findEncoder(_codec_id, false)) {
+                _codec = soft;
+                ret = openVideoCodec(width, height, bitrate, _codec);
+            }
+        }
         if (!ret) {
             throw std::runtime_error(string("打开视频编码器失败: ") + _codec->name);
         }
+        InfoL << "transcode video encoder: " << _codec->name
+              << (isHardwareEncoder(_codec) ? " (hardware)" : " (software)")
+              << " " << width << "x" << height << " @" << bitrate << "bps";
     } else {
         auto audio = static_pointer_cast<AudioTrack>(track);
         auto sample_rate = audio->getAudioSampleRate();
@@ -1539,7 +1611,23 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
     // later avcodec_send_frame for real frames returns "End of file", killing the whole
     // transcode chain. Plain encoding already makes x265 emit its first packet with
     // VPS/SPS/PPS, which is all we need.
-    bool ok = encodeFrame(frame);
+    // 硬件编码器（VideoToolbox/NVENC）内部有帧缓冲，**第一帧不一定吐包**：
+    // 实测 hevc_videotoolbox 只喂 1 帧时一个包都不出，warmup 判定失败、目标轨永远
+    // unready，整条视频轨被 muxer 丢弃（症状是转码 CPU 几乎为 0、拉流 404）。
+    // 软编 x265/x264 通常首帧就出包，所以这里循环到拿到包为止。
+    // Hardware encoders buffer internally: feeding a single frame made
+    // hevc_videotoolbox emit nothing, so warmup failed and the target track stayed
+    // unready (muxers dropped it; symptom: ~0% CPU and a 404 on pull). Loop until a
+    // packet appears; software encoders emit on the first frame anyway.
+    bool ok = false;
+    static constexpr int kMaxWarmupFrames = 12;
+    for (int i = 0; i < kMaxWarmupFrames && config_frames.empty(); ++i) {
+        frame->pts = (int64_t) i * 33;
+        ok = encodeFrame(frame);
+        if (!ok) {
+            break;
+        }
+    }
     _cb = old_cb;
     av_frame_free(&frame);
 

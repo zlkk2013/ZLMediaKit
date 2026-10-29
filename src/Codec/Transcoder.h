@@ -87,6 +87,15 @@ struct VideoTargetParams {
     float fps = 0;
     /** 输出码率(bps)；0=按分辨率/帧率自动估算 */
     int bitrate = 0;
+    /**
+     * 优先使用硬件编码器（VideoToolbox / NVENC / VAAPI / QSV）。
+     * 拿不到硬件编码器、或硬件编码器打开失败时**自动回落软件编码**，
+     * 永远不让一条流因为硬件不可用而失败。
+     *
+     * Prefer a hardware encoder; fall back to software when it is unavailable or fails
+     * to open, so a stream never dies just because the GPU path is missing.
+     */
+    bool hw_encode = false;
 };
 
 /**

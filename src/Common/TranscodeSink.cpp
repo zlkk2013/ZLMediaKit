@@ -313,6 +313,7 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         // video_bitrate wins over the shared bitrate field: keeping audio at 64k while
         // giving video 1M is a normal requirement and one shared field cannot express it.
         video_params.bitrate = _option.video_bitrate > 0 ? _option.video_bitrate : _option.bitrate;
+        video_params.hw_encode = _option.hw_encode;
         ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
                                                       is_audio ? nullptr : track,
                                                       is_audio ? VideoTargetParams() : video_params);

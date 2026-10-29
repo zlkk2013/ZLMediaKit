@@ -78,6 +78,9 @@ struct TranscodeOption {
      * adapt_min_fps 是下限，默认 5。
      * adapt_selftest_delay_ms 仅用于自测（人为放大测得耗时以复现过载），生产必须 0。
      */
+    /** 优先使用硬件编码器（拿不到或打不开时自动回落软件编码） */
+    bool hw_encode = false;
+
     bool adapt_fps = false;
     float adapt_min_fps = 5;
     int adapt_selftest_delay_ms = 0;

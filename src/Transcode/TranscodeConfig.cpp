@@ -226,6 +226,8 @@ TranscodeOption loadGlobalTranscodeOption() {
     option.video_logo_y = parseSignedInt(ini[kTranscodeVideoLogoY].as<string>(), 10);
     option.video_logo_width = parseInt(ini[kTranscodeVideoLogoWidth].as<string>(), 0);
     // 负载自适应降帧：默认关闭，保持与未引入该特性时行为一致（基线回归靠这个）
+    // 硬件编码：默认关闭，与旧行为一致；拿不到硬件编码器时自动回落软编
+    option.hw_encode = parseBool(ini[kTranscodeHwEncode].as<string>(), false);
     option.adapt_fps = parseBool(ini[kTranscodeAdaptFps].as<string>(), false);
     option.adapt_min_fps = parseFloat(ini[kTranscodeAdaptMinFps].as<string>(), 5);
     option.adapt_selftest_delay_ms = parseInt(ini[kTranscodeAdaptSelftestDelay].as<string>(), 0);
