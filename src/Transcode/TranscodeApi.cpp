@@ -145,6 +145,7 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_logo_y"] = option.video_logo_y;
     val["video_logo_width"] = option.video_logo_width;
     val["hw_encode"] = option.hw_encode;
+    val["hw_decode"] = option.hw_decode;
     val["adapt_fps"] = option.adapt_fps;
     val["adapt_min_fps"] = option.adapt_min_fps;
 }
@@ -266,7 +267,19 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
             return makeError(kApiInvalidArgs, "invalid hw, must be 0/1/true/false");
         }
         if (ret == 1) {
+            // hw=1 语义是「尽量用硬件」：编码和解码一起开，运维只需要一个开关
             option.hw_encode = v;
+            option.hw_decode = v;
+            hw_given = true;
+        }
+        // 允许只要解码或只要编码
+        bool dv = option.hw_decode;
+        auto dret = parseBoolArg(args, "hw_decode", &dv);
+        if (dret < 0) {
+            return makeError(kApiInvalidArgs, "invalid hw_decode, must be 0/1/true/false");
+        }
+        if (dret == 1) {
+            option.hw_decode = dv;
             hw_given = true;
         }
     }
@@ -516,6 +529,9 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             track["adapt_fps"] = st.adapt_fps;
             track["adapt_dropped"] = (Json::Int64) st.adapt_dropped;
             track["silence_frames"] = (Json::UInt64) st.silence;
+            // 解码侧：hw_decode=true 才算真的在用硬件解码（挂设备但没下载过帧不算）
+            track["hw_decode"] = st.hw_decode;
+            track["hw_decode_frames"] = (Json::Int64) st.hw_decode_frames;
             val["tracks"].append(track);
         }
     } else if (online) {

@@ -165,6 +165,10 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
         st.transcoding = pr.second.transcoding;
         st.frames = pr.second.frame_count;
         st.silence = pr.second.silence_count;
+        if (pr.second.decoder) {
+            st.hw_decode = pr.second.decoder->hardwareDecoding();
+            st.hw_decode_frames = pr.second.decoder->hardwareFrames();
+        }
         if (pr.second.encoder) {
             // 这两项是「现场到底用没用硬件 / 降了多少帧」的唯一可观测口径
             st.encoder = pr.second.encoder->encoderName();
@@ -258,7 +262,14 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
     }
 
     try {
-        ctx.decoder = std::make_shared<FFmpegDecoder>(track);
+        std::vector<std::string> hw_decoder;
+        if (_option.hw_decode) {
+            auto name = hwDecoderName(track->getCodecId());
+            if (!name.empty()) {
+                hw_decoder.push_back(name);
+            }
+        }
+        ctx.decoder = std::make_shared<FFmpegDecoder>(track, 2, hw_decoder, _option.hw_decode && !is_audio);
         // 帧率必须在构造 encoder 之前传给目标轨：FFmpegEncoder 的构造函数里就会
         // avcodec_open2，之后再 setVideoFps 已经无效。
         // The frame rate must be handed to the target track BEFORE constructing the

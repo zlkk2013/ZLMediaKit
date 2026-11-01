@@ -121,13 +121,29 @@ public:
     using Ptr = std::shared_ptr<FFmpegDecoder>;
     using onDec = std::function<void(const FFmpegFrame::Ptr &)>;
 
-    FFmpegDecoder(const Track::Ptr &track, int thread_num = 2, const std::vector<std::string> &codec_name = {});
+    /**
+     * @param hw_decode 尝试硬件解码（当前实现：挂 hw_device_ctx + get_format）。
+     *        失败会静默回落软件解码，绝不因为硬件不可用而拒绝解码。
+     *
+     * Try hardware decoding (hw_device_ctx + get_format). Silently falls back to
+     * software when the device cannot be created.
+     */
+    FFmpegDecoder(const Track::Ptr &track, int thread_num = 2,
+                  const std::vector<std::string> &codec_name = {}, bool hw_decode = false);
     ~FFmpegDecoder() override;
 
     bool inputFrame(const Frame::Ptr &frame, bool live, bool async, bool enable_merge = true);
     void setOnDecode(onDec cb);
     void flush();
     const AVCodecContext *getContext() const;
+
+public:
+    /** 硬件解码输出的像素格式（get_format 回调需要读） */
+    AVPixelFormat _hw_pix_fmt = AV_PIX_FMT_NONE;
+    /** 已从硬件帧下载下来的帧数：>0 才证明硬件解码真的在跑（挂设备不算） */
+    int64_t _hw_frames = 0;
+    bool hardwareDecoding() const { return _hw_frames > 0; }
+    int64_t hardwareFrames() const { return _hw_frames; }
 
 private:
     void onDecode(const FFmpegFrame::Ptr &frame);
@@ -141,6 +157,8 @@ private:
     onDec _cb;
     std::shared_ptr<AVCodecContext> _context;
     FrameMerger _merger{FrameMerger::h264_prefix};
+    /** 硬件解码设备；空表示走软件解码 */
+    AVBufferRef *_hw_device = nullptr;
     toolkit::ResourcePool<FFmpegFrame> _frame_pool;
 };
 

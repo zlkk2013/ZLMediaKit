@@ -682,6 +682,7 @@ extern const std::string kTranscodeVideoLogoX;
 extern const std::string kTranscodeVideoLogoY;
 extern const std::string kTranscodeVideoLogoWidth;
 extern const std::string kTranscodeHwEncode;
+extern const std::string kTranscodeHwDecode;
 extern const std::string kTranscodeAdaptFps;
 extern const std::string kTranscodeAdaptMinFps;
 extern const std::string kTranscodeAdaptSelftestDelay;

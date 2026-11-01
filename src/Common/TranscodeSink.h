@@ -80,6 +80,8 @@ struct TranscodeOption {
      */
     /** 优先使用硬件编码器（拿不到或打不开时自动回落软件编码） */
     bool hw_encode = false;
+    /** 优先使用硬件解码器（拿不到时自动回落软件解码） */
+    bool hw_decode = false;
 
     bool adapt_fps = false;
     float adapt_min_fps = 5;
@@ -228,6 +230,9 @@ public:
         int64_t adapt_dropped = 0;
         /** 已补出的静音帧数（仅音频） */
         size_t silence = 0;
+        /** 解码是否真的走了硬件（依据：有过硬件帧下载），以及该类帧计数 */
+        bool hw_decode = false;
+        int64_t hw_decode_frames = 0;
     };
     std::vector<TrackStatus> trackStatus() const;
 

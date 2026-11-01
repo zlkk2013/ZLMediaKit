@@ -326,7 +326,29 @@ static inline const AVCodec *getCodecByName(const std::vector<std::string> &code
     return ret;
 }
 
-FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num, const std::vector<std::string> &codec_name) {
+/**
+ * 硬件解码的像素格式协商回调。
+ *
+ * 必须自己选硬件格式：默认的 avcodec_default_get_format 会挑第一个软件格式，
+ * 于是「挂了 hw_device_ctx 也照样软解」——这是最容易踩的坑，日志上完全看不出。
+ *
+ * Pick the hardware pixel format ourselves: the default callback returns the first
+ * software format, so hw device attached but decoding still on CPU, silently.
+ */
+static enum AVPixelFormat hwDecodeGetFormat(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    auto self = (FFmpegDecoder *) ctx->opaque;
+    auto want = self ? self->_hw_pix_fmt : AV_PIX_FMT_NONE;
+    for (auto p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == want) {
+            return *p;
+        }
+    }
+    WarnL << "hw decode: codec 未提供期望的硬件格式，回落软件";
+    return avcodec_default_get_format(ctx, pix_fmts);
+}
+
+FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
+                             const std::vector<std::string> &codec_name, bool hw_decode) {
     setupFFmpeg();
     _frame_pool.setSize(AV_NUM_DATA_POINTERS);
     const AVCodec *codec = nullptr;
@@ -492,6 +514,32 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num, const std:
         }
 #endif
 
+        // 硬件解码：建设备 + 挂 get_format。只对视频、且只是 H264/H265 有意义
+        if (hw_decode && track->getTrackType() == TrackVideo
+            && (track->getCodecId() == CodecH264 || track->getCodecId() == CodecH265)) {
+            AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
+            AVPixelFormat hw_fmt = AV_PIX_FMT_NONE;
+#if defined(__APPLE__)
+            type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+            hw_fmt = AV_PIX_FMT_VIDEOTOOLBOX;
+#elif defined(_WIN32) || defined(__linux__)
+            type = AV_HWDEVICE_TYPE_CUDA;
+            hw_fmt = AV_PIX_FMT_CUDA;
+#endif
+            if (type != AV_HWDEVICE_TYPE_NONE) {
+                if (av_hwdevice_ctx_create(&_hw_device, type, nullptr, nullptr, 0) >= 0) {
+                    _hw_pix_fmt = hw_fmt;
+                    _context->hw_device_ctx = av_buffer_ref(_hw_device);
+                    _context->opaque = this;
+                    _context->get_format = hwDecodeGetFormat;
+                    InfoL << "hw decode enabled: " << av_hwdevice_get_type_name(type);
+                } else {
+                    WarnL << "hw decode: 创建硬件设备失败，回落软件解码";
+                    _hw_pix_fmt = AV_PIX_FMT_NONE;
+                }
+            }
+        }
+
         int ret = avcodec_open2(_context.get(), codec, &dict);
         av_dict_free(&dict);
         if (ret >= 0) {
@@ -518,6 +566,12 @@ FFmpegDecoder::~FFmpegDecoder() {
         _merger.flush();
     }
     flush();
+    // 先释放 codec context（它持有 hw_device_ctx 的引用），再放设备，顺序不能反
+    // Release the codec context (which references hw_device_ctx) before the device.
+    _context.reset();
+    if (_hw_device) {
+        av_buffer_unref(&_hw_device);
+    }
 }
 
 void FFmpegDecoder::flush() {
@@ -602,6 +656,31 @@ bool FFmpegDecoder::decodeFrame(const char *data, size_t size, uint64_t dts, uin
         if (ret < 0) {
             WarnL << "avcodec_receive_frame failed:" << ffmpeg_err(ret);
             break;
+        }
+        // 硬件解码器（如 hevc_videotoolbox）输出的是**硬件帧**（pix_fmt 带
+        // AV_PIX_FMT_FLAG_HWACCEL），下游的 sws/滤镜都只吃系统内存帧，必须显式下载。
+        // 这是「硬件解码」与「全 GPU 零拷贝」的分界：要真正零拷贝，就得让滤镜链也能
+        // 直接消费硬件帧，而 drawtext/overlay 这类 GPU 滤镜不是各平台都齐。
+        //
+        // HW decoders (e.g. hevc_videotoolbox) return hardware frames; sws/filters only
+        // accept system memory, so download explicitly. This is exactly the boundary
+        // between "hardware decode" and true zero-copy.
+        auto frame_fmt = (enum AVPixelFormat) out_frame->get()->format;
+        auto desc = av_pix_fmt_desc_get(frame_fmt);
+        if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            auto sw_frame = _frame_pool.obtain2();
+            if (av_hwframe_transfer_data(sw_frame->get(), out_frame->get(), 0) < 0) {
+                WarnL << "av_hwframe_transfer_data failed, drop frame";
+                continue;
+            }
+            sw_frame->get()->pts = out_frame->get()->pts;
+            sw_frame->get()->pkt_dts = out_frame->get()->pkt_dts;
+            sw_frame->get()->pict_type = out_frame->get()->pict_type;
+            if (++_hw_frames == 1) {
+                InfoL << "hw decode: 第一帧已从硬件帧下载到内存, pix_fmt=" << (int) frame_fmt;
+            }
+            onDecode(sw_frame);
+            continue;
         }
         if (live && pts - out_frame->get()->pts > MAX_DELAY_SECOND * 1000 && _ticker.createdTime() > 10 * 1000) {
             // 后面的帧才忽略,防止Track无法ready  [AUTO-TRANSLATED:23f1a7c9]

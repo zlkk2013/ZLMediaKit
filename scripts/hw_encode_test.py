@@ -254,6 +254,42 @@ def main():
         note(m is not None and int(m.group(1)) > 0, "回落路径确实在编码（服务端帧数 > 0）",
              f"{m.group(1) + ' 帧' if m else '日志无帧数'}")
 
+        # ---- 硬件解码（第 8 项前置）：判据与编码一样分三层 ----
+        # 用软件编码做对照，把 CPU 差异归因到「解码」这一侧
+        # 注意参数名：API 只认 hw / hw_decode（没有 hw_encode），
+        # 写成 hw_encode 会被静默忽略，两组都变成软编（实测踩过，导致 CPU 对照作废）。
+        dec_sw = run_case("hw_dec_sw", {"video_codec": "H265", "hw": 0, "hw_decode": 0})
+        dec_hw = run_case("hw_dec_hw", {"video_codec": "H265", "hw": 0, "hw_decode": 1})
+        sw_t = next((t for t in ((dec_sw.get("status") or {}).get("tracks") or [])
+                     if t.get("type") == "video"), {})
+        hw_t = next((t for t in ((dec_hw.get("status") or {}).get("tracks") or [])
+                     if t.get("type") == "video"), {})
+        note(hw_t.get("hw_decode") is True and int(hw_t.get("hw_decode_frames") or 0) > 0,
+             "状态接口证明硬件解码真的在跑（有硬件帧下载）",
+             f"hw_decode={hw_t.get('hw_decode')} frames={hw_t.get('hw_decode_frames')}")
+        note(sw_t.get("hw_decode") is False, "hw_decode=0 时报告未启用",
+             f"hw_decode={sw_t.get('hw_decode')} frames={sw_t.get('hw_decode_frames')}")
+        note(dec_hw.get("info", "").startswith("hevc,1280,720"),
+             "硬解路径输出正确", f"{dec_hw.get('info')}")
+        note(not dec_hw.get("errs"), "硬解路径 0 解码错误", f"{len(dec_hw.get('errs') or [])} 条")
+        if dec_sw.get("cpu") and dec_hw.get("cpu"):
+            # 软编占大头（~200%），解码差异被淹没，这里只要求「不显著变差」并打印实测；
+            # 真正的隔离对照在下面（两边都硬编）
+            note(dec_hw["cpu"] <= dec_sw["cpu"] * 1.1,
+                 "硬解路径 CPU 不高于软解 1.1 倍（软编占大头，差异有限）",
+                 f"软解 {round(dec_sw['cpu'], 1)}% vs 硬解 {round(dec_hw['cpu'], 1)}%")
+
+        # 更干净的隔离：编码都用硬件，只差解码这一侧
+        hwenc_swdec = run_case("hw_is_swdec", {"video_codec": "H265", "hw": 1, "hw_decode": 0})
+        hwenc_hwdec = run_case("hw_is_hwdec", {"video_codec": "H265", "hw": 1})
+        if hwenc_swdec.get("cpu") and hwenc_hwdec.get("cpu"):
+            # 两边都硬编，只差解码：这个差值才是解码侧的真实收益
+            note(hwenc_hwdec["cpu"] <= hwenc_swdec["cpu"] + 2.0,
+                 "硬编+硬解 与 硬编+软解 相比 CPU 不升高",
+                 f"硬编+软解 {round(hwenc_swdec['cpu'], 1)}% -> 硬编+硬解 {round(hwenc_hwdec['cpu'], 1)}%")
+            note("(hardware)" in hwenc_hwdec.get("enc", ""), "隔离对照确实用了硬件编码",
+                 f"{hwenc_hwdec.get('enc')}")
+
         # 5) hw=0 时必须用软件编码（开关有效）
         note("(software)" in sw.get("enc", ""), "hw=0 时使用软件编码", f"{sw.get('enc')}")
         sw_tracks = ((sw.get("status") or {}).get("tracks") or [{}])

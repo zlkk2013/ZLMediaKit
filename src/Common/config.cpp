@@ -451,6 +451,7 @@ const string kTranscodeVideoLogoX = TRANSCODE_FIELD "video_logo_x";
 const string kTranscodeVideoLogoY = TRANSCODE_FIELD "video_logo_y";
 const string kTranscodeVideoLogoWidth = TRANSCODE_FIELD "video_logo_width";
 const string kTranscodeHwEncode = TRANSCODE_FIELD "hw_encode";
+const string kTranscodeHwDecode = TRANSCODE_FIELD "hw_decode";
 const string kTranscodeAdaptFps = TRANSCODE_FIELD "adapt_fps";
 const string kTranscodeAdaptMinFps = TRANSCODE_FIELD "adapt_min_fps";
 const string kTranscodeAdaptSelftestDelay = TRANSCODE_FIELD "adapt_selftest_delay_ms";
