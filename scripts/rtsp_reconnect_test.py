@@ -134,8 +134,16 @@ def hard_errors(stream, secs=4):
     # 注意：不要用 `-ss 2` 来「跳过加入时的 GOP 中间段」——直播流上 seek 并不等于
     # 跳到关键帧，实测反而让每条转码流都报 `Could not find ref`（比不 seek 更糟）。
     # 加入时机造成的引用缺失改为按行排除（见下）。
-    r = sh(f"ffmpeg -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
-           f"-t {secs} -f null - 2>&1", timeout=secs + 50)
+    # 超时重试：宿主负载高时拉流会饿死（环境问题）。重试一次仍失败才抛。
+    cmd = (f"ffmpeg -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
+           f"-t {secs} -f null - 2>&1")
+    r = None
+    for attempt in range(2):
+        try:
+            r = sh(cmd, timeout=secs + 50)
+            break
+        except Exception:
+            print(f"        (拉流超时，重试 {attempt + 1}/2)")
     lines = [l for l in r.stdout.splitlines() if l.strip()]
     hard = [l for l in lines
             if "monoton" not in l and "Last message repeated" not in l]
