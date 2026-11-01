@@ -80,6 +80,17 @@ struct TranscodeOption {
      */
     /** 优先使用硬件编码器（拿不到或打不开时自动回落软件编码） */
     bool hw_encode = false;
+    /**
+     * 可用硬件设备列表（如 "0,1"）与指定设备（-1 = 自动按负载分配）。
+     * 只在支持设备选择的编码器上生效（NVENC 的 gpu 选项、VAAPI 的 render node）；
+     * macOS 的 VideoToolbox 没有设备索引概念，这里会被忽略并在状态里报 -1。
+     *
+     * Hardware device list ("0,1") and pinned device (-1 = auto, balanced by load).
+     * Only meaningful where the encoder supports it (NVENC gpu option, VAAPI render node);
+     * VideoToolbox has no device index, so it reports -1.
+     */
+    std::string hw_devices;
+    int hw_device = -1;
     /** 优先使用硬件解码器（拿不到时自动回落软件解码） */
     bool hw_decode = false;
 
@@ -233,6 +244,8 @@ public:
         /** 解码是否真的走了硬件（依据：有过硬件帧下载），以及该类帧计数 */
         bool hw_decode = false;
         int64_t hw_decode_frames = 0;
+        /** 分配到的硬件设备号（-1 = 未指定/该平台不支持设备选择） */
+        int hw_device = -1;
     };
     std::vector<TrackStatus> trackStatus() const;
 
@@ -251,6 +264,8 @@ private:
         size_t frame_count = 0;
         /** 已补出的静音帧数 */
         size_t silence_count = 0;
+        /** 分配到的硬件设备号（-1 未指定） */
+        int hw_device = -1;
         /** 最近一次输出真实帧的时刻(ms)，用于判断源端是否断流 */
         int64_t last_output_ms = 0;
         /** 真实帧是否已产出过；未产出前不补静音，避免抢先于首帧 */

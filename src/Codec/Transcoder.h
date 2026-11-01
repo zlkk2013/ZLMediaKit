@@ -96,6 +96,14 @@ struct VideoTargetParams {
      * to open, so a stream never dies just because the GPU path is missing.
      */
     bool hw_encode = false;
+    /**
+     * 硬件设备序号（-1 = 不指定）。目前只对 NVENC 生效（`gpu` 选项）：
+     * VAAPI 走 render node 路径、VideoToolbox 没有设备索引，两者都会忽略并在状态里报 -1。
+     *
+     * Hardware device index (-1 = unspecified). Honoured by NVENC's `gpu` option only;
+     * VAAPI uses render nodes and VideoToolbox has no device index.
+     */
+    int device = -1;
 };
 
 /**
@@ -154,6 +162,29 @@ private:
  * The encoder is chosen from the track codec, and audio runs through a FIFO so
  * frames are sample-aligned.
  */
+/**
+ * 平台首选硬件解码器名（h264_videotoolbox / hevc_cuvid ...）；无对应硬件实现返回空串。
+ * 供 FFmpegDecoder 的 codec_name 参数使用 —— 上游默认候选表把通用软件解码器排在硬件前面，
+ * 不显式指定就永远走不到硬件解码。
+ *
+ * Preferred hardware decoder name per platform; empty when unsupported. Passed into
+ * FFmpegDecoder's codec_name: upstream's default candidate list puts the generic
+ * software decoder first, so hardware decode is otherwise never reached.
+ */
+std::string hwDecoderName(CodecId codec_id);
+
+/**
+ * 当前平台是否支持「按设备号选择 GPU」。
+ *
+ * 只有 NVENC（Windows/Linux）有 `gpu` 选项；macOS 的 VideoToolbox 没有设备索引，
+ * VAAPI 走 render node 而非序号 —— 这两个平台上配置 hw_devices 不会报错，但要如实
+ * 在状态里报 -1，绝不能假装分到了卡。
+ *
+ * Whether this platform supports selecting a GPU by index. Only NVENC does;
+ * VideoToolbox/VAAPI have no index, so hw_devices is accepted but reported as -1.
+ */
+bool hwDeviceSelectionSupported();
+
 class FFmpegEncoder : public TaskManager, public CodecInfo {
 public:
     using Ptr = std::shared_ptr<FFmpegEncoder>;

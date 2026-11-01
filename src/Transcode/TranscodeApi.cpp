@@ -146,11 +146,33 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_logo_width"] = option.video_logo_width;
     val["hw_encode"] = option.hw_encode;
     val["hw_decode"] = option.hw_decode;
+    val["hw_devices"] = option.hw_devices;
+    val["hw_device"] = option.hw_device;
     val["adapt_fps"] = option.adapt_fps;
     val["adapt_min_fps"] = option.adapt_min_fps;
 }
 
 }//namespace
+
+// 是否至少给了一个「下发参数」（不含 reset 本身）。
+// 用来区分「只要回退到 ini」和「先回退、再按参数重新下发」两种调用，
+// 否则 reset=1 会把同一请求里的参数静默吞掉（实测踩过）。
+// Whether the request carries any option parameter (reset itself excluded), so that
+// "reset only" and "reset then re-apply" can be told apart.
+static bool transcodeHasOptionArgs(const TranscodeApiArgs &args) {
+    static const char *kNames[] = {
+            "audio_codec", "video_codec", "bitrate", "sample_rate", "on_demand", "enable",
+            "enable_silence", "silence_timeout_ms", "video_width", "video_height", "video_fps",
+            "video_bitrate", "video_scale", "width", "height", "filter", "logo", "logo_x",
+            "logo_y", "logo_width", "hw", "hw_encode", "hw_decode", "hw_devices", "hw_device",
+            "adapt_fps", "adapt_min_fps"};
+    for (auto name : kNames) {
+        if (!argValue(args, name).empty()) {
+            return true;
+        }
+    }
+    return false;
+}
 
 Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
     MediaTuple tuple;
@@ -169,7 +191,13 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
     if (reset_ret < 0) {
         return makeError(kApiInvalidArgs, "invalid reset");
     }
-    if (reset) {
+    // reset 与其它参数同时出现时：先清空、再按参数重新下发（而不是把参数静默吞掉）。
+    // 以前只要带 reset=1 就直接返回，调用方以为参数生效了，实际什么也没改 —— 实测踩过。
+    //
+    // When reset is combined with other parameters, clear first and then apply them.
+    // Previously any request carrying reset=1 returned immediately, silently dropping
+    // the parameters while the caller believed they had been applied.
+    if (reset && !transcodeHasOptionArgs(args)) {
         bool cleared = TranscodeRuntime::instance().clearOverride(tuple);
         bool online = (bool) MediaSource::find(tuple.vhost, tuple.app, tuple.stream);
         Json::Value val;
@@ -196,6 +224,12 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         InfoL << "addTranscode reset " << tuple.shortUrl() << ", cleared=" << cleared
               << ", applied=" << val["applied"].asString();
         return val;
+    }
+    if (reset) {
+        // 参数与 reset 同时给出：清空旧覆盖但不返回，随后用这些参数重新建立覆盖。
+        // Parameters combined with reset=1: drop the old override and continue, so the
+        // parameters below are applied instead of being silently ignored.
+        TranscodeRuntime::instance().clearOverride(tuple);
     }
 
     struct {
@@ -270,6 +304,22 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
             // hw=1 语义是「尽量用硬件」：编码和解码一起开，运维只需要一个开关
             option.hw_encode = v;
             option.hw_decode = v;
+            hw_given = true;
+        }
+        // 多卡：hw_devices="0,1" 声明可用设备，hw_device=N 指定具体设备（-1 自动）
+        auto devs = trim(argValue(args, "hw_devices"));
+        if (!devs.empty()) {
+            option.hw_devices = devs;
+            hw_given = true;
+        }
+        auto dev = trim(argValue(args, "hw_device"));
+        if (!dev.empty()) {
+            char *end = nullptr;
+            long n = ::strtol(dev.data(), &end, 10);
+            if (end == dev.data() || *end != '\0' || n < -1) {
+                return makeError(kApiInvalidArgs, "invalid hw_device, must be >= -1");
+            }
+            option.hw_device = (int) n;
             hw_given = true;
         }
         // 允许只要解码或只要编码
@@ -532,6 +582,7 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             // 解码侧：hw_decode=true 才算真的在用硬件解码（挂设备但没下载过帧不算）
             track["hw_decode"] = st.hw_decode;
             track["hw_decode_frames"] = (Json::Int64) st.hw_decode_frames;
+            track["hw_device"] = st.hw_device;
             val["tracks"].append(track);
         }
     } else if (online) {

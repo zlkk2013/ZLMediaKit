@@ -76,3 +76,4 @@ config.filter.ini
 config.adapt.ini
 config.hw.ini
 config.soak.ini
+config.multigpu.ini

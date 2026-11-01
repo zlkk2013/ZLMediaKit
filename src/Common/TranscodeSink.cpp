@@ -15,6 +15,7 @@
 #include "Util/util.h"
 #include "Common/Parser.h"   // StrCaseCompare：别名表要不区分大小写
 #include "Common/config.h"
+#include "Transcode/TranscodeConfig.h"   // TranscodeRuntime：多卡分配
 #include <algorithm>
 #include <atomic>
 
@@ -29,6 +30,13 @@ TranscodeSink::TranscodeSink(const TranscodeOption &option, std::function<size_t
 
 TranscodeSink::~TranscodeSink() {
     cancelSilenceTimer();
+    // 释放多卡分配计数，否则设备负载只增不减，后续流会全被分到"看起来最空"的卡
+    // Release the device slot, otherwise load only ever grows and later streams all
+    // land on whichever device looks emptiest.
+    auto label = streamLabel();
+    if (!label.empty()) {
+        TranscodeRuntime::instance().unbindDevice(label);
+    }
     // 不能在持 _mtx 的情况下销毁 TrackContext：解码器析构会 flush 残留帧，flush 会
     // 同步回调进 onDecoded()，那里要拿 _mtx，而非递归锁 → 同一线程自死锁。
     // 实测：推流端断连、延时注销结束时释放 muxer 的输出源，poller 线程就卡在
@@ -165,6 +173,7 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
         st.transcoding = pr.second.transcoding;
         st.frames = pr.second.frame_count;
         st.silence = pr.second.silence_count;
+        st.hw_device = pr.second.hw_device;
         if (pr.second.decoder) {
             st.hw_decode = pr.second.decoder->hardwareDecoding();
             st.hw_decode_frames = pr.second.decoder->hardwareFrames();
@@ -333,6 +342,24 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
         // giving video 1M is a normal requirement and one shared field cannot express it.
         video_params.bitrate = _option.video_bitrate > 0 ? _option.video_bitrate : _option.bitrate;
         video_params.hw_encode = _option.hw_encode;
+        // 多卡分配：指定了就尊重，否则按「在跑路数最少」挑；macOS 上没有设备索引，
+        // 状态里如实报 -1（配置了 hw_devices 也不会假装分到了卡）
+        if (_option.hw_encode && !hwDeviceSelectionSupported()
+            && (!_option.hw_devices.empty() || _option.hw_device >= 0)) {
+            // 本平台没有设备索引：配置不报错，但要明确告知被忽略，且状态里报 -1
+            WarnL << "hw_devices/hw_device 在本平台不生效（只有 NVENC 支持按序号选卡），已忽略";
+        }
+        if (_option.hw_encode && hwDeviceSelectionSupported()) {
+            int dev = _option.hw_device;
+            if (dev < 0 && !_option.hw_devices.empty()) {
+                dev = TranscodeRuntime::instance().pickDevice(streamLabel(), _option.hw_devices);
+                if (dev >= 0) {
+                    TranscodeRuntime::instance().bindDevice(streamLabel(), dev);
+                }
+            }
+            video_params.device = dev;
+            ctx.hw_device = dev;
+        }
         ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
                                                       is_audio ? nullptr : track,
                                                       is_audio ? VideoTargetParams() : video_params);

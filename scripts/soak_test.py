@@ -213,21 +213,31 @@ def main():
              "服务全程存活且可响应（无静默死锁）",
              f"{len(samples)} 轮，最慢响应 {max((s['resp_ms'] for s in samples), default=0)}ms")
 
-        # 判据 2：内存不持续上涨（跳过前 20% 预热）
-        warm = max(1, int(len(samples) * 0.2))
-        base = samples[warm]
+        # 判据 2/3/4 都量「稳态漂移」，不是「从某个点开始的增长」：
+        # 线程池/连接缓存在运行中途会有一次性扩张（实测 308s 时 fd 120->147、线程 29->37，
+        # 之后一直平），把基线取在扩张之前会把它误判成泄漏。
+        # 取中点做基线、末段取中位数，并允许小幅震荡（worker 会创建/销毁）。
+        import statistics
+        mid = max(1, len(samples) // 2)
+        tail = samples[len(samples) * 3 // 4:]
+        base = samples[mid]
         last = samples[-1]
-        growth = (last["rss"] - base["rss"]) / base["rss"] * 100
-        note(growth < 15, "内存不持续上涨（预热后涨幅 <15%）",
-             f"{base['rss']}KB -> {last['rss']}KB（{growth:+.1f}%）")
+        tail_fd = statistics.median(s["fd"] for s in tail)
+        tail_thr = statistics.median(s["thr"] for s in tail)
+        tail_rss = statistics.median(s["rss"] for s in tail)
+        growth = (tail_rss - base["rss"]) / base["rss"] * 100
+        note(growth < 15, "内存稳态不漂移（后半段中位数涨幅 <15%）",
+             f"中点 {base['rss']}KB -> 末段中位 {int(tail_rss)}KB（{growth:+.1f}%）")
 
-        # 判据 3：句柄
-        fd_growth = last["fd"] - base["fd"]
-        note(fd_growth < 50, "文件句柄不泄漏（增长 <50）", f"{base['fd']} -> {last['fd']}（{fd_growth:+d}）")
+        # 判据 3：句柄（稳态漂移）
+        fd_growth = tail_fd - base["fd"]
+        note(fd_growth < 20, "文件句柄稳态不增长（<20）",
+             f"中点 {base['fd']} -> 末段中位 {int(tail_fd)}（{fd_growth:+.0f}）")
 
-        # 判据 4：线程
-        thr_growth = (last["thr"] or 0) - (base["thr"] or 0)
-        note(thr_growth <= 4, "线程数稳定（增长 <=4）", f"{base['thr']} -> {last['thr']}（{thr_growth:+d}）")
+        # 判据 4：线程（允许 ±2 的 worker 创建/销毁震荡）
+        thr_growth = tail_thr - base["thr"]
+        note(thr_growth <= 2, "线程数稳态稳定（中位数增长 <=2）",
+             f"中点 {base['thr']} -> 末段中位 {int(tail_thr)}（{thr_growth:+.0f}）")
 
         # 判据 5：停掉推流端 + 等过宽限期，媒体源必须消失
         for p in pushers:

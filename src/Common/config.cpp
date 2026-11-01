@@ -465,6 +465,8 @@ static onceToken token([]() {
     mINI::Instance()["transcode.video_logo_width"] = 0;
     mINI::Instance()["transcode.hw_encode"] = 0;
     mINI::Instance()["transcode.hw_decode"] = 0;
+    mINI::Instance()["transcode.hw_devices"] = "";
+    mINI::Instance()["transcode.hw_device"] = -1;
     mINI::Instance()["transcode.adapt_fps"] = 0;
     mINI::Instance()["transcode.adapt_min_fps"] = 5;
     mINI::Instance()["transcode.adapt_selftest_delay_ms"] = 0;

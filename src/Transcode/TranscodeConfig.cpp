@@ -17,6 +17,8 @@
 #include "Util/mini.h"
 #include "Util/util.h"
 #include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <set>
 
@@ -48,6 +50,8 @@ const std::string kTranscodeVideoLogoY = "transcode.video_logo_y";
 const std::string kTranscodeVideoLogoWidth = "transcode.video_logo_width";
 const std::string kTranscodeHwEncode = "transcode.hw_encode";
 const std::string kTranscodeHwDecode = "transcode.hw_decode";
+const std::string kTranscodeHwDevices = "transcode.hw_devices";
+const std::string kTranscodeHwDevice = "transcode.hw_device";
 const std::string kTranscodeAdaptFps = "transcode.adapt_fps";
 const std::string kTranscodeAdaptMinFps = "transcode.adapt_min_fps";
 const std::string kTranscodeAdaptSelftestDelay = "transcode.adapt_selftest_delay_ms";
@@ -259,6 +263,9 @@ TranscodeOption loadGlobalTranscodeOption() {
     // 硬件编码：默认关闭，与旧行为一致；拿不到硬件编码器时自动回落软编
     option.hw_encode = parseBool(ini[kTranscodeHwEncode].as<string>(), false);
     option.hw_decode = parseBool(ini[kTranscodeHwDecode].as<string>(), false);
+    // 多卡：设备列表 + 指定设备（-1 自动）
+    option.hw_devices = trim(ini[kTranscodeHwDevices].as<string>());
+    option.hw_device = parseSignedInt(ini[kTranscodeHwDevice].as<string>(), -1);
     option.adapt_fps = parseBool(ini[kTranscodeAdaptFps].as<string>(), false);
     option.adapt_min_fps = parseFloat(ini[kTranscodeAdaptMinFps].as<string>(), 5);
     option.adapt_selftest_delay_ms = parseInt(ini[kTranscodeAdaptSelftestDelay].as<string>(), 0);
@@ -423,7 +430,66 @@ TranscodeRuntime &TranscodeRuntime::instance() {
     return s_instance;
 }
 
-string TranscodeRuntime::makeKey(const MediaTuple &tuple) {
+int TranscodeRuntime::pickDevice(const std::string &stream_key, const std::string &devices) {
+    if (devices.empty()) {
+        return -1;
+    }
+    lock_guard<mutex> lck(_mtx);
+    // 已经绑定过（重推/接管）就沿用，避免同一条流在两个设备间跳来跳去
+    auto it = _stream_device.find(stream_key);
+    if (it != _stream_device.end()) {
+        return it->second;
+    }
+    // 解析 "0,1" 这类列表，挑在跑路数最少的那个；同负载取序号小的，保证可预测
+    int best = -1;
+    int best_load = INT32_MAX;
+    for (auto &part : split(devices, ",")) {
+        auto str = trim(string(part));
+        if (str.empty()) {
+            continue;
+        }
+        char *end = nullptr;
+        long id = ::strtol(str.data(), &end, 10);
+        if (end == str.data() || id < 0) {
+            continue;
+        }
+        int load = _device_load.count((int) id) ? _device_load[(int) id] : 0;
+        if (load < best_load) {
+            best_load = load;
+            best = (int) id;
+        }
+    }
+    return best;
+}
+
+void TranscodeRuntime::bindDevice(const std::string &stream_key, int device) {
+    if (device < 0) {
+        return;
+    }
+    lock_guard<mutex> lck(_mtx);
+    auto it = _stream_device.find(stream_key);
+    if (it != _stream_device.end()) {
+        if (--_device_load[it->second] <= 0) {
+            _device_load.erase(it->second);
+        }
+    }
+    _stream_device[stream_key] = device;
+    ++_device_load[device];
+}
+
+void TranscodeRuntime::unbindDevice(const std::string &stream_key) {
+    lock_guard<mutex> lck(_mtx);
+    auto it = _stream_device.find(stream_key);
+    if (it == _stream_device.end()) {
+        return;
+    }
+    if (--_device_load[it->second] <= 0) {
+        _device_load.erase(it->second);
+    }
+    _stream_device.erase(it);
+}
+
+std::string TranscodeRuntime::makeKey(const MediaTuple &tuple) {
     return tuple.vhost + "/" + tuple.app + "/" + tuple.stream;
 }
 

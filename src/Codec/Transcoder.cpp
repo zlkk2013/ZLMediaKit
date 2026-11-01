@@ -830,6 +830,26 @@ void FFmpegEncoder::updateAdaptiveFps(double cost_ms) {
     }
 }
 
+std::string hwDecoderName(CodecId codec_id) {
+#if defined(__APPLE__)
+    if (codec_id == CodecH264) return "h264_videotoolbox";
+    if (codec_id == CodecH265) return "hevc_videotoolbox";
+#elif defined(_WIN32) || defined(__linux__)
+    // NVIDIA 的解码器叫 cuvid；AMD/Intel 走各自实现，这里按最常见的一档给
+    if (codec_id == CodecH264) return "h264_cuvid";
+    if (codec_id == CodecH265) return "hevc_cuvid";
+#endif
+    return "";
+}
+
+bool hwDeviceSelectionSupported() {
+#if defined(_WIN32) || defined(__linux__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FFmpegEncoder::isHardwareEncoder() const {
     return ::mediakit::isHwEncoderCodec(_codec);
 }
@@ -934,6 +954,16 @@ bool FFmpegEncoder::openVideoCodec(int width, int height, int bitrate, const AVC
     }
 
     if (codec->id == AV_CODEC_ID_H264) {
+        // 多卡：只有 NVENC 有 gpu 选项。其它硬件编码器（VAAPI 走 render node、
+        // VideoToolbox 无设备索引）会忽略这个值，状态接口里会如实报 -1。
+        // Only NVENC has a `gpu` option; VAAPI (render nodes) and VideoToolbox ignore it.
+        if (_video_params.device >= 0 && strstr(codec->name, "nvenc")) {
+            if (av_opt_set(_context->priv_data, "gpu", std::to_string(_video_params.device).data(), 0) < 0) {
+                WarnL << "nvenc: 设置 gpu=" << _video_params.device << " 失败，使用默认设备";
+            } else {
+                InfoL << "nvenc: 绑定 GPU " << _video_params.device;
+            }
+        }
         av_opt_set(_context->priv_data, "preset", "veryfast", 0);
         av_opt_set(_context->priv_data, "tune", "zerolatency", 0);
         // 关掉场景切换强制 IDR：直播里源内容抖动（噪声/闪白）会频繁触发，

@@ -36,6 +36,7 @@ CORE=(
   "filter_test:420:视频滤镜/OSD（luma 反相与亮度变化判据）"
   "adapt_fps_test:600:负载自适应降帧（降得下来/不错位/不花屏）"
   "hw_encode_test:600:硬件编码（日志+正确性+CPU 三条判据）"
+  "multi_gpu_test:600:多卡分配：参数面 + 平台诚实性（NVENC 机器上多验真分配）"
   "vp8_source_timeline_test:420:VP8/VP9 作源的时间轴（防 2 倍速）"
   "joint_accept:600:联合验收：API/视频参数/静音兜底/多轨并发"
   "source_release_check:300:媒体源释放：断开后源必须清空（泄漏检查）"

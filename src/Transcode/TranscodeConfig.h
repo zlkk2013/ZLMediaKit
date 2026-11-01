@@ -109,6 +109,24 @@ public:
      * distinguishable in logs.
      */
     void attachSink(const MediaTuple &tuple, const std::weak_ptr<TranscodeSink> &sink);
+
+    /**
+     * 为一条流挑硬件设备：指定了就尊重指定；否则在 hw_devices 里挑**当前在跑路数最少**的。
+     * 没有配置设备列表返回 -1（表示不区分设备，交给编码器默认）。
+     *
+     * 分配依据是「正在转码的流数量」，不是 GPU 利用率：读利用率需要厂商 SDK，
+     * 而路数已经能近似均衡（同样分辨率/码率下每路的负载接近）。
+     *
+     * Pick a device for a stream: honour the pinned device, otherwise the least-loaded
+     * one from hw_devices. Returns -1 when no device list is configured. Balancing is by
+     * active stream count rather than GPU utilization: reading utilization needs a
+     * vendor SDK, while stream count is a good proxy for equal-cost streams.
+     */
+    int pickDevice(const std::string &stream_key, const std::string &devices);
+
+    /** 记录某条流使用了哪个设备（流关闭时释放计数） */
+    void bindDevice(const std::string &stream_key, int device);
+    void unbindDevice(const std::string &stream_key);
     TranscodeSink::Ptr findSink(const MediaTuple &tuple) const;
 
     static std::string makeKey(const MediaTuple &tuple);
@@ -120,6 +138,9 @@ private:
     std::map<std::string, TranscodeOption> _overrides;
     /** findSink() 在 const 方法里清理失效条目，故为 mutable / pruned from a const method */
     mutable std::map<std::string, std::weak_ptr<TranscodeSink>> _sinks;
+    /** 流 → 设备，以及设备 → 在跑路数 */
+    std::map<std::string, int> _stream_device;
+    std::map<int, int> _device_load;
 };
 
 /**
