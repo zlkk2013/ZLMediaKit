@@ -1,80 +1,71 @@
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-*.d
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-#*.dylib
-#*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.lib
-
-# Executables
-#*.exe
-*.out
-*.app
-/X64/
-
-
-*.DS_Store
-
-/cmake-build-debug/
-/cmake-build-release/
-/linux/
-/.vs/
-/.vscode/
-/.idea/
-/c_wrapper/.idea/
-/release/
-/out/
-/Android/.idea/
-/Android/app/src/main/cpp/libs_export/
-/3rdpart/media-server/.idea/
-/3rdpart/media-server/.idea/
-/build/
-/3rdpart/media-server/.idea/
-/ios/
-/cmake-build-*
-/3rdpart/ZLToolKit/cmake-build-mq/
 
 # ---- transcode fork ----
+# Compiled Dynamic libraries
+# Compiled Object files
+# Compiled Static libraries
+# Executables
+# Fortran module files
+# Precompiled Headers
+#*.dll
+#*.dylib
+#*.exe
+*.DS_Store
+*.app
+*.d
+*.gch
+*.la
+*.lai
+*.lib
+*.lo
+*.mod
+*.o
+*.obj
+*.out
+*.pch
+*.slo
+*.smod
+/.idea/
+/.vs/
+/.vscode/
+/3rdpart/ZLToolKit/cmake-build-mq/
+/3rdpart/media-server/.idea/
+/Android/.idea/
+/Android/app/src/main/cpp/libs_export/
+/X64/
+/build/
+/c_wrapper/.idea/
+/cmake-build-*
+/cmake-build-debug/
+/cmake-build-release/
+/ios/
+/linux/
+/out/
+/release/
 build-wt/
-release/
-config.joint.ini
-config.joint.base.ini
+config.*.ini
 config.a1test.ini
 config.a2test.ini
 config.a3test.ini
+config.adapt.ini
+config.apiparams.ini
+config.av1stab.ini
+config.camera.ini
+config.crash.ini
+config.dts.ini
+config.e0.ini
+config.filter.ini
 config.g711.ini
 config.g8.ini
-config.e0.ini
-config.dts.ini
-config.crash.ini
-config.matrix.ini
-config.reverse.ini
-config.camera.ini
-config.reconnect.ini
-config.liveness.ini
-config.release.ini
-config.av1stab.ini
-logs/
-config.scale.ini
-config.filter.ini
-config.adapt.ini
 config.hw.ini
-config.soak.ini
+config.joint.base.ini
+config.joint.ini
+config.liveness.ini
+config.matrix.ini
 config.multigpu.ini
-config.apiparams.ini
+config.reconnect.ini
+config.release.ini
+config.reverse.ini
+config.scale.ini
+config.soak.ini
+logs/
+release/
