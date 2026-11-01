@@ -106,6 +106,11 @@ preflight() {
     if (l > c * 0.8) printf "⚠️  宿主负载 %.2f / %d 核（偏高）：adapt_fps 等时间敏感套件可能假红\n", l, c;
     else printf "✅ 宿主负载 %.2f / %d 核\n", l, c }'
 
+  # 素材：/tmp 会被回收，缺了会让套件报「缺素材」或被误读成产品故障
+  if [ -x "$WT/scripts/test_assets.py" ] || [ -f "$WT/scripts/test_assets.py" ]; then
+    env -u PYTHONPATH -u PYTHONHOME python3 "$WT/scripts/test_assets.py" | sed 's/^/   /'
+  fi
+
   # 残留 MediaServer 必须清掉再开跑 —— 上一轮被打断（Ctrl-C / 工具超时）留下的孤儿进程
   # 会占着端口，导致后续套件「启动失败」，而症状看起来像产品坏了（Connection refused）。
   #

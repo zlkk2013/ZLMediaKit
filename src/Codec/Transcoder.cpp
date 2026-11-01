@@ -336,7 +336,7 @@ int TranscodeAudioFifo::size() const {
 // FFmpegEncoder
 
 /** 判断一个 AVCodec 是不是硬件编码器（用于回落与日志） */
-static bool isHardwareEncoder(const AVCodec *codec) {
+static bool isHwEncoderCodec(const AVCodec *codec) {
     if (!codec || !codec->name) {
         return false;
     }
@@ -524,7 +524,7 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
             InfoL << "hw encoder without explicit bitrate, defaulting to " << bitrate << "bps";
         }
         auto ret = openVideoCodec(width, height, bitrate, _codec);
-        if (!ret && _video_params.hw_encode && isHardwareEncoder(_codec)) {
+        if (!ret && _video_params.hw_encode && isHwEncoderCodec(_codec)) {
             // 硬件编码器存在但打不开（驱动异常、并发会话数上限、分辨率超出硬件能力）
             // 必须回落软件编码：宁可用 CPU 也不能让这条流起不来。
             // The hardware encoder exists but refuses to open (driver issue, session limit,
@@ -540,7 +540,7 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
             throw std::runtime_error(string("打开视频编码器失败: ") + _codec->name);
         }
         InfoL << "transcode video encoder: " << _codec->name
-              << (isHardwareEncoder(_codec) ? " (hardware)" : " (software)")
+              << (isHwEncoderCodec(_codec) ? " (hardware)" : " (software)")
               << " " << width << "x" << height << " @" << bitrate << "bps";
     } else {
         auto audio = static_pointer_cast<AudioTrack>(track);
@@ -828,6 +828,10 @@ void FFmpegEncoder::updateAdaptiveFps(double cost_ms) {
         _overload_frames = 0;
         _idle_frames = 0;
     }
+}
+
+bool FFmpegEncoder::isHardwareEncoder() const {
+    return ::mediakit::isHwEncoderCodec(_codec);
 }
 
 double FFmpegEncoder::videoStepMs() const {

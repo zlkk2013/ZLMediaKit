@@ -510,6 +510,12 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             track["source_codec"] = ::mediakit::getCodecName(st.source_codec);
             track["target_codec"] = ::mediakit::getCodecName(st.target_codec);
             track["frames"] = (Json::UInt64) st.frames;
+            // 运行态：现场排障最常问的两件事就是「这路到底用没用硬件」「降了多少帧」
+            track["encoder"] = st.encoder;
+            track["hardware"] = st.hardware;
+            track["adapt_fps"] = st.adapt_fps;
+            track["adapt_dropped"] = (Json::Int64) st.adapt_dropped;
+            track["silence_frames"] = (Json::UInt64) st.silence;
             val["tracks"].append(track);
         }
     } else if (online) {

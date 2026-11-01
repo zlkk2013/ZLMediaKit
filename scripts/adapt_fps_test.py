@@ -180,12 +180,14 @@ def run_case(name, params, selftest_delay_ms=0):
         pr = push(name)
         time.sleep(8)                 # 让自适应收敛（每降一档需要 15 帧）
         res = measure(name, PULL_SECS)
+        # 运行态接口：运维要能看到「现在降到多少帧、丢了多少帧」
+        status = api("getTranscode", app="live", stream=name)
         try:
             os.killpg(os.getpgid(pr.pid), signal.SIGKILL)
         except Exception:
             pass
         # 日志按用例截断（每次 start 都 open(...,'w')），所以要在这里取，不能最后统一读
-        return res + (open(LOG, errors="replace").read(),)
+        return res + (open(LOG, errors="replace").read(), status)
     finally:
         stop(srv)
 
@@ -202,7 +204,7 @@ def main():
         base = {"video_codec": "H265"}
 
         # A. 无过载：帧率不能自己往下掉
-        fps, dur, n, keys, errs, log_a = run_case("ad_norm", dict(base, adapt_fps=1))
+        fps, dur, n, keys, errs, log_a, st_a = run_case("ad_norm", dict(base, adapt_fps=1))
         if BUSY_HOST:
             # 高负载下只要求「没崩到下限附近」，不要求贴住目标
             note(fps is not None and fps > TARGET_FPS * 0.4,
@@ -214,7 +216,7 @@ def main():
                  f"fps={fps and round(fps, 1)} 包={n} 时长={dur and round(dur, 2)}")
 
         # B. 中等过载：要降帧，且时长仍然对
-        fps2, dur2, n2, keys2, errs2, log_b = run_case(
+        fps2, dur2, n2, keys2, errs2, log_b, st_b = run_case(
             "ad_mid", dict(base, adapt_fps=1, adapt_min_fps=5), selftest_delay_ms=60)
         note(fps2 is not None and fps2 < TARGET_FPS * 0.9,
              "过载时帧率下降", f"目标 {TARGET_FPS} -> 实测 {fps2 and round(fps2, 1)}")
@@ -223,9 +225,14 @@ def main():
              f"拉 {PULL_SECS}s -> 视频时长 {dur2 and round(dur2, 2)}s")
         note(keys2 > 0, "关键帧仍在", f"{keys2} 个")
         note(not errs2, "重新解码 0 错误（不花屏）", f"{len(errs2)} 条")
+        vt = next((t for t in ((st_b or {}).get("tracks") or []) if t.get("type") == "video"), {})
+        note(vt.get("adapt_fps") is not None and 0 < float(vt.get("adapt_fps") or 0) < TARGET_FPS,
+             "状态接口报告降帧后的帧率", f"{vt.get('adapt_fps')}")
+        note(int(vt.get("adapt_dropped") or 0) > 0, "状态接口报告已丢弃帧数",
+             f"{vt.get('adapt_dropped')}")
 
         # C. 重度过载：撞到下限，但时长与关键帧依旧
-        fps3, dur3, n3, keys3, errs3, log_c = run_case(
+        fps3, dur3, n3, keys3, errs3, log_c, st_c = run_case(
             "ad_hard", dict(base, adapt_fps=1, adapt_min_fps=5), selftest_delay_ms=400)
         note(fps3 is not None and 4.0 <= fps3 <= 16.0 and (fps2 is None or fps3 <= fps2 + 3.0),
              "重度过载时继续降且不低于下限（不无限降）",
@@ -236,7 +243,7 @@ def main():
              f"关键帧 {keys3}, 错误 {len(errs3)}")
 
         # D. 关掉自适应：同样的过载信号不应影响帧率（证明是开关起作用）
-        fps4, dur4, n4, keys4, errs4, log_d = run_case(
+        fps4, dur4, n4, keys4, errs4, log_d, st_d = run_case(
             "ad_off", dict(base, adapt_fps=0), selftest_delay_ms=400)
         note(fps4 is not None and fps4 > TARGET_FPS * 0.85,
              "adapt_fps=0 时不降帧", f"fps={fps4 and round(fps4, 1)}")

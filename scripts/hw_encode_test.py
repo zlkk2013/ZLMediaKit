@@ -184,11 +184,14 @@ def run_case(name, params, src=None, pull=True):
             if l.strip() and "monoton" not in l and "Last message repeated" not in l]
     log = open(LOG, errors="replace").read()
     enc_line = _last_encoder(log)
+    # 运行态接口必须和实际一致：这是运维唯一能看到的「到底用没用硬件」
+    status = api("getTranscode", app="live", stream=name)
     try:
         os.killpg(os.getpgid(pr.pid), signal.SIGKILL)
     except Exception:
         pass
-    return {"cpu": cpu, "info": info, "errs": errs, "enc": enc_line, "log": log}
+    return {"cpu": cpu, "info": info, "errs": errs, "enc": enc_line, "log": log,
+            "status": status}
 
 
 def main():
@@ -214,6 +217,13 @@ def main():
         note("(hardware)" in hw.get("enc", ""), "日志标记为 hardware", f"{hw.get('enc')}")
         note(hw.get("info", "").startswith("hevc,1280,720"),
              "硬编输出 codec/尺寸正确", f"{hw.get('info')}")
+        # 状态接口（运维视角）：encoder 名 + hardware 标记 + 帧数
+        tracks = ((hw.get("status") or {}).get("tracks") or [{}])
+        vt = next((t for t in tracks if t.get("type") == "video"), {})
+        note(vt.get("hardware") is True and "videotoolbox" in (vt.get("encoder") or "")
+             or vt.get("hardware") is True and "nvenc" in (vt.get("encoder") or ""),
+             "状态接口报告 hardware=true 且带编码器名", f"{vt.get('encoder')} hw={vt.get('hardware')}")
+        note(int(vt.get("frames") or 0) > 0, "状态接口报告已编码帧数", f"{vt.get('frames')}")
         note(not hw.get("errs"), "硬编拉流 0 解码错误", f"{len(hw.get('errs') or [])} 条")
         if sw.get("cpu") and hw.get("cpu"):
             note(hw["cpu"] < sw["cpu"] * 0.85, "硬编 CPU 明显低于软编",
@@ -246,6 +256,10 @@ def main():
 
         # 5) hw=0 时必须用软件编码（开关有效）
         note("(software)" in sw.get("enc", ""), "hw=0 时使用软件编码", f"{sw.get('enc')}")
+        sw_tracks = ((sw.get("status") or {}).get("tracks") or [{}])
+        sw_vt = next((t for t in sw_tracks if t.get("type") == "video"), {})
+        note(sw_vt.get("hardware") is False, "状态接口对软编报告 hardware=false",
+             f"{sw_vt.get('encoder')} hw={sw_vt.get('hardware')}")
     finally:
         stop(srv)
 

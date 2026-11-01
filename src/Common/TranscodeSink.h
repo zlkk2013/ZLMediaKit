@@ -218,6 +218,16 @@ public:
         CodecId target_codec = CodecInvalid;
         bool transcoding = false;
         size_t frames = 0;
+        /** 实际编码器名（如 libx265 / hevc_videotoolbox）；未转码时为空 */
+        std::string encoder;
+        /** 是否硬件编码器 —— 运维要能确认「到底用没用 GPU」 */
+        bool hardware = false;
+        /** 负载自适应当前帧率（0 = 未启用） */
+        float adapt_fps = 0;
+        /** 因过载被丢弃的帧数 */
+        int64_t adapt_dropped = 0;
+        /** 已补出的静音帧数（仅音频） */
+        size_t silence = 0;
     };
     std::vector<TrackStatus> trackStatus() const;
 

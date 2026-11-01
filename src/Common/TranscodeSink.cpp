@@ -164,6 +164,14 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
                               : pr.second.source_codec;
         st.transcoding = pr.second.transcoding;
         st.frames = pr.second.frame_count;
+        st.silence = pr.second.silence_count;
+        if (pr.second.encoder) {
+            // 这两项是「现场到底用没用硬件 / 降了多少帧」的唯一可观测口径
+            st.encoder = pr.second.encoder->encoderName();
+            st.hardware = pr.second.encoder->isHardwareEncoder();
+            st.adapt_fps = pr.second.encoder->adaptFpsNow();
+            st.adapt_dropped = pr.second.encoder->adaptDropped();
+        }
         ret.emplace_back(st);
     }
     // 按 track index 排序，让接口输出稳定

@@ -223,6 +223,14 @@ public:
      * Empty string disables it. The filter must not change size or pixel format —
      * use video_scale / video_width for resizing.
      */
+    /** 实际选中的编码器名（如 libx265 / hevc_videotoolbox），未初始化时为空 */
+    std::string encoderName() const { return _codec && _codec->name ? _codec->name : ""; }
+    /** 是否走硬件编码器 */
+    bool isHardwareEncoder() const;
+    /** 负载自适应：当前生效帧率（0 表示未启用/未初始化）与已丢弃帧数 */
+    float adaptFpsNow() const { return _adapt_fps ? _adapt_fps_now : 0; }
+    int64_t adaptDropped() const { return _adapt_dropped; }
+
     void setVideoFilter(const std::string &desc) { _filter_desc = desc; }
 
     /**
