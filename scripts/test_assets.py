@@ -22,6 +22,9 @@ if not os.path.exists(FFMPEG):
 
 # 名称 -> 生成命令（-y 覆盖、-v error 只报错）
 ASSETS = {
+    # 注：所有视频素材都必须 -g 15（1 秒一个关键帧）。x264/x265 默认 GOP 是 250 帧，
+    # 15fps 下等于 16 秒才有下一个关键帧 —— 直播中途接入的测试必然报
+    # "Missing reference picture"，还会让时长测量提前结束（实测 5 秒只测到 4.64 秒）。
     # 320x240@15 + aac：绝大多数音频/视频用例的基础素材
     # 注意：必须 44100Hz **立体声**。原来手工造的素材是双声道，joint_accept 的
     # 声道数/音量断言依赖它；我第一次用默认 sine（单声道）生成，导致 5 项音频断言
@@ -29,44 +32,44 @@ ASSETS = {
     "/tmp/av_test.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=20 "
         "-f lavfi -i sine=frequency=440:sample_rate=44100:duration=20 "
-        "-c:v libx264 -preset ultrafast -b:v 400k -pix_fmt yuv420p "
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -b:v 400k -pix_fmt yuv420p "
         "-c:a aac -b:a 64k -ar 44100 -ac 2",
     # 640x360@15 H265：H265 源用例（反向转码、重连、硬件编码的 H264 目标）
     "/tmp/src_h265.mp4":
         "-f lavfi -i testsrc2=size=640x360:rate=15:duration=20 "
         "-f lavfi -i sine=frequency=440:duration=20 "
-        "-c:v libx265 -preset ultrafast -b:v 500k -c:a aac -b:a 64k",
+        "-c:v libx265 -preset ultrafast -g 15 -keyint_min 15 -b:v 500k -c:a aac -b:a 64k",
     # 1280x720@30 H264：缩放倍数、滤镜、自适应降帧、硬件编码基准
     "/tmp/src_1280x720.mp4":
         "-f lavfi -i testsrc2=size=1280x720:rate=30:duration=20 "
         "-f lavfi -i sine=frequency=440:duration=20 "
-        "-c:v libx264 -preset ultrafast -b:v 800k -pix_fmt yuv420p -c:a aac -b:a 64k",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -b:v 800k -pix_fmt yuv420p -c:a aac -b:a 64k",
     # 1920x1080@15：视频参数用例（高分辨率缩放/码率）
     "/tmp/src_1920x1080.mp4":
         "-f lavfi -i testsrc2=size=1920x1080:rate=15:duration=10 "
         "-f lavfi -i sine=frequency=440:duration=10 "
-        "-c:v libx264 -preset ultrafast -b:v 1500k -pix_fmt yuv420p -c:a aac -b:a 64k",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -b:v 1500k -pix_fmt yuv420p -c:a aac -b:a 64k",
     # 音频矩阵的 5 个采样率/声道源（audio_matrix_test 硬编码这些路径）
     "/tmp/src_s8k_m.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:sample_rate=8000:duration=12 "
-        "-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ar 8000 -ac 1",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -pix_fmt yuv420p -c:a aac -ar 8000 -ac 1",
     "/tmp/src_s16k_m.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:sample_rate=16000:duration=12 "
-        "-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ar 16000 -ac 1",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -pix_fmt yuv420p -c:a aac -ar 16000 -ac 1",
     "/tmp/src_s22k_s.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:sample_rate=22050:duration=12 "
-        "-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ar 22050 -ac 2",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -pix_fmt yuv420p -c:a aac -ar 22050 -ac 2",
     "/tmp/src_s44k_s.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:sample_rate=44100:duration=12 "
-        "-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ar 44100 -ac 2",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -pix_fmt yuv420p -c:a aac -ar 44100 -ac 2",
     "/tmp/src_s48k_s.mp4":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:sample_rate=48000:duration=12 "
-        "-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2",
 
     # logo 角标用例的素材（白底黑框，和之前手工造的一致）
     "/tmp/logo_wm.png":
@@ -77,12 +80,12 @@ ASSETS = {
     "/tmp/src_g711a.flv":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:duration=12 "
-        "-c:v libx264 -preset ultrafast -c:a pcm_alaw -ar 8000 -ac 1",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -c:a pcm_alaw -ar 8000 -ac 1",
     # MP3 作源
     "/tmp/src_mp3.flv":
         "-f lavfi -i testsrc2=size=320x240:rate=15:duration=12 "
         "-f lavfi -i sine=frequency=440:duration=12 "
-        "-c:v libx264 -preset ultrafast -c:a libmp3lame -ar 44100 -ac 2",
+        "-c:v libx264 -preset ultrafast -g 15 -keyint_min 15 -c:a libmp3lame -ar 44100 -ac 2",
 }
 
 
