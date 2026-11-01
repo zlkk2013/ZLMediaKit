@@ -77,3 +77,4 @@ config.adapt.ini
 config.hw.ini
 config.soak.ini
 config.multigpu.ini
+config.apiparams.ini

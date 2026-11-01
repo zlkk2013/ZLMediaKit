@@ -137,6 +137,9 @@ void writeOption(Json::Value &val, const TranscodeOption &option) {
     val["video_width"] = option.video_width;
     val["video_height"] = option.video_height;
     val["video_fps"] = option.video_fps;
+    // 静音兜底的两个参数也要回显：只解析不回显，运维「改了没」看不出来
+    val["enable_silence"] = option.enable_silence;
+    val["silence_timeout_ms"] = option.silence_timeout_ms;
     val["video_bitrate"] = option.video_bitrate;
     val["video_scale"] = option.video_scale;
     val["video_filter"] = option.video_filter;
@@ -334,6 +337,80 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         }
     }
 
+    // 视频帧率 / 码率：以前只有配置能设，API 只回显不解析 —— 调用方传了静默无效
+    // （正是「参数被静默忽略」那类坑）。这里补齐，接受长短两种写法。
+    bool video_extra_given = false;
+    {
+        auto fps_str = trim(argValue(args, "video_fps"));
+        if (fps_str.empty()) {
+            fps_str = trim(argValue(args, "fps"));
+        }
+        if (!fps_str.empty()) {
+            char *end = nullptr;
+            double v = ::strtod(fps_str.data(), &end);
+            if (end == fps_str.data() || *end != '\0' || v < 0 || v > 120) {
+                return makeError(kApiInvalidArgs, "invalid video_fps, must be 0 or 1~120");
+            }
+            option.video_fps = (float) v;
+            video_extra_given = true;
+        }
+        auto vbr = trim(argValue(args, "video_bitrate"));
+        if (!vbr.empty()) {
+            char *end = nullptr;
+            long v = ::strtol(vbr.data(), &end, 10);
+            if (end == vbr.data() || *end != '\0' || v < 0) {
+                return makeError(kApiInvalidArgs, "invalid video_bitrate, must be a non-negative integer");
+            }
+            option.video_bitrate = (int) v;
+            video_extra_given = true;
+        }
+    }
+
+    // logo 位置：配置键叫 video_logo_x/video_logo_y，API 用短名 logo_x/logo_y
+    {
+        auto lx = trim(argValue(args, "logo_x"));
+        auto ly = trim(argValue(args, "logo_y"));
+        auto set_pos = [](const string &raw, int *out) -> bool {
+            if (raw.empty()) {
+                return true;
+            }
+            char *end = nullptr;
+            long v = ::strtol(raw.data(), &end, 10);
+            if (end == raw.data() || *end != '\0') {
+                return false;
+            }
+            *out = (int) v;
+            return true;
+        };
+        if (!set_pos(lx, &option.video_logo_x) || !set_pos(ly, &option.video_logo_y)) {
+            return makeError(kApiInvalidArgs, "invalid logo_x/logo_y, must be integers");
+        }
+        if (!lx.empty() || !ly.empty()) {
+            video_extra_given = true;
+        }
+    }
+
+    // 静音兜底：enable_silence 开关 + silence_timeout_ms 判据
+    {
+        auto sret = parseBoolArg(args, "enable_silence", &option.enable_silence);
+        if (sret < 0) {
+            return makeError(kApiInvalidArgs, "invalid enable_silence, must be 0/1/true/false");
+        }
+        if (sret == 1) {
+            video_extra_given = true;
+        }
+        auto st = trim(argValue(args, "silence_timeout_ms"));
+        if (!st.empty()) {
+            video_extra_given = true;
+            char *end = nullptr;
+            long v = ::strtol(st.data(), &end, 10);
+            if (end == st.data() || *end != '\0' || v < 20 || v > 5000) {
+                return makeError(kApiInvalidArgs, "invalid silence_timeout_ms, must be 20~5000");
+            }
+            option.silence_timeout_ms = (int) v;
+        }
+    }
+
     // 负载自适应降帧：adapt_fps=1/0 开关，adapt_min_fps 下限
     bool adapt_given = false;
     {
@@ -461,7 +538,7 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
     // 一次都没给可执行参数 → 报错，别静默写一条什么也不做的覆盖
     if (!touched_codec && !enable_given && !on_demand_given && !bitrate_given && !sample_rate_given
         && !scale_given && !size_given && !filter_given && !logo_given && !adapt_given
-        && !hw_given) {
+        && !hw_given && !video_extra_given) {
         return makeError(kApiInvalidArgs,
                          "need at least one of audio_codec/video_codec/bitrate/sample_rate/on_demand/enable/scale/width/filter/logo/adapt_fps/hw");
     }
