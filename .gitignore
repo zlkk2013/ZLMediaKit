@@ -75,3 +75,4 @@ config.scale.ini
 config.filter.ini
 config.adapt.ini
 config.hw.ini
+config.soak.ini
