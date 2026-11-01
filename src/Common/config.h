@@ -661,31 +661,6 @@ extern const std::string kCustomHeader;
 extern const std::string kSchema;
 } // namespace Client
 #if defined(ENABLE_FFMPEG)
-// 转码配置（[transcode] 段）
-// Transcode config ([transcode] section)
-extern const std::string kTranscodeEnable;
-extern const std::string kTranscodeAudioCodec;
-extern const std::string kTranscodeVideoCodec;
-extern const std::string kTranscodeBitrate;
-extern const std::string kTranscodeSampleRate;
-extern const std::string kTranscodeOnDemand;
-extern const std::string kTranscodeEnableSilence;
-extern const std::string kTranscodeSilenceTimeoutMS;
-extern const std::string kTranscodeVideoWidth;
-extern const std::string kTranscodeVideoHeight;
-extern const std::string kTranscodeVideoFps;
-extern const std::string kTranscodeVideoBitrate;
-extern const std::string kTranscodeVideoScale;
-extern const std::string kTranscodeVideoFilter;
-extern const std::string kTranscodeVideoLogo;
-extern const std::string kTranscodeVideoLogoX;
-extern const std::string kTranscodeVideoLogoY;
-extern const std::string kTranscodeVideoLogoWidth;
-extern const std::string kTranscodeHwEncode;
-extern const std::string kTranscodeHwDecode;
-extern const std::string kTranscodeAdaptFps;
-extern const std::string kTranscodeAdaptMinFps;
-extern const std::string kTranscodeAdaptSelftestDelay;
 #endif//ENABLE_FFMPEG
 } // namespace mediakit
 

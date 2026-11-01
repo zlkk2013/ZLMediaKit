@@ -431,30 +431,6 @@ const string kCustomHeader = "custom_header";
 } // namespace Client
 
 #if defined(ENABLE_FFMPEG)
-#define TRANSCODE_FIELD "transcode."
-const string kTranscodeEnable = TRANSCODE_FIELD "enable";
-const string kTranscodeAudioCodec = TRANSCODE_FIELD "audio_codec";
-const string kTranscodeVideoCodec = TRANSCODE_FIELD "video_codec";
-const string kTranscodeBitrate = TRANSCODE_FIELD "bitrate";
-const string kTranscodeSampleRate = TRANSCODE_FIELD "sample_rate";
-const string kTranscodeOnDemand = TRANSCODE_FIELD "on_demand";
-const string kTranscodeEnableSilence = TRANSCODE_FIELD "enable_silence";
-const string kTranscodeSilenceTimeoutMS = TRANSCODE_FIELD "silence_timeout_ms";
-const string kTranscodeVideoWidth = TRANSCODE_FIELD "video_width";
-const string kTranscodeVideoHeight = TRANSCODE_FIELD "video_height";
-const string kTranscodeVideoFps = TRANSCODE_FIELD "video_fps";
-const string kTranscodeVideoBitrate = TRANSCODE_FIELD "video_bitrate";
-const string kTranscodeVideoScale = TRANSCODE_FIELD "video_scale";
-const string kTranscodeVideoFilter = TRANSCODE_FIELD "video_filter";
-const string kTranscodeVideoLogo = TRANSCODE_FIELD "video_logo";
-const string kTranscodeVideoLogoX = TRANSCODE_FIELD "video_logo_x";
-const string kTranscodeVideoLogoY = TRANSCODE_FIELD "video_logo_y";
-const string kTranscodeVideoLogoWidth = TRANSCODE_FIELD "video_logo_width";
-const string kTranscodeHwEncode = TRANSCODE_FIELD "hw_encode";
-const string kTranscodeHwDecode = TRANSCODE_FIELD "hw_decode";
-const string kTranscodeAdaptFps = TRANSCODE_FIELD "adapt_fps";
-const string kTranscodeAdaptMinFps = TRANSCODE_FIELD "adapt_min_fps";
-const string kTranscodeAdaptSelftestDelay = TRANSCODE_FIELD "adapt_selftest_delay_ms";
 
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷
@@ -462,22 +438,36 @@ static onceToken token([]() {
     // Defaults live in mINI so a config missing these keys still behaves
     // predictably and no "unknow config" warning is printed; must match
     // TranscodeOption
-    mINI::Instance()[kTranscodeEnable] = 0;
-    mINI::Instance()[kTranscodeAudioCodec] = "";
-    mINI::Instance()[kTranscodeVideoCodec] = "";
-    mINI::Instance()[kTranscodeBitrate] = 0;
-    mINI::Instance()[kTranscodeSampleRate] = 0;
-    mINI::Instance()[kTranscodeOnDemand] = 1;
+    mINI::Instance()["transcode.enable"] = 0;
+    mINI::Instance()["transcode.audio_codec"] = "";
+    mINI::Instance()["transcode.video_codec"] = "";
+    mINI::Instance()["transcode.bitrate"] = 0;
+    mINI::Instance()["transcode.sample_rate"] = 0;
+    mINI::Instance()["transcode.on_demand"] = 1;
     // 静音兜底默认开，200ms 断流即补帧
     // Silence fallback is on by default, padding after a 200ms stall
-    mINI::Instance()[kTranscodeEnableSilence] = 1;
-    mINI::Instance()[kTranscodeSilenceTimeoutMS] = 200;
+    mINI::Instance()["transcode.enable_silence"] = 1;
+    mINI::Instance()["transcode.silence_timeout_ms"] = 200;
     // 视频输出参数默认全部 0（跟随源），与未引入这些配置项时的行为一致
     // Video output params default to 0 (follow the source), matching earlier behavior
-    mINI::Instance()[kTranscodeVideoWidth] = 0;
-    mINI::Instance()[kTranscodeVideoHeight] = 0;
-    mINI::Instance()[kTranscodeVideoFps] = 0;
-    mINI::Instance()[kTranscodeVideoBitrate] = 0;
+    mINI::Instance()["transcode.video_width"] = 0;
+    mINI::Instance()["transcode.video_height"] = 0;
+    mINI::Instance()["transcode.video_fps"] = 0;
+    mINI::Instance()["transcode.video_bitrate"] = 0;
+    // 后续新增的键也在这里登记默认值，否则配置里不写就会报 "unknow config"
+    // Later keys are registered here too, otherwise a config without them logs
+    // "unknow config" warnings.
+    mINI::Instance()["transcode.video_scale"] = 0;
+    mINI::Instance()["transcode.video_filter"] = "";
+    mINI::Instance()["transcode.video_logo"] = "";
+    mINI::Instance()["transcode.video_logo_x"] = 10;
+    mINI::Instance()["transcode.video_logo_y"] = 10;
+    mINI::Instance()["transcode.video_logo_width"] = 0;
+    mINI::Instance()["transcode.hw_encode"] = 0;
+    mINI::Instance()["transcode.hw_decode"] = 0;
+    mINI::Instance()["transcode.adapt_fps"] = 0;
+    mINI::Instance()["transcode.adapt_min_fps"] = 5;
+    mINI::Instance()["transcode.adapt_selftest_delay_ms"] = 0;
 });
 
 #endif//ENABLE_FFMPEG

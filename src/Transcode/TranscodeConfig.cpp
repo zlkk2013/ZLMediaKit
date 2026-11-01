@@ -23,6 +23,36 @@
 using namespace std;
 using namespace toolkit;
 
+// 转码配置键：定义在本文件而不是上游 config.h/config.cpp —— 全仓只有这里引用它们，
+// 放在这儿能让上游文件的改动量最小，长期 rebase 冲突面更小。
+// Transcode keys live here (referenced only from this file) to keep the upstream
+// diff minimal.
+namespace {
+const std::string kTranscodeEnable = "transcode.enable";
+const std::string kTranscodeAudioCodec = "transcode.audio_codec";
+const std::string kTranscodeVideoCodec = "transcode.video_codec";
+const std::string kTranscodeBitrate = "transcode.bitrate";
+const std::string kTranscodeSampleRate = "transcode.sample_rate";
+const std::string kTranscodeOnDemand = "transcode.on_demand";
+const std::string kTranscodeEnableSilence = "transcode.enable_silence";
+const std::string kTranscodeSilenceTimeoutMS = "transcode.silence_timeout_ms";
+const std::string kTranscodeVideoWidth = "transcode.video_width";
+const std::string kTranscodeVideoHeight = "transcode.video_height";
+const std::string kTranscodeVideoFps = "transcode.video_fps";
+const std::string kTranscodeVideoBitrate = "transcode.video_bitrate";
+const std::string kTranscodeVideoScale = "transcode.video_scale";
+const std::string kTranscodeVideoFilter = "transcode.video_filter";
+const std::string kTranscodeVideoLogo = "transcode.video_logo";
+const std::string kTranscodeVideoLogoX = "transcode.video_logo_x";
+const std::string kTranscodeVideoLogoY = "transcode.video_logo_y";
+const std::string kTranscodeVideoLogoWidth = "transcode.video_logo_width";
+const std::string kTranscodeHwEncode = "transcode.hw_encode";
+const std::string kTranscodeHwDecode = "transcode.hw_decode";
+const std::string kTranscodeAdaptFps = "transcode.adapt_fps";
+const std::string kTranscodeAdaptMinFps = "transcode.adapt_min_fps";
+const std::string kTranscodeAdaptSelftestDelay = "transcode.adapt_selftest_delay_ms";
+}
+
 namespace mediakit {
 
 // ─────────────────────────────────────────────────────────────────────────────
