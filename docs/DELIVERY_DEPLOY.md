@@ -37,22 +37,21 @@ sudo apt install -y pkg-config cmake build-essential \
   libx264-dev libx265-dev libopus-dev libmp3lame-dev libvpx-dev
 ```
 
-### ⚠️ ffmpeg 版本下限：5.1（实测）
+### ffmpeg 版本：4.4 与 7.1 都已实测（两套 API 均有分支）
 
-本仓的转码代码用了 ffmpeg 5.1 引入的 `AVChannelLayout`（`ch_layout`，33 处引用）。
-**Ubuntu 22.04 / Debian 12 的 apt 源里是 ffmpeg 4.4，只有 `channel_layout`，直接编译失败**：
+本仓沿用 ZLM 既有的版本开关 `FF_CODEC_VER_7_1`，把 `ch_layout`（新）与
+`channel_layout`（旧）两套声道布局 API 各写一份。实测结论：
 
-```
-error: 'const AVFrame' has no member named 'ch_layout'; did you mean 'channel_layout'?
-```
+| ffmpeg | 编译 | 转码实测 |
+|---|---|---|
+| **4.4**（Ubuntu 22.04 / Debian 12 的 apt 源） | ✅ 0 错误 | ✅ H264→H265（298 帧/输入 297）+ AAC→Opus，拉流 `hevc,1280,720 \| opus` |
+| **7.1**（conda-forge / macOS） | ✅ | ✅ 全量回归 15 套 336 断言 |
 
-在 NVIDIA 机器上实测踩到（WSL Ubuntu 22.04 + RTX 5060 Ti）。两条路：
+所以 **Ubuntu 22.04 直接 `apt install libav*-dev` 就能编**，不需要额外装新版本。
 
-1. **装新 ffmpeg（推荐）**：conda-forge 的 `ffmpeg=7.*`，见下面的 conda 段；
-2. 若必须用系统包，选 ffmpeg ≥ 5.1 的发行版/源（如 Ubuntu 24.04 的 6.1）。
-
-长期计划是给这 33 处加 `LIBAVUTIL_VERSION_INT` 版本分支，让 4.4 也能编；在此之前
-交付文档按「≥ 5.1」执行。
+> 注意：系统 ffmpeg 4.4 **不带 NVENC**（Ubuntu 的构建没编 nvenc）。要硬件编码请用
+> conda-forge 的 ffmpeg 7.x（它带 `h264_nvenc`/`hevc_nvenc`/`av1_nvenc`），或自行编译
+> 带 `--enable-nvenc` 的 ffmpeg。软件编解码用系统包即可。
 
 conda（推荐，版本自洽，macOS 上几乎必用）：
 

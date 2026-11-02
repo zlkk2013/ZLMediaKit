@@ -140,8 +140,9 @@ WSL 调度喂不满。换句话说，**转码本身的余量还没用尽**：GPU
 
 ## 未完成
 
-- **ffmpeg 4.4 兼容**：本仓代码用了 5.1+ 的 `ch_layout`（33 处），Ubuntu 22.04 自带的
-  4.4 编不过 —— 客户直接 `apt install libav*-dev` 会失败。交付文档已改为要求 ffmpeg ≥ 5.1，
-  长期方案是加版本分支。
+- ~~**ffmpeg 4.4 兼容**~~ —— 已解决：按 ZLM 既有的 `FF_CODEC_VER_7_1` 开关给
+  `ch_layout`/`channel_layout` 两套 API 各写一份，在本机（WSL Ubuntu 22.04，系统 ffmpeg 4.4）
+  编译 0 错误，并实测转码成功（H264→H265 + AAC→Opus，拉流 `hevc,1280,720 | opus`）。
+  注意系统 4.4 不带 NVENC，硬件编码仍需 conda-forge 的 7.x。
 - 裸机 Linux 的容量未测（本组数字来自 WSL，内存仅 5.8GB）。
 - Windows 原生（MSVC）与 VAAPI 仍未验证/未接入。
