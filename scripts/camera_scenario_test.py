@@ -132,8 +132,23 @@ def packets(stream, secs=5):
     return 0
 
 def hard_errors(stream, secs=4):
-    r = sh(f"ffmpeg -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
-           f"-t {secs} -f null - 2>&1", timeout=secs + 40)
+    """拉流解码并数硬错误。宿主机被压满时拉流会饿死到超时 —— 重试一次，
+    仍超时则返回一条可读的失败而不是抛 traceback（实测踩过：整轮回归因此判红，
+    日志里只有 TimeoutExpired，看不出是哪条断言）。
+
+    Pull and count hard errors. Retry once on timeout; if it still times out report a
+    readable failure instead of raising — a traceback hides which assertion failed.
+    """
+    r = None
+    for attempt in range(2):
+        try:
+            r = sh(f"ffmpeg -v error -rtsp_transport tcp -i rtsp://127.0.0.1:{RTSP}/live/{stream} "
+                   f"-t {secs} -f null - 2>&1", timeout=secs + 40)
+            break
+        except subprocess.TimeoutExpired:
+            print(f"    (拉流超时，重试 {attempt + 1}/2，负载 {os.getloadavg()[0]:.2f})")
+    if r is None:
+        return 1, [f"拉流 {secs}s 两次都超时（负载 {os.getloadavg()[0]:.2f}）"]
     lines = [l for l in r.stdout.splitlines() if l.strip()]
     hard = [l for l in lines if "monoton" not in l]
     return len(hard), hard[:2]
