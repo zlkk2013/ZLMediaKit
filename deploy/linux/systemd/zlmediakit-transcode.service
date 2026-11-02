@@ -1,0 +1,22 @@
+[Unit]
+Description=ZLMediaKit MediaServer (transcode build)
+Documentation=https://github.com/zlkk2013/ZLMediaKit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PREFIX@
+ExecStart=@PREFIX@/bin/MediaServer -c @CONFIG@ -l 1
+Restart=on-failure
+RestartSec=3
+# 转码是 CPU/GPU 密集型：给足文件句柄，避免大量观众时打不开 socket
+LimitNOFILE=65535
+
+# 安全加固（若杀死了服务再逐条放宽，不要整段删）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
