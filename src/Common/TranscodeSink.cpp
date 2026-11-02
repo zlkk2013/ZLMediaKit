@@ -171,7 +171,12 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
                               ? pr.second.target_track->getCodecId()
                               : pr.second.source_codec;
         st.transcoding = pr.second.transcoding;
-        st.frames = pr.second.frame_count;
+        // 用编码器的「包=帧」计数，而不是 NAL 级回调计数（后者虚高约 2.2 倍）。
+        // Use the encoder's packet-level count, not the per-NAL callback count.
+        st.frames = pr.second.encoder ? (size_t) pr.second.encoder->encodedFrames()
+                                      : pr.second.frame_count;
+        // 输入帧数：让运维/容量测试能区分「源没喂满」与「编码跟不上」
+        st.input_frames = pr.second.in_frames;
         st.silence = pr.second.silence_count;
         if (pr.second.decoder) {
             st.hw_decode = pr.second.decoder->hardwareDecoding();
@@ -566,7 +571,14 @@ void TranscodeSink::onDecoded(int index, const FFmpegFrame::Ptr &frame) {
         }
         encoder = it->second.encoder;
     }
-    // 编码一律同步：保证输出帧序与输入一致  [AUTO-TRANSLATED:8a2f4c19]
+    {
+        lock_guard<mutex> lck(_mtx);
+        auto it = _contexts.find(index);
+        if (it != _contexts.end()) {
+            ++it->second.in_frames;
+        }
+    }
+    // 编码一律同步：保证输出帧序与输入一致
     encoder->inputFrame(frame, false);
 }
 

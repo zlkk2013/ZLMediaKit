@@ -1818,6 +1818,12 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     if (!_cb || !packet || packet->size <= 0) {
         return;
     }
+    // 一个 AVPacket = 一帧（视频/音频同理）。这是「真实帧数」的唯一准确位置：
+    // 再往下会被拆成多个 NAL 分别回调（x265 每帧 AUD+VCL，IDR 还有 VPS/SPS/PPS），
+    // 在 NAL 级计数会虚高约 2.2 倍。
+    // One AVPacket is one frame. This is the only accurate place to count: further down
+    // the packet is split into NALs (AUD+VCL per frame, VPS/SPS/PPS per IDR).
+    ++_encoded_frames;
 
     // 不依赖 ffmpeg 输出的 pts/dts：编码器的 time_base 与 ZLM 的毫秒体系不同，
     // 换算后仍可能出现负值或跳变。这里用自维护的毫秒时钟，每帧按固定间隔推进一步，

@@ -239,6 +239,8 @@ public:
         float adapt_fps = 0;
         /** 因过载被丢弃的帧数 */
         int64_t adapt_dropped = 0;
+        /** 解码后送进编码器的输入帧数：与 frames 一起看能区分「输入不够」与「编码跟不上」 */
+        size_t input_frames = 0;
         /** 已补出的静音帧数（仅音频） */
         size_t silence = 0;
         /** 解码是否真的走了硬件（依据：有过硬件帧下载），以及该类帧计数 */
@@ -262,6 +264,8 @@ private:
         std::shared_ptr<FFmpegDecoder> decoder;
         std::shared_ptr<FFmpegEncoder> encoder;
         size_t frame_count = 0;
+        /** 解码后送进编码器的输入帧数（据此判断「编码是否跟得上输入」） */
+        size_t in_frames = 0;
         /** 已补出的静音帧数 */
         size_t silence_count = 0;
         /** 分配到的硬件设备号（-1 未指定） */

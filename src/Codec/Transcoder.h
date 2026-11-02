@@ -258,6 +258,17 @@ public:
     std::string encoderName() const { return _codec && _codec->name ? _codec->name : ""; }
     /** 是否走硬件编码器 */
     bool isHardwareEncoder() const;
+
+    /**
+     * 已编码的**帧**数（一个 AVPacket 算一帧，音频同理）。
+     *
+     * 不要用 NAL 级回调计数：视频在 NAL 拆分后才逐 NAL 回调，x265 每帧带 AUD+VCL、
+     * IDR 再加 VPS/SPS/PPS ⇒ NAL 数约为帧数的 2.2 倍（实测服务端 63fps vs 真实 27fps）。
+     *
+     * Encoded frame count (one AVPacket = one frame). Counting at the NAL level
+     * over-reports ~2.2x because x265 emits AUD+VCL per frame and VPS/SPS/PPS per IDR.
+     */
+    int64_t encodedFrames() const { return _encoded_frames; }
     /** 负载自适应：当前生效帧率（0 表示未启用/未初始化）与已丢弃帧数 */
     float adaptFpsNow() const { return _adapt_fps ? _adapt_fps_now : 0; }
     int64_t adaptDropped() const { return _adapt_dropped; }
@@ -354,6 +365,7 @@ public:
 
 private:
     void onEncode(AVPacket *packet);
+
     bool encodeFrame(AVFrame *frame);
     bool encodeAudio_l(AVFrame *converted);
     /** 音频切帧长度（采样数），编码与静音补帧共用；见实现处注释 */
@@ -456,6 +468,8 @@ private:
     int64_t _next_pts_ms = 0;
     /** 每帧时间步进（毫秒），0 表示按编码器 frame_size/fps 推算 */
     int64_t _frame_interval_ms = 0;
+    /** 已编码帧数（一个包一帧） */
+    int64_t _encoded_frames = 0;
     /** 输出帧的 Annex-B 起始码长度，0 表示未知（由 onEncode 探测） */
     size_t _nalu_prefix_size = 0;
     /** 视频帧率，0 表示未设置（回退到编码器默认） */

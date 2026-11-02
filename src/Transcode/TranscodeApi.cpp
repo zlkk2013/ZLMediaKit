@@ -666,6 +666,7 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             track["hw_decode"] = st.hw_decode;
             track["hw_decode_frames"] = (Json::Int64) st.hw_decode_frames;
             track["hw_device"] = st.hw_device;
+            track["input_frames"] = (Json::Int64) st.input_frames;
             val["tracks"].append(track);
         }
     } else if (online) {
