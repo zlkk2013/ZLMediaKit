@@ -18,8 +18,44 @@ IS_LINUX = sys.platform.startswith("linux")
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class _TimeoutResult:
+    """超时后的替代结果：调用方拿到的 stdout 里带标记，断言自然失败而不是抛异常。
+
+    A stand-in result after a timeout. stdout carries a marker so assertions fail with
+    evidence instead of crashing with AttributeError on None.
+    """
+
+    def __init__(self, cmd, timeout):
+        self.args = cmd
+        self.returncode = -9
+        self.stdout = f"__COMMAND_TIMEOUT__ after {timeout}s: {cmd}\n"
+        self.stderr = self.stdout
+
+
+def sh_retry(cmd, timeout=120, attempts=2):
+    """跑外部命令：超时重试 attempts 次；仍失败则返回带标记的结果（**不抛异常**）。
+
+    为什么：脚本里到处是 `r = sh(...)` 然后 `r.stdout`。宿主负载高时 ffmpeg 拉流会超时，
+    subprocess 抛 TimeoutExpired，异常一路冒到顶层 —— 整轮回归判红，日志里只有 traceback，
+    看不到是哪条断言，也分不清是产品问题还是环境问题（这个坑连踩三次）。
+    统一在这里兜住：重试，仍超时就返回带 ``__COMMAND_TIMEOUT__`` 的结果，
+    数错误的断言会把它算成 1 条，判据自然红且带证据。
+
+    Run an external command with retries. On repeated timeout return a marker result
+    instead of raising: assertions then fail with evidence rather than a traceback.
+    """
+    for attempt in range(attempts):
+        try:
+            return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                  timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < attempts:
+                print(f"    (命令超时，重试 {attempt + 1}/{attempts - 1}：{cmd[:60]})")
+    return _TimeoutResult(cmd, timeout)
+
+
 def sh(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return sh_retry(cmd, timeout)
 
 
 def bin_path():

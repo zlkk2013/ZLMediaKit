@@ -10,7 +10,7 @@ API 覆盖 / 按流规则 / 视频参数 / 音频 codec / 静音兜底 / 双轨�
 import json, os, re, signal, subprocess, sys, time, urllib.parse, urllib.request
 
 WT = "/Users/zhanglei/ZLMediaKit"
-from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir, sh_retry as _sh_retry
 BIN = _bin_path()
 BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
@@ -32,7 +32,7 @@ def knote(name, detail=""):
     print(f"  [KNOWN] {name}" + (f"  {detail}" if detail else ""))
 
 def sh(cmd, timeout=60):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 def api(path, **params):
     params.setdefault("secret", SECRET)

@@ -22,6 +22,7 @@
   python3 scripts/rtsp_repush_check.py --tag base_h264 --src /tmp/src_h264.mp4 --enable 0
 """
 import argparse, json, os, re, signal, socket, subprocess, sys, time
+from _platshim import sh_retry as _sh_retry
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CFG = f"{WT}/config.av.ini"
@@ -40,7 +41,7 @@ def note(ok, name, detail=""):
 
 
 def sh(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def lpid(port):

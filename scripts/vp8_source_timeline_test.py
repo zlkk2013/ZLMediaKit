@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir, sh_retry as _sh_retry
 BIN = _bin_path()
 BIN_DIR = _bin_dir()
 CFG = "/tmp/zlm_vp8_timeline.ini"  # 放 /tmp，避免污染工作区
@@ -70,7 +70,7 @@ CASES = [
 
 
 def sh(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def listener_pid(port):

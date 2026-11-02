@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir, sh_retry as _sh_retry
 BIN = _bin_path()
 BIN_DIR = _bin_dir()
 CFG = f"{WT}/config.codec_matrix.ini"
@@ -37,7 +37,7 @@ SOURCES = [
 
 
 def sh(cmd, timeout=90):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def lpid(port):

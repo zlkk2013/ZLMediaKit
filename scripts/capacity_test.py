@@ -30,7 +30,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _platshim import (bin_path, bin_dir, pid_on_port, rss_kb, gpu_count, gpu_name,
-                       supports_device_selection, kill_group, load_avg, ncpu, nvidia_smi)
+                       supports_device_selection, kill_group, load_avg, ncpu, nvidia_smi, sh_retry as _sh_retry)
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN, BIN_DIR = bin_path(), bin_dir()
@@ -58,7 +58,7 @@ def note(ok, name, detail=""):
 
 
 def sh(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def api(path, **kw):

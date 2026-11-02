@@ -20,6 +20,7 @@ direct-proxy 会把源 RTP 原样透传给观众，转码输出根本到不了�
       --video "" --audio "" --enable 0 --framemd5 /tmp/base.fmd5
 """
 import argparse, json, os, re, signal, socket, subprocess, sys, time
+from _platshim import sh_retry as _sh_retry
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CFG = f"{WT}/config.av.ini"
@@ -42,7 +43,7 @@ def note(ok, name, detail=""):
 
 
 def sh(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def lpid(port):

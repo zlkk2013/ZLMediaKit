@@ -14,7 +14,7 @@
 import json, os, signal, subprocess, sys, time
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir, sh_retry as _sh_retry
 BIN = _bin_path()
 BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
@@ -24,7 +24,7 @@ ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 
 
 def sh(cmd, timeout=60):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def lpid(port):

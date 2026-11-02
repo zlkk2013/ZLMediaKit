@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 
 from _platshim import (pid_on_port as _pid_on_port, fd_count as _fd_count,
-                       thread_count as _thread_count)
+                       thread_count as _thread_count, sh_retry as _sh_retry)
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
@@ -56,7 +56,7 @@ def note(ok, name, detail=""):
 
 
 def sh(cmd, timeout=90):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 
 def lpid(port):

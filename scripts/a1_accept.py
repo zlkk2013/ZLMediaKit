@@ -10,7 +10,7 @@
 import json, os, re, signal, subprocess, sys, time
 
 WT = "/Users/zhanglei/zlm-wt/a1"
-from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir, sh_retry as _sh_retry
 BIN = _bin_path()
 BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.av.ini"
@@ -33,7 +33,7 @@ def note(ok, name, detail=""):
     print(f"  {'[PASS]' if ok else '[FAIL]'} {name}" + (f"  {detail}" if detail else ""))
 
 def sh(cmd, timeout=60):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return _sh_retry(cmd, timeout)
 
 def listening_pid(port):
     out = sh(f"/usr/sbin/lsof -nP -tiTCP:{port} -sTCP:LISTEN").stdout.strip().split()
