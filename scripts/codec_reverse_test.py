@@ -13,7 +13,9 @@
 import json, os, re, signal, subprocess, sys, time
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.reverse.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
@@ -71,7 +73,7 @@ def kill_all():
 def start(tag):
     kill_all()
     open(LOG, "w").close()
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "a"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)

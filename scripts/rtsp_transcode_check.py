@@ -288,7 +288,7 @@ def run_once(a, stream):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default=f"{WT}/release/darwin/Release/MediaServer")
+    ap.add_argument("--bin", default=f"{BIN_DIR}/MediaServer")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--src", required=True)
     ap.add_argument("--video", default="")

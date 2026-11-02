@@ -18,6 +18,8 @@
 #include "Util/util.h"
 #include <algorithm>
 #include <climits>
+#include <cstdio>
+#include <dirent.h>
 #include <cstdint>
 #include <cstdlib>
 #include <set>
@@ -430,6 +432,69 @@ TranscodeRuntime &TranscodeRuntime::instance() {
     return s_instance;
 }
 
+/**
+ * 本机实际有多少张 NVIDIA 卡。
+ *
+ * 为什么需要：`hw_devices="0,1"` 是运维写的声明，**不等于机器真有 2 张卡**。
+ * 单卡机器上分配器若把某路分给 1 号卡，nvenc 会把越界索引当默认卡用（照样能跑），
+ * 但状态接口报出一个不存在的卡号 —— 运维据此以为在用第二张卡（实测踩过）。
+ * 检测不到（例如某些容器）时返回 0，表示「不做收敛，按声明来」。
+ *
+ * How many NVIDIA GPUs actually exist. A declared `hw_devices="0,1"` is not proof of two
+ * cards: handing out a non-existent index silently binds to the default GPU while the
+ * status API reports a card that isn't there. Returns 0 when detection is unavailable.
+ */
+static int availableGpuCount() {
+    static int cached = []() -> int {
+#if defined(__linux__)
+        // 首选 /proc：不产生子进程
+        {
+            DIR *dir = opendir("/proc/driver/nvidia/gpus");
+            if (dir) {
+                int n = 0;
+                while (auto *e = readdir(dir)) {
+                    if (e->d_name[0] != '.') {
+                        ++n;
+                    }
+                }
+                closedir(dir);
+                if (n > 0) {
+                    return n;
+                }
+            }
+        }
+        // 回退 nvidia-smi（WSL 里没有 /proc/driver/nvidia/gpus，但 nvidia-smi 可用）。
+        // 必须试绝对路径：WSL 把 nvidia-smi 装在 /usr/lib/wsl/lib，服务的 PATH 里没有，
+        // 只写 `nvidia-smi` 会静默失败 → 卡数当 0 → 不做收敛（实测踩过）。
+        // Absolute paths matter: WSL keeps nvidia-smi in /usr/lib/wsl/lib, which is not on
+        // the server's PATH; a bare name fails silently and detection reports 0 GPUs.
+        static const char *kSmi[] = {"nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi",
+                                     "/usr/bin/nvidia-smi",
+                                     "/usr/local/nvidia/bin/nvidia-smi"};
+        for (auto *smi : kSmi) {
+            string cmd = string(smi) + " -L 2>/dev/null";
+            auto *fp = popen(cmd.data(), "r");
+            if (!fp) {
+                continue;
+            }
+            char buf[256];
+            int n = 0;
+            while (fgets(buf, sizeof(buf), fp)) {
+                if (strstr(buf, "GPU ")) {
+                    ++n;
+                }
+            }
+            pclose(fp);
+            if (n > 0) {
+                return n;
+            }
+        }
+#endif
+        return 0;
+    }();
+    return cached;
+}
+
 int TranscodeRuntime::pickDevice(const std::string &stream_key, const std::string &devices) {
     if (devices.empty()) {
         return -1;
@@ -441,6 +506,7 @@ int TranscodeRuntime::pickDevice(const std::string &stream_key, const std::strin
         return it->second;
     }
     // 解析 "0,1" 这类列表，挑在跑路数最少的那个；同负载取序号小的，保证可预测
+    const int gpu_total = availableGpuCount();
     int best = -1;
     int best_load = INT32_MAX;
     for (auto &part : split(devices, ",")) {
@@ -451,6 +517,12 @@ int TranscodeRuntime::pickDevice(const std::string &stream_key, const std::strin
         char *end = nullptr;
         long id = ::strtol(str.data(), &end, 10);
         if (end == str.data() || id < 0) {
+            continue;
+        }
+        if (gpu_total > 0 && id >= gpu_total) {
+            // 声明了机器上不存在的卡：跳过，别把流分到幻觉设备上
+            WarnL << "hw_devices 里声明的设备 " << id << " 不存在（本机 " << gpu_total
+                  << " 张卡），已跳过";
             continue;
         }
         int load = _device_load.count((int) id) ? _device_load[(int) id] : 0;

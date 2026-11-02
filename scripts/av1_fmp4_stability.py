@@ -14,7 +14,9 @@
 import json, os, signal, subprocess, sys, time
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.av1stab.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
@@ -64,7 +66,7 @@ for n in range(ROUNDS):
         if pid:
             sh(f"kill -9 {pid}"); time.sleep(0.4)
     log = f"/tmp/av1stab_{n}.log"
-    srv = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    srv = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                            stdout=open(log, "w"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     time.sleep(3.5)
     pr = subprocess.Popen(["ffmpeg", "-re", "-stream_loop", "-1", "-i", "/tmp/av_test.mp4",

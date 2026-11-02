@@ -10,7 +10,9 @@
 import json, os, re, signal, subprocess, sys, time
 
 WT = "/Users/zhanglei/zlm-wt/a1"
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.av.ini"
 CFG = f"{WT}/config.a1test.ini"
 HTTP, RTMP, RTSP = 54080, 51900, 51554
@@ -63,7 +65,7 @@ def start_server(tag, audio, sample_rate=0):
     kill_all()
     make_cfg(audio, sample_rate)
     open(LOG, "w").close()
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "a"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)

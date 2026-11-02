@@ -173,7 +173,6 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
         st.transcoding = pr.second.transcoding;
         st.frames = pr.second.frame_count;
         st.silence = pr.second.silence_count;
-        st.hw_device = pr.second.hw_device;
         if (pr.second.decoder) {
             st.hw_decode = pr.second.decoder->hardwareDecoding();
             st.hw_decode_frames = pr.second.decoder->hardwareFrames();
@@ -185,6 +184,12 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
             st.adapt_fps = pr.second.encoder->adaptFpsNow();
             st.adapt_dropped = pr.second.encoder->adaptDropped();
         }
+        // 必须在 st.hardware 定下来之后再算：硬件没真用上（回落软件）就别报设备号，
+        // 报 -1 才是事实。之前这行放在 st.hardware 赋值之前，于是永远读到默认 false →
+        // 恒报 -1（实测：分配日志 picked=0，接口却报 -1）。
+        // Must run AFTER st.hardware is known — computing it earlier read the default
+        // (false) and always reported -1 while the log said picked=0.
+        st.hw_device = st.hardware ? pr.second.hw_device : -1;
         ret.emplace_back(st);
     }
     // 按 track index 排序，让接口输出稳定
@@ -359,6 +364,9 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
             }
             video_params.device = dev;
             ctx.hw_device = dev;
+            InfoL << "transcode multi-gpu: hw_devices='" << _option.hw_devices
+                  << "', pinned=" << _option.hw_device << ", picked=" << dev
+                  << ", stream=" << streamLabel();
         }
         ctx.encoder = std::make_shared<FFmpegEncoder>(target, 0, src_fps,
                                                       is_audio ? nullptr : track,

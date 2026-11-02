@@ -106,6 +106,62 @@ static bool checkIfSupportedNvidia() {
     return ret;
 }
 
+/**
+ * Intel QSV 是否可用。
+ *
+ * 上游的候选列表把 h264_qsv/hevc_qsv 排在软件解码之前，却**不检查设备是否存在**。
+ * 只要 ffmpeg 编译时带了 QSV（conda-forge、Ubuntu 的 ffmpeg 都带），在没有 Intel
+ * 核显的机器上也会选中 qsv：`avcodec_open2` 返回成功，但每个包都
+ * `avcodec_send_packet failed: Unknown error`，整条流一个帧都出不来，拉流端超时。
+ * 实测（Ubuntu 22.04 + NVIDIA 独显）就撞上了这个。
+ *
+ * Whether Intel QSV is actually available. Upstream puts h264_qsv/hevc_qsv ahead of
+ * software decoders without checking the device: on a machine with no Intel iGPU but an
+ * ffmpeg built with QSV support, open2 "succeeds" and then every packet fails with
+ * `avcodec_send_packet failed: Unknown error` — no frames at all, viewers time out.
+ */
+static bool checkIfSupportedQsv_l() {
+#if defined(__linux__)
+    // 不能只看 /dev/dri 是否存在：WSL2 的 GPU 直通同样会建 card0/renderD128，
+    // 但那是 NVIDIA 卡，qsv 照样打不开（实测：open2 成功、每个包 send 失败）。
+    // 唯一可靠判据是 sysfs 里的 PCI vendor —— 只有 0x8086 才是 Intel。
+    //
+    // Do not rely on /dev/dri existing: WSL2's GPU passthrough also creates
+    // card0/renderD128 for an NVIDIA card, and qsv still fails there. Only the PCI
+    // vendor id in sysfs (0x8086) positively identifies an Intel GPU.
+    bool intel = false;
+    for (int i = 0; i < 8; ++i) {
+        auto path = "/sys/class/drm/card" + std::to_string(i) + "/device/vendor";
+        std::ifstream ifs(path);
+        if (!ifs.good()) {
+            continue;
+        }
+        string vendor;
+        ifs >> vendor;
+        if (vendor.find("0x8086") != string::npos) {
+            intel = true;
+            break;
+        }
+    }
+    if (!intel) {
+        WarnL << "未检测到 Intel 显卡（sysfs vendor 0x8086），跳过 qsv 解码器";
+    }
+    return intel;
+#else
+    // 其它平台维持上游行为，不做额外假设
+    return true;
+#endif
+}
+
+static bool checkIfSupportedQsv() {
+    static auto ret = checkIfSupportedQsv_l();
+    return ret;
+}
+/** CodecName 是否指向 qsv 硬件解码器（用于「设备不存在时跳过」） */
+static inline bool isQsvCodecName(const char *name) {
+    return name && strstr(name, "_qsv");
+}
+
 //////////////////////////////////////////////////////////////////////////////////////////
 
 bool TaskManager::addEncodeTask(function<void()> task) {
@@ -297,12 +353,33 @@ public:
         return getCodec_l<decoder>(_id);
     }
 
+    /** 是否指向 qsv 解码器（无 Intel 设备时要跳过，见 checkIfSupportedQsv_l） */
+    bool isQsv() const { return !_codec_name.empty() && _codec_name.find("_qsv") != string::npos; }
+
 private:
     string _codec_name;
     enum AVCodecID _id;
 };
 
-template <bool decoder = true>
+/** 同 getCodec，但没有 Intel 设备时跳过 qsv 候选（否则会选到打不开的实现） */
+template<bool decoder = true>
+static inline const AVCodec *getCodecFiltered(const std::initializer_list<CodecName> &codec_list) {
+    const AVCodec *ret = nullptr;
+    bool skip_qsv = !checkIfSupportedQsv();
+    for (int i = codec_list.size(); i >= 1; --i) {
+        const auto &item = codec_list.begin()[i - 1];
+        if (skip_qsv && item.isQsv()) {
+            continue;
+        }
+        ret = item.getCodec<decoder>();
+        if (ret) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
+template<bool decoder = true>
 static inline const AVCodec *getCodec(const std::initializer_list<CodecName> &codec_list) {
     const AVCodec *ret = nullptr;
     for (int i = codec_list.size(); i >= 1; --i) {
@@ -363,9 +440,9 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
                 break;
             }
             if (checkIfSupportedNvidia()) {
-                codec = getCodec({{"libopenh264"}, {AV_CODEC_ID_H264}, {"h264_qsv"}, {"h264_videotoolbox"}, {"h264_cuvid"}, {"h264_nvmpi"}});
+                codec = getCodecFiltered({{"libopenh264"}, {AV_CODEC_ID_H264}, {"h264_qsv"}, {"h264_videotoolbox"}, {"h264_cuvid"}, {"h264_nvmpi"}});
             } else {
-                codec = getCodec({{"libopenh264"}, {AV_CODEC_ID_H264}, {"h264_qsv"}, {"h264_videotoolbox"}, {"h264_nvmpi"}});
+                codec = getCodecFiltered({{"libopenh264"}, {AV_CODEC_ID_H264}, {"h264_qsv"}, {"h264_videotoolbox"}, {"h264_nvmpi"}});
             }
             break;
         case CodecH265:
@@ -374,9 +451,9 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
                 break;
             }
             if (checkIfSupportedNvidia()) {
-                codec = getCodec({{AV_CODEC_ID_HEVC}, {"hevc_qsv"}, {"hevc_videotoolbox"}, {"hevc_cuvid"}, {"hevc_nvmpi"}});
+                codec = getCodecFiltered({{AV_CODEC_ID_HEVC}, {"hevc_qsv"}, {"hevc_videotoolbox"}, {"hevc_cuvid"}, {"hevc_nvmpi"}});
             } else {
-                codec = getCodec({{AV_CODEC_ID_HEVC}, {"hevc_qsv"}, {"hevc_videotoolbox"}, {"hevc_nvmpi"}});
+                codec = getCodecFiltered({{AV_CODEC_ID_HEVC}, {"hevc_qsv"}, {"hevc_videotoolbox"}, {"hevc_nvmpi"}});
             }
             break;
         case CodecAAC:

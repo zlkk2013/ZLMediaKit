@@ -29,8 +29,13 @@ import time
 import urllib.parse
 import urllib.request
 
+from _platshim import (pid_on_port as _pid_on_port, fd_count as _fd_count,
+                       thread_count as _thread_count)
+
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.soak.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
@@ -55,8 +60,7 @@ def sh(cmd, timeout=90):
 
 
 def lpid(port):
-    out = sh(f"/usr/sbin/lsof -nP -tiTCP:{port} -sTCP:LISTEN").stdout.split()
-    return int(out[0]) if out else None
+    return _pid_on_port(port)
 
 
 def api(path, timeout=3, **kw):
@@ -77,12 +81,11 @@ def rss_kb(pid):
 
 
 def fd_count(pid):
-    return int(sh(f"/usr/sbin/lsof -p {pid} 2>/dev/null | wc -l").stdout.strip() or 0)
+    return _fd_count(pid)
 
 
 def thread_count(pid):
-    out = sh(f"ps -M -p {pid} 2>/dev/null | wc -l").stdout.strip()
-    return int(out) if out.isdigit() else None
+    return _thread_count(pid)
 
 
 def our_sources():
@@ -128,7 +131,7 @@ def start():
         if pid:
             sh(f"kill -9 {pid}")
             time.sleep(0.6)
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
                          preexec_fn=os.setsid)
     for _ in range(60):

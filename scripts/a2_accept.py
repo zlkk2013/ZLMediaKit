@@ -7,7 +7,9 @@
 import json, os, signal, subprocess, sys, time, urllib.request
 
 WT = "/Users/zhanglei/zlm-wt/a2"
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.av.ini"
 CFG = f"{WT}/config.a2test.ini"
 SECRET = "5j9gfMmxP1l7Ox1lrhUm1l3SsWA5dz4z"
@@ -67,7 +69,7 @@ def kill_all():
 def start_server(tag, expect):
     kill_all()
     open(LOG, "w").close()
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "a"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)

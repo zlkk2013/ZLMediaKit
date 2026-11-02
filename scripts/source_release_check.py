@@ -21,7 +21,9 @@
 import json, os, signal, subprocess, sys, time, urllib.parse, urllib.request
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.release.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
@@ -85,7 +87,7 @@ def run_case(tag, with_viewers):
         pid = lpid(p)
         if pid:
             sh(f"kill -9 {pid}"); time.sleep(0.6)
-    srv = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    srv = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                            stdout=open(LOG, "w"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)

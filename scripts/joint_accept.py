@@ -10,7 +10,9 @@ API 覆盖 / 按流规则 / 视频参数 / 音频 codec / 静音兜底 / 双轨�
 import json, os, re, signal, subprocess, sys, time, urllib.parse, urllib.request
 
 WT = "/Users/zhanglei/ZLMediaKit"
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.joint.ini"
 SECRET = "5j9gfMmxP1l7Ox1lrhUm1l3SsWA5dz4z"
@@ -88,7 +90,7 @@ def start(tag, audio="opus", video="h265", rules=(), expect=None, **extra):
     kill_all()
     make_cfg(audio=audio, video=video, rules=rules, **extra)
     open(LOG, "w").close()
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "a"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)

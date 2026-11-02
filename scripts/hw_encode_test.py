@@ -23,8 +23,12 @@ import time
 import urllib.parse
 import urllib.request
 
+from _platshim import pid_on_port as _pid_on_port
+
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.hw.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
@@ -46,8 +50,7 @@ def sh(cmd, timeout=120):
 
 
 def lpid(port):
-    out = sh(f"/usr/sbin/lsof -nP -tiTCP:{port} -sTCP:LISTEN").stdout.split()
-    return int(out[0]) if out else None
+    return _pid_on_port(port)
 
 
 def api(path, **kw):
@@ -94,7 +97,7 @@ def start():
         if pid:
             sh(f"kill -9 {pid}")
             time.sleep(0.6)
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
                          preexec_fn=os.setsid)
     for _ in range(60):
@@ -180,8 +183,16 @@ def run_case(name, params, src=None, pull=True):
     info = sh(f"ffprobe -v error -select_streams v -show_entries stream=codec_name,width,height "
               f"-of csv=p=0 {out}").stdout.strip()
     dec = sh(f"ffmpeg -v error -i {out} -f null - 2>&1", timeout=60).stdout
-    errs = [l for l in (res.stdout + dec).splitlines()
+    # 重试都超时后 res 仍是 None：必须报一条可读失败，不能抛 AttributeError ——
+    # 那样日志里只有 traceback，看不出是哪条断言、什么证据（实测踩过两次）。
+    # If every retry timed out, res stays None: report a readable failure instead of
+    # crashing with AttributeError and losing the assertion context.
+    pull_out = res.stdout if res is not None else ""
+    errs = [l for l in (pull_out + dec).splitlines()
             if l.strip() and "monoton" not in l and "Last message repeated" not in l]
+    if res is None:
+        print(f"  FAIL  {name} 拉流两次都超时（宿主机负载 {os.getloadavg()[0]:.2f}），"
+              f"无法判定，记为失败")
     log = open(LOG, errors="replace").read()
     enc_line = _last_encoder(log)
     # 运行态接口必须和实际一致：这是运维唯一能看到的「到底用没用硬件」

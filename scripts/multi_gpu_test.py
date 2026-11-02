@@ -25,15 +25,21 @@ import time
 import urllib.parse
 import urllib.request
 
+from _platshim import (pid_on_port as _pid_on_port, gpu_count,
+                       supports_device_selection)
+
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 BASE_CFG = f"{WT}/config.joint.base.ini"
 CFG = f"{WT}/config.multigpu.ini"
 HTTP, RTMP, RTSP = 57080, 56900, 56554
 SECRET = "5j9gfMmxP1l7Ox1lrhUm1l3SsWA5dz4z"
 LOG = "/tmp/multigpu.log"
 SRC = "/tmp/src_1280x720.mp4"   # H264 源；用 H265 源转 H265 会走同编码透传，压根不建编码器
-PLATFORM_SUPPORTS_DEVICE = sys.platform.startswith("linux") or sys.platform == "win32"
+PLATFORM_SUPPORTS_DEVICE = supports_device_selection()
+GPU_N = gpu_count()
 
 PASS, FAIL = [], []
 
@@ -48,8 +54,7 @@ def sh(cmd, timeout=90):
 
 
 def lpid(port):
-    out = sh(f"/usr/sbin/lsof -nP -tiTCP:{port} -sTCP:LISTEN").stdout.split()
-    return int(out[0]) if out else None
+    return _pid_on_port(port)
 
 
 def api(path, timeout=5, **kw):
@@ -93,7 +98,7 @@ def start():
         if pid:
             sh(f"kill -9 {pid}")
             time.sleep(0.6)
-    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=f"{WT}/release/darwin/Release",
+    p = subprocess.Popen([BIN, "-c", CFG, "-l", "1"], cwd=BIN_DIR,
                          stdout=open(LOG, "w"), stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     for _ in range(60):
         time.sleep(0.25)
@@ -178,8 +183,9 @@ def main():
         note(t is not None, "gpu_a 视频轨开始转码")
         if t is not None:
             if PLATFORM_SUPPORTS_DEVICE:
-                # NVENC：应真的分到 0（第一路，负载最少）
-                note(t.get("hw_device") in (0, 1), "分配到具体设备号", f"hw_device={t.get('hw_device')}")
+                # NVENC：第一路应分到 0 号卡
+                note(t.get("hw_device") == 0, "分配到具体设备号（0 号卡）",
+                     f"hw_device={t.get('hw_device')}（共 {GPU_N} 张卡）")
             else:
                 note(t.get("hw_device") == -1,
                      "不支持选卡的平台如实报 hw_device=-1（不假装分卡）",
@@ -198,7 +204,10 @@ def main():
             pushers.append(push("gpu_c"))
             tb, tc = wait_video("gpu_b"), wait_video("gpu_c")
             devs = [t.get("hw_device") for t in (t, tb, tc) if t]
-            note(sorted(devs) == [0, 0, 1], "3 路按负载分到 0/1/0", f"{devs}")
+            # 期望：按「在跑路数最少」分配，N 张卡时轮流落在 0,1,...,N-1,0,...
+            want = [i % GPU_N for i in range(len(devs))] if GPU_N else []
+            note(devs == want, f"{len(devs)} 路在 {GPU_N} 张卡上按负载分配",
+                 f"实际 {devs} / 期望 {want}")
         else:
             print("  SKIP  负载均衡真分配（本平台无 NVENC，需 Linux/Windows + NVIDIA 复验）")
 

@@ -233,6 +233,12 @@ Json::Value addTranscodeApi(const TranscodeApiArgs &args) {
         // Parameters combined with reset=1: drop the old override and continue, so the
         // parameters below are applied instead of being silently ignored.
         TranscodeRuntime::instance().clearOverride(tuple);
+        // 必须重新取一次基线：上面的 option 是**清空前**的快照，里面还带着旧覆盖的
+        // 全部字段（实测：先设 hw_device=1，再 reset=1+其它参数，设备号 1 会残留在
+        // 新覆盖里，看起来像「reset 没生效」）。
+        // Re-resolve after clearing: the snapshot above still carries the old override,
+        // so stale fields (e.g. hw_device) would leak into the new one.
+        option = TranscodeRuntime::instance().resolveRaw(tuple);
     }
 
     struct {

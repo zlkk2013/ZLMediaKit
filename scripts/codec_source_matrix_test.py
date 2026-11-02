@@ -15,7 +15,9 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = f"{WT}/release/darwin/Release/MediaServer"
+from _platshim import bin_path as _bin_path, bin_dir as _bin_dir
+BIN = _bin_path()
+BIN_DIR = _bin_dir()
 CFG = f"{WT}/config.codec_matrix.ini"
 HTTP, RTMP, RTSP = 61080, 60900, 60554
 LOG = "/tmp/codec_source.log"
