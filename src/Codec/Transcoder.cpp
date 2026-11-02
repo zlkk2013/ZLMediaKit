@@ -18,6 +18,33 @@
 #include <chrono>
 #include <cmath>
 
+// ── 声道布局的跨版本兼容 ────────────────────────────────────────────────
+// ZLM 原本就区分 FFmpeg 7.1 前后两套 API（见 Transcode.h 里 FFmpegSwr 的两个构造函数）；
+// 本文件新增的转码代码当初直接用了 ch_layout，于是 ffmpeg < 7.1（含 Ubuntu 22.04 的 4.4）
+// 编不过：`AVFrame has no member named 'ch_layout'`。下面这组 helper 把差异收在一处，
+// 分支开关与仓库既有约定保持一致（FF_CODEC_VER_7_1）。
+//
+// Channel-layout compatibility. ZLM already distinguishes the pre/post-7.1 APIs
+// (see FFmpegSwr's two constructors); our new transcode code used ch_layout
+// unconditionally, so anything below 7.1 (including Ubuntu 22.04's 4.4) failed to
+// build. Keep the difference here, using the repo's existing switch.
+#if LIBAVCODEC_VERSION_INT >= FF_CODEC_VER_7_1
+static inline int frameChannels(const AVFrame *f) { return f ? f->ch_layout.nb_channels : 0; }
+static inline int ctxChannels(const AVCodecContext *c) { return c ? c->ch_layout.nb_channels : 0; }
+/** 把上下文的声道布局拷给 frame（老 API 是 channels + channel_layout 两个字段） */
+static inline void copyCtxLayoutToFrame(AVFrame *f, const AVCodecContext *c) {
+    av_channel_layout_copy(&f->ch_layout, &c->ch_layout);
+}
+#else
+static inline int frameChannels(const AVFrame *f) { return f ? f->channels : 0; }
+static inline int ctxChannels(const AVCodecContext *c) { return c ? c->channels : 0; }
+static inline void copyCtxLayoutToFrame(AVFrame *f, const AVCodecContext *c) {
+    f->channels = c->channels;
+    f->channel_layout = c->channel_layout;
+}
+#endif
+
+
 using namespace std;
 using namespace toolkit;
 
@@ -264,7 +291,7 @@ bool TranscodeAudioFifo::write(const AVFrame *frame) {
         return false;
     }
     if (!_fifo) {
-        _channels = frame->ch_layout.nb_channels;
+        _channels = frameChannels(frame);
         _samplerate = frame->sample_rate;
         _format = (AVSampleFormat) frame->format;
         if (_channels <= 0 || _samplerate <= 0) {
@@ -278,14 +305,14 @@ bool TranscodeAudioFifo::write(const AVFrame *frame) {
         }
         TraceL << "audio fifo init, " << _channels << "ch " << _samplerate << "Hz "
                << av_get_sample_fmt_name(_format);
-    } else if (_channels != frame->ch_layout.nb_channels
+    } else if (_channels != frameChannels(frame)
                || _samplerate != frame->sample_rate
                || _format != (AVSampleFormat) frame->format) {
         // 参数变了，必须重建，否则会写入错位数据
         // Parameters changed, must rebuild, otherwise misaligned data will be written
         WarnL << "audio params changed, rebuilding fifo"
               << ", " << _channels << "ch/" << _samplerate << "Hz/" << av_get_sample_fmt_name(_format)
-              << " -> " << frame->ch_layout.nb_channels << "ch/" << frame->sample_rate
+              << " -> " << frameChannels(frame) << "ch/" << frame->sample_rate
               << "Hz/" << av_get_sample_fmt_name((AVSampleFormat) frame->format);
         // 关键：先把成员更新成新参数再分配。旧代码用旧的 _format/_channels 重建，
         // 再用新格式去 av_audio_fifo_write，格式与 FIFO 不符 → 写入失败/数据错位，
@@ -294,7 +321,7 @@ bool TranscodeAudioFifo::write(const AVFrame *frame) {
         // code rebuilt with the OLD _format/_channels then wrote new-format data into it,
         // so the format never matched the FIFO -> write failure/misaligned samples,
         // i.e. audio went silent or garbled after a mid-stream parameter change.
-        _channels = frame->ch_layout.nb_channels;
+        _channels = frameChannels(frame);
         _samplerate = frame->sample_rate;
         _format = (AVSampleFormat) frame->format;
         av_audio_fifo_free(_fifo);
@@ -1081,6 +1108,7 @@ bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, con
     }
 
     int want_channels = channel > 0 ? channel : 1;
+#if LIBAVCODEC_VERSION_INT >= FF_CODEC_VER_7_1
     av_channel_layout_default(&_context->ch_layout, want_channels);
     if (codec->ch_layouts) {
         // 必须优先挑与请求声道数一致的布局。旧代码无条件取 ch_layouts[0]：
@@ -1105,6 +1133,32 @@ bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, con
         av_channel_layout_copy(&_context->ch_layout, pick);
         want_channels = _context->ch_layout.nb_channels;
     }
+#else
+    // ffmpeg < 7.1：声道布局是 channels + channel_layout 两个字段。
+    // 同样优先挑与请求声道数一致的布局（libmp3lame 的列表是 {1ch, 2ch}，
+    // 无条件取 [0] 会把立体声静默降成单声道）。
+    _context->channels = want_channels;
+    _context->channel_layout = av_get_default_channel_layout(want_channels);
+    if (codec->channel_layouts) {
+        uint64_t pick = codec->channel_layouts[0];
+        bool matched = false;
+        for (auto p = codec->channel_layouts; *p; ++p) {
+            if ((int) av_get_channel_layout_nb_channels(*p) == want_channels) {
+                pick = *p;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            WarnL << "codec " << codec->name << " does not support " << want_channels
+                  << " channel(s), fallback to "
+                  << av_get_channel_layout_nb_channels(codec->channel_layouts[0]);
+        }
+        _context->channel_layout = pick;
+        _context->channels = (int) av_get_channel_layout_nb_channels(pick);
+        want_channels = _context->channels;
+    }
+#endif
 
     _context->sample_fmt = codec->sample_fmts ? codec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
     _context->bit_rate = bitrate > 0 ? bitrate : 64000;
@@ -1158,7 +1212,7 @@ bool FFmpegEncoder::openAudioCodec(int samplerate, int channel, int bitrate, con
 
     InfoL << "audio encoder:" << codec->name
           << ", samplerate=" << _context->sample_rate
-          << ", channels=" << _context->ch_layout.nb_channels
+          << ", channels=" << ctxChannels(_context.get())
           << ", sample_fmt=" << av_get_sample_fmt_name(_context->sample_fmt)
           << ", frame_size=" << _context->frame_size
           << ", variable_frame=" << _variable_frame_size
@@ -1243,11 +1297,16 @@ FFmpegFrame::Ptr FFmpegEncoder::formatFrame(const FFmpegFrame::Ptr &frame) {
     // ---- 音频路径 ----
     if (av_frame->format == _context->sample_fmt
         && av_frame->sample_rate == _context->sample_rate
-        && av_frame->ch_layout.nb_channels == _context->ch_layout.nb_channels) {
+        && frameChannels(av_frame) == ctxChannels(_context.get())) {
         return frame;
     }
     if (!_swr) {
+#if LIBAVCODEC_VERSION_INT >= FF_CODEC_VER_7_1
         _swr.reset(new FFmpegSwr(_context->sample_fmt, &_context->ch_layout, _context->sample_rate));
+#else
+        _swr.reset(new FFmpegSwr(_context->sample_fmt, _context->channels,
+                                 (int) _context->channel_layout, _context->sample_rate));
+#endif
     }
     return _swr->inputFrame(frame);
 }
@@ -1315,7 +1374,7 @@ bool FFmpegEncoder::encodeAudio_l(AVFrame *converted) {
         out->format = _context->sample_fmt;
         out->sample_rate = _context->sample_rate;
         out->nb_samples = frame_size;
-        av_channel_layout_copy(&out->ch_layout, &_context->ch_layout);
+        copyCtxLayoutToFrame(out, _context.get());
         auto alloc_ret = av_frame_get_buffer(out, 0);
         if (alloc_ret < 0) {
             WarnL << "av_frame_get_buffer failed:" << ffmpeg_err_str(alloc_ret);
@@ -1380,7 +1439,7 @@ bool FFmpegEncoder::inputSilence() {
     frame->format = _context->sample_fmt;
     frame->sample_rate = rate;
     frame->nb_samples = frame_size;
-    av_channel_layout_copy(&frame->ch_layout, &_context->ch_layout);
+    copyCtxLayoutToFrame(frame, _context.get());
     auto ret = av_frame_get_buffer(frame, 0);
     if (ret < 0) {
         WarnL << "av_frame_get_buffer failed for silence:" << ffmpeg_err_str(ret);
@@ -1390,7 +1449,7 @@ bool FFmpegEncoder::inputSilence() {
     // av_frame_get_buffer 不保证清零，必须显式填静音，否则"静音"里会带随机噪声
     // av_frame_get_buffer does not zero the buffer; fill explicit silence or the
     // "silence" carries random noise
-    av_samples_set_silence(frame->data, 0, frame_size, frame->ch_layout.nb_channels,
+    av_samples_set_silence(frame->data, 0, frame_size, frameChannels(frame),
                            (AVSampleFormat) frame->format);
 
     // 与真实帧走完全相同的编码路径（含 FIFO 对齐）；
