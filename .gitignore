@@ -43,7 +43,9 @@
 /out/
 /release/
 __pycache__/
+build-*/
 build-wt/
+build/
 config.*.ini
 config.a1test.ini
 config.a2test.ini
