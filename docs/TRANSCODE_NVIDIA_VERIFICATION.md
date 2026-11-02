@@ -144,5 +144,7 @@ WSL 调度喂不满。换句话说，**转码本身的余量还没用尽**：GPU
   `ch_layout`/`channel_layout` 两套 API 各写一份，在本机（WSL Ubuntu 22.04，系统 ffmpeg 4.4）
   编译 0 错误，并实测转码成功（H264→H265 + AAC→Opus，拉流 `hevc,1280,720 | opus`）。
   注意系统 4.4 不带 NVENC，硬件编码仍需 conda-forge 的 7.x。
+  **尚欠一步**：4.4 侧的音频矩阵（125 项）在本机 WSL 里跑不完（5.8GB 内存，第一格后静默退出），
+  临时单格探针结果不稳定（3.6s / 2.88s 两次不同），不能当结论 —— 上线前需在裸机 Linux 复验。
 - 裸机 Linux 的容量未测（本组数字来自 WSL，内存仅 5.8GB）。
 - Windows 原生（MSVC）与 VAAPI 仍未验证/未接入。

@@ -44,8 +44,12 @@ sudo apt install -y pkg-config cmake build-essential \
 
 | ffmpeg | 编译 | 转码实测 |
 |---|---|---|
-| **4.4**（Ubuntu 22.04 / Debian 12 的 apt 源） | ✅ 0 错误 | ✅ H264→H265（298 帧/输入 297）+ AAC→Opus，拉流 `hevc,1280,720 \| opus` |
-| **7.1**（conda-forge / macOS） | ✅ | ✅ 全量回归 15 套 336 断言 |
+| **4.4**（Ubuntu 22.04 / Debian 12 的 apt 源） | ✅ 0 错误 | ✅ codec 级验证：H264→H265（298 帧/输入 297）+ AAC→Opus，拉流 `hevc,1280,720 \| opus` |
+| **7.1**（conda-forge / macOS） | ✅ | ✅ 全量回归 15 套 336 断言（含音频矩阵 125 项） |
+
+> ⚠️ **4.4 侧的音频矩阵（125 项）尚未跑通**：在 5060 的 WSL 里跑到第一格就静默退出
+> （资源受限，5.8GB 内存跑不下整轮），临时写的单格探针结果不稳定（同一格两次得到 3.6s / 2.88s），
+> 不能作为结论。**上线前需在裸机 Linux + ffmpeg 4.4 上跑一次 `audio_matrix_test.py`**。
 
 所以 **Ubuntu 22.04 直接 `apt install libav*-dev` 就能编**，不需要额外装新版本。
 
