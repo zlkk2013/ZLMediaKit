@@ -24,6 +24,7 @@
 | `TRANSCODE_MULTI_GPU.md` | 多卡分配与平台能力差异 |
 | `TRANSCODE_SOAK.md` | 长跑判据与「池扩张 vs 泄漏」的定性方法 |
 | `MAINTAINABILITY_UPSTREAM_DIFF.md` | 上游改动量逐文件必要性（rebase 可维护性） |
+| `TRANSCODE_NVIDIA_VERIFICATION.md` | NVIDIA 真机（RTX 5060 Ti / WSL2）验证明细、修掉的 4 个缺陷、容量口径问题、WSL 环境坑 |
 
 ## 验收脚本（`scripts/`）
 
@@ -47,6 +48,9 @@
 | `vp8_source_timeline_test.py` | VP8/VP9 作源的时间轴 | — |
 | `av1_fmp4_stability.py` | AV1+fmp4 偶发崩溃复现 | — |
 | `soak_test.py` | 长跑稳定性（默认 12 分钟，可传分钟数） | 7 |
+| `multi_gpu_test.py` | 多卡参数面 + 按实际卡数分配（有 NVENC 时验真分配） | 10 |
+| `capacity_test.py` | 容量（逐档加路，拉流端实测帧率；**口径仍在完善，数字暂不对外**） | — |
+| `_platshim.py` | 平台差异收口（macOS/Linux/WSL 的进程、句柄、GPU 探测） | — |
 
 素材由 `scripts/test_assets.py` 幂等生成（一秒钟一个关键帧，否则中途接入的用例会假红）。
 

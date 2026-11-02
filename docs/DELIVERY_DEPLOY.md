@@ -25,7 +25,10 @@
 > ```
 > 没有输出就说明得装开发包（或像本仓一样用 conda 装一份）。
 
-Ubuntu / Debian：
+> ⚠️ **ffmpeg 版本要求 ≥ 5.1**（见下）。Ubuntu 22.04 / Debian 12 自带的 4.4 编不过，
+> 必须额外装新版本（conda 最省事）。
+
+Ubuntu / Debian（**仅当系统 ffmpeg ≥ 5.1 时可用**）：
 
 ```bash
 sudo apt install -y pkg-config cmake build-essential \
@@ -33,6 +36,23 @@ sudo apt install -y pkg-config cmake build-essential \
   libswscale-dev libswresample-dev \
   libx264-dev libx265-dev libopus-dev libmp3lame-dev libvpx-dev
 ```
+
+### ⚠️ ffmpeg 版本下限：5.1（实测）
+
+本仓的转码代码用了 ffmpeg 5.1 引入的 `AVChannelLayout`（`ch_layout`，33 处引用）。
+**Ubuntu 22.04 / Debian 12 的 apt 源里是 ffmpeg 4.4，只有 `channel_layout`，直接编译失败**：
+
+```
+error: 'const AVFrame' has no member named 'ch_layout'; did you mean 'channel_layout'?
+```
+
+在 NVIDIA 机器上实测踩到（WSL Ubuntu 22.04 + RTX 5060 Ti）。两条路：
+
+1. **装新 ffmpeg（推荐）**：conda-forge 的 `ffmpeg=7.*`，见下面的 conda 段；
+2. 若必须用系统包，选 ffmpeg ≥ 5.1 的发行版/源（如 Ubuntu 24.04 的 6.1）。
+
+长期计划是给这 33 处加 `LIBAVUTIL_VERSION_INT` 版本分支，让 4.4 也能编；在此之前
+交付文档按「≥ 5.1」执行。
 
 conda（推荐，版本自洽，macOS 上几乎必用）：
 
