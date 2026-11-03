@@ -506,7 +506,13 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
 #endif
     _codec = findEncoder(_codec_id,
                          _video_params.hw_encode && track->getTrackType() == TrackVideo);
-    if (!_codec && !_ascend_wanted) {
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾路径不需要 libavcodec 编码器，这里不能因为找不到就抛异常
+    const bool ascend_ready = _ascend_wanted;
+#else
+    const bool ascend_ready = false;
+#endif
+    if (!_codec && !ascend_ready) {
         throw std::runtime_error("未找到编码器: " + string(::mediakit::getCodecName(_codec_id)));
     }
 
