@@ -25,6 +25,8 @@
 | `TRANSCODE_SOAK.md` | 长跑判据与「池扩张 vs 泄漏」的定性方法 |
 | `MAINTAINABILITY_UPSTREAM_DIFF.md` | 上游改动量逐文件必要性（rebase 可维护性） |
 | `TRANSCODE_NVIDIA_VERIFICATION.md` | NVIDIA 真机（RTX 5060 Ti / WSL2）验证明细、修掉的 4 个缺陷、容量口径问题、WSL 环境坑 |
+| `TRANSCODE_ASCEND_VENC.md` | 昇腾 310P DVPP 硬编接入：原理、8 个真 bug、并发容量（16 路 25fps）、测量口径 |
+| `WORKLOG.md` | **工作日志**：每轮工作的目标 / 改动 / 踩坑 / 实测数据 / 待办（最新在最前） |
 
 ## 验收脚本（`scripts/`）
 
