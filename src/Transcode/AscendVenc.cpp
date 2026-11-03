@@ -334,6 +334,12 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
     auto &im = *_impl;
     lock_guard<mutex> lck(im.send_mtx);
 
+    // 上下文是**按线程**生效的：调用方可能在任意线程喂帧（多路并发时每路一个线程）。
+    // 不重绑的话 aclrtMemcpy/send 会因参数校验失败而直接返回错误（多路测试实测 300/300 全失败）。
+    if (aclrtSetCurrentContext(env().ctx) != ACL_SUCCESS) {
+        return false;
+    }
+
     uint32_t slot = im.idx % (uint32_t) im.dev_buf.size();
     if (aclrtMemcpy(im.dev_buf[slot], im.frame_size, nv12, im.frame_size,
                     ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
