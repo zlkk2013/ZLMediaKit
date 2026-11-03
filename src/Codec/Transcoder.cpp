@@ -2096,7 +2096,10 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     // 只有音频才需要它兜底乱序。
     // The video next_ms is already strictly increasing from the packet index and must
     // not be rewritten by this guard; only audio needs it as a reorder backstop.
-    if (_context->codec_type != AVMEDIA_TYPE_VIDEO && next_ms <= _emitted_ms) {
+    // 昇腾硬编路径没有 libavcodec 上下文（_context 为空），这里必须判空，
+    // 否则视频首包就在这里解引用空指针（实测 SIGSEGV）
+    // The Ascend path has no libavcodec context, so this must be null-checked
+    if ((!_context || _context->codec_type != AVMEDIA_TYPE_VIDEO) && next_ms <= _emitted_ms) {
         next_ms = _emitted_ms + (_frame_interval_ms > 0 ? _frame_interval_ms : 20);
     }
     _emitted_ms = next_ms;

@@ -153,6 +153,47 @@ struct AscendVenc::Impl {
         return nullptr;
     }
 
+    /// 取一次码流（非阻塞），把拿到的包全部回调出去。返回本次取到的 pack 数。
+    int drainOnce() {
+        static constexpr int kMaxPacks = 64;
+        hi_venc_pack packs[kMaxPacks];
+        hi_venc_stream stream;
+        memset(&stream, 0, sizeof(stream));
+        memset(packs, 0, sizeof(packs));
+        stream.pack = packs;
+        stream.pack_cnt = kMaxPacks;
+
+        // 用 1ms 超时而不是 0：非阻塞(0)这条路径在本进程内会卡住不返回。
+        // 超时值就是等待上限，设太大等于给每帧加了固定延迟（实测 5ms×20 轮
+        // 把 25fps 的输入限流到 8fps），所以这里取最小可用值。
+        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 1);
+        if (ret != 0) {
+            return 0;
+        }
+        int n = 0;
+        for (hi_u32 i = 0; i < stream.pack_cnt && i < (hi_u32) kMaxPacks; i++) {
+            size_t len = packs[i].len;
+            if (!packs[i].addr || len == 0 || len > (32u << 20)) {
+                continue;
+            }
+            if (xfer.size() < len) {
+                xfer.resize(len);
+            }
+            if (aclrtMemcpy(xfer.data(), len, packs[i].addr, len,
+                            ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                continue;
+            }
+            local_out++;
+            n++;
+            if (cb) {
+                cb((const char *) xfer.data(), len, packs[i].pts,
+                   isKeyFrame(xfer.data(), len, h265));
+            }
+        }
+        hi_mpi_venc_release_stream(cfg.channel, &stream);
+        return n;
+    }
+
     void loop() {
         // 线程内必须重绑上下文，否则 runtime 参数校验失败
         {
@@ -306,9 +347,24 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
         env().release();
         return false;
     }
+    // 官方样例 create_chn 之后还有两步，缺了不影响「能建通道」但可能让码控丢帧：
+    //   1) set_scene_mode(SCENE_0)：声明画面内容特征（静止/规律运动）
+    //   2) get_rc_param → set_rc_param 往返：把驱动默认码控参数显式下发一次
+    {
+        auto sm = hi_mpi_venc_set_scene_mode(cfg.channel, HI_VENC_SCENE_0);
+        hi_venc_rc_param rcp;
+        memset(&rcp, 0, sizeof(rcp));
+        auto gr = hi_mpi_venc_get_rc_param(cfg.channel, &rcp);
+        auto sr = (gr == 0) ? hi_mpi_venc_set_rc_param(cfg.channel, &rcp) : gr;
+        fprintf(stderr, "[ascend venc] scene_mode=0x%x rc_roundtrip get=0x%x set=0x%x\n",
+                sm, gr, sr);
+    }
+
+    fprintf(stderr, "[ascend venc] before start_chn\n");
     hi_venc_start_param sp;
     sp.recv_pic_num = -1;
     ret = hi_mpi_venc_start_chn(cfg.channel, &sp);
+    fprintf(stderr, "[ascend venc] start_chn ret=0x%x\n", ret);
     if (ret != 0) {
         char buf[96];
         snprintf(buf, sizeof(buf), "hi_mpi_venc_start_chn 失败 0x%x", ret);
@@ -333,36 +389,16 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
         impl->host_buf[i] = (uint8_t *) malloc(impl->frame_size);
     }
     impl->xfer.resize(4 * 1024 * 1024);
+    fprintf(stderr, "[ascend venc] buffers ready (%d x %u bytes)\n", cfg.bufs,
+            (unsigned) impl->frame_size);
 
+    // 不启动独立取流线程：本进程里该线程恒拿不到数据（见 drainOnce 注释），
+    // 且与内联排空并发访问同一通道会段错误。
     impl->stop.store(false);
-    if (pthread_create(&impl->th, nullptr, &Impl::threadEntry, impl.get()) != 0) {
-        err = "取流线程创建失败";
-        goto fail;
-    }
-    impl->running.store(true);
 
     _impl = std::move(impl);
     _opened = true;
 
-    if (getenv("ASCEND_VENC_SELFTEST")) { // 决定性探针：同线程编码+同步取流，默认关闭
-        // 打开后立刻在**当前线程**编一帧并同步取流：用于区分
-        // 「取流线程绑不到上下文」和「本进程里编码器根本不出流」。
-        std::vector<uint8_t> gray(impl->frame_size, 128);
-        auto ok_send = encode(gray.data(), 1000);
-        int got = 0;
-        for (int i = 0; i < 200 && got == 0; i++) {
-            hi_venc_pack pk[64];
-            hi_venc_stream st;
-            memset(&st, 0, sizeof(st));
-            memset(pk, 0, sizeof(pk));
-            st.pack = pk;
-            st.pack_cnt = 64;
-            auto r = hi_mpi_venc_get_stream(cfg.channel, &st, 10);
-            if (r == 0) { got = (int) st.pack_cnt; hi_mpi_venc_release_stream(cfg.channel, &st); }
-            else usleep(5000);
-        }
-        fprintf(stderr, "[ascend venc] INLINE selftest: send=%d got_packs=%d\n", (int) ok_send, got);
-    }
     return true;
 
 fail:
@@ -437,6 +473,22 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
     if (ok) {
         im.idx++;
         _sent++;
+        // 同线程排空：实测「另起取流线程」在本进程里拿不到数据（恒 BUF_EMPTY），
+        // 而同线程同步取流稳定拿得到（INLINE 探针 send=1/got_packs=1）。
+        // 编码器出包有几毫秒延迟，所以要带等待重试，不能取一次空就放弃。
+        // 只在极短时间内等出包：编码器通常几毫秒内出包；没出来就留给下一帧
+        // 再取（包在驱动里排队，不会丢）。等待时间必须小，否则会把发送节奏
+        // 拖慢成帧率上限（实测 120ms 等待 → 输出只有 8fps）。
+        for (int w = 0; w < 4; w++) {
+            if (im.drainOnce() > 0) {
+                break;
+            }
+            usleep(200);
+        }
+        // 把同一时刻可取的包取干净，但必须有上界：
+        // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
+        for (int k = 0; k < 16 && im.drainOnce() > 0; k++) {
+        }
         if (_sent.load() <= 3) {
             hi_venc_chn_status st;
             memset(&st, 0, sizeof(st));
