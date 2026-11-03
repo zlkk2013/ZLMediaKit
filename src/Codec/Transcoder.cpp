@@ -1787,9 +1787,10 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
             break;
         }
 #ifdef ENABLE_ASCEND_VENC
-        // 昇腾链路是异步的：encodeFrame 只保证「送进编码器」，码流在取流线程里才回调。
-        // 不等就会在 config_frames 还空时就恢复 _cb，预热包被当成真实帧往下游送，
-        // 此时目标轨尚未 ready，muxer 取 SPS 直接断言 abort（实测段错误）。
+        // 昇腾链路是同步排空但仍然要等：encodeFrame 返回时码流已经回调过，
+        // 但要防止个别帧在这一拍没出包（驱动排队）就往下走 —— 一旦 config_frames 还空着
+        // 就恢复 _cb，预热包会被当真实帧推下去，此时目标轨尚未 ready，
+        // muxer 取 SPS 直接断言 abort（实测段错误）。
         if (_ascend) {
             for (int w = 0; w < 40 && config_frames.empty(); w++) {
                 usleep(5 * 1000);
@@ -1913,7 +1914,8 @@ bool FFmpegEncoder::isVideo() const {
 #ifdef ENABLE_ASCEND_VENC
 
 bool FFmpegEncoder::openAscendVideo(int width, int height, int bitrate) {
-    // 通道号是整机共享资源：必须申请/归还，不能取模复用（复用会把在跑的流打停）
+    // 通道号必须走池申请/归还，不能取模复用（复用会把正在跑的流打停，实测 18 路时发生）
+    // 池满（>16 路）时返回 -1，这里直接回落软编，已在跑的流不受影响
     AscendVenc::Config cfg;
     cfg.width = width;
     cfg.height = height;
@@ -1928,7 +1930,8 @@ bool FFmpegEncoder::openAscendVideo(int width, int height, int bitrate) {
 
     std::string err;
     auto enc = std::make_shared<AscendVenc>();
-    // 回调跑在 AscendVenc 的取流线程上：组装成 AVPacket 后复用 onEncode 的
+    // 回调跑在 AscendVenc::encode() 的调用线程上（同步排空，无后台取流线程）：
+    // 组装成 AVPacket 后复用 onEncode 的
     // 整条下游逻辑（Annex-B 组装、关键帧标记、时间轴推进），与软编路径完全一致。
     auto cb = [this](const char *data, size_t len, uint64_t, bool key) {
         AVPacket *pkt = av_packet_alloc();

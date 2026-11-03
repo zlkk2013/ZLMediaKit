@@ -8,7 +8,6 @@
 
 #ifdef ENABLE_ASCEND_VENC
 
-#include <pthread.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -138,21 +137,11 @@ struct AscendVenc::Impl {
     vector<uint8_t> xfer;            ///< 取流时 D2H 的中转缓冲
     vector<char> au;                 ///< 拼接同一个访问单元的所有 pack
 
-    pthread_t th{};
-    atomic<bool> stop{false};
-    atomic<bool> running{false};
     mutex send_mtx;
     uint32_t idx = 0;                ///< 帧序号（time_ref 用 idx*2）
 
     // 统计
     uint32_t local_out = 0;
-
-    // ---- 取流线程 ----
-    static void *threadEntry(void *p) {
-        auto self = static_cast<Impl *>(p);
-        self->loop();
-        return nullptr;
-    }
 
     /// 取一次码流（非阻塞），把拿到的包全部回调出去。返回本次取到的 pack 数。
     int drainOnce() {
@@ -205,61 +194,6 @@ struct AscendVenc::Impl {
         return 1;
     }
 
-    void loop() {
-        // 线程内必须重绑上下文，否则 runtime 参数校验失败
-        {
-            auto dev_rc = aclrtSetDevice(cfg.device);
-            auto ctx_rc = aclrtSetCurrentContext(env().ctx);
-            fprintf(stderr, "[ascend venc] get-thread bind: setDevice=%d setCtx=%d ctx=%p dev=%d\n",
-                    (int) dev_rc, (int) ctx_rc, (void *) env().ctx, cfg.device);
-        }
-        while (!stop.load()) {
-            // 一个访问单元可能吐出多个 pack（IDR = AUD/VPS/SPS/PPS/SEI/切片…）。
-            // 数组小了驱动会写越界，之后读到野指针长度 → aclrtMemcpy 段错误（实测）。
-            static constexpr int kMaxPacks = 64;
-            hi_venc_pack packs[kMaxPacks];
-            hi_venc_stream stream;
-            memset(&stream, 0, sizeof(stream));
-            memset(packs, 0, sizeof(packs));
-            stream.pack = packs;
-            stream.pack_cnt = kMaxPacks;
-
-            auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 0);
-            if (ret != 0) {
-                // 头 200 次打印返回码：区分「暂时没数据」和「通道不对/上下文没绑」
-                static int dbg = 0;
-                if (dbg < 200 && (dbg++ % 40) == 0) {
-                    fprintf(stderr, "[ascend venc] get_stream ch=%d ret=0x%x ctx=%p\n",
-                            cfg.channel, ret, (void *) env().ctx);
-                }
-                usleep(500); // 非阻塞轮询
-                continue;
-            }
-            if (stream.pack_cnt > (hi_u32) kMaxPacks) {
-                fprintf(stderr, "[ascend venc] pack_cnt=%u exceeds %d\n",
-                        (unsigned) stream.pack_cnt, kMaxPacks);
-            }
-            for (hi_u32 i = 0; i < stream.pack_cnt && i < (hi_u32) kMaxPacks; i++) {
-                size_t len = packs[i].len;
-                if (!packs[i].addr || len == 0 || len > (32u << 20)) {
-                    continue;
-                }
-                if (xfer.size() < len) {
-                    xfer.resize(len);
-                }
-                if (aclrtMemcpy(xfer.data(), len, packs[i].addr, len,
-                                ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-                    continue;
-                }
-                local_out++;
-                if (cb) {
-                    cb((const char *) xfer.data(), len, packs[i].pts,
-                       isKeyFrame(xfer.data(), len, h265));
-                }
-            }
-            hi_mpi_venc_release_stream(cfg.channel, &stream);
-        }
-    }
 };
 
 namespace {
@@ -428,9 +362,6 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
     fprintf(stderr, "[ascend venc] buffers ready (%d x %u bytes)\n", cfg.bufs,
             (unsigned) impl->frame_size);
 
-    // 不启动独立取流线程：本进程里该线程恒拿不到数据（见 drainOnce 注释），
-    // 且与内联排空并发访问同一通道会段错误。
-    impl->stop.store(false);
 
     _impl = std::move(impl);
     _opened = true;
@@ -538,9 +469,13 @@ void AscendVenc::flush() {
     if (!_opened || !_impl) {
         return;
     }
-    // 给取流线程一点时间把残余码流取干净
-    for (int i = 0; i < 50 && _out.load() < _sent.load(); i++) {
-        usleep(2 * 1000);
+    // 主动排空：编码器里可能还有排队未出的帧（没有独立取流线程，这里必须自己取）
+    // Drain inline: there is deliberately no background drain thread, so flush() must
+    // poll the channel itself until the pending frames come out (bounded wait).
+    for (int i = 0; i < 100 && _out.load() < _sent.load(); i++) {
+        if (_impl->drainOnce() == 0) {
+            usleep(2 * 1000);
+        }
     }
 }
 
@@ -550,11 +485,6 @@ void AscendVenc::close() {
     }
     auto &im = *_impl;
     flush();
-    im.stop.store(true);
-    if (im.running.load()) {
-        pthread_join(im.th, nullptr);
-        im.running.store(false);
-    }
     hi_mpi_venc_stop_chn(im.cfg.channel);
     hi_mpi_venc_destroy_chn(im.cfg.channel);
     // 通道必须归还，否则后续流申请不到号（池耗尽时会明确报错并回落软编）
