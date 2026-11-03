@@ -157,21 +157,34 @@ struct AscendVenc::Impl {
         // 线程内必须重绑上下文，否则 runtime 参数校验失败
         aclrtSetCurrentContext(env().ctx);
         while (!stop.load()) {
-            hi_venc_pack packs[8];
+            // 一个访问单元可能吐出多个 pack（IDR = AUD/VPS/SPS/PPS/SEI/切片…）。
+            // 数组小了驱动会写越界，之后读到野指针长度 → aclrtMemcpy 段错误（实测）。
+            static constexpr int kMaxPacks = 64;
+            hi_venc_pack packs[kMaxPacks];
             hi_venc_stream stream;
             memset(&stream, 0, sizeof(stream));
             memset(packs, 0, sizeof(packs));
             stream.pack = packs;
-            stream.pack_cnt = 8;
+            stream.pack_cnt = kMaxPacks;
 
             auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 0);
             if (ret != 0) {
+                // 头 200 次打印返回码：区分「暂时没数据」和「通道不对/上下文没绑」
+                static int dbg = 0;
+                if (dbg < 200 && (dbg++ % 40) == 0) {
+                    fprintf(stderr, "[ascend venc] get_stream ch=%d ret=0x%x ctx=%p\n",
+                            cfg.channel, ret, (void *) env().ctx);
+                }
                 usleep(500); // 非阻塞轮询
                 continue;
             }
-            for (hi_u32 i = 0; i < stream.pack_cnt; i++) {
+            if (stream.pack_cnt > (hi_u32) kMaxPacks) {
+                fprintf(stderr, "[ascend venc] pack_cnt=%u exceeds %d\n",
+                        (unsigned) stream.pack_cnt, kMaxPacks);
+            }
+            for (hi_u32 i = 0; i < stream.pack_cnt && i < (hi_u32) kMaxPacks; i++) {
                 size_t len = packs[i].len;
-                if (!packs[i].addr || len == 0) {
+                if (!packs[i].addr || len == 0 || len > (32u << 20)) {
                     continue;
                 }
                 if (xfer.size() < len) {
@@ -399,6 +412,16 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
     if (ok) {
         im.idx++;
         _sent++;
+        if (_sent.load() <= 3) {
+            fprintf(stderr, "[ascend venc] sent frame #%u pts=%llu idx=%u\n", _sent.load(),
+                    (unsigned long long) pts_us, im.idx);
+        }
+    } else {
+        // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看
+        if (_sent.load() < 5) {
+            fprintf(stderr, "[ascend venc] send failed after retries, ch=%d size=%dx%d\n",
+                    im.cfg.channel, im.cfg.width, im.cfg.height);
+        }
     }
     return ok;
 }

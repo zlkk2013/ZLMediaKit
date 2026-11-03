@@ -15,6 +15,11 @@
 
 #include <memory>
 #include "Codec/Transcode.h"
+#ifdef ENABLE_ASCEND_VENC
+// 必须放在 namespace mediakit 之外：AscendVenc.h 自己也开 mediakit 命名空间，
+// 在命名空间内 include 会嵌套成 mediakit::mediakit（编译器实测报错）。
+#include "Transcode/AscendVenc.h"
+#endif
 
 namespace mediakit {
 // 滤镜图：只需要指针成员，定义在 TranscodeFilter.h（.cpp 里包含）
@@ -361,9 +366,26 @@ public:
     int getAudioFrameMs() const { return (int) _audio_frame_ms; }
 
     /** 编码器是否可用（构造成功即为 true，供上层做能力判定） */
-    bool available() const { return _context && _codec; }
+    bool available() const {
+#ifdef ENABLE_ASCEND_VENC
+        if (_ascend) {
+            return true;
+        }
+#endif
+        return _context && _codec;
+    }
 
 private:
+    /// 是否为视频轨（不依赖 _context：走昇腾硬编时根本没有 AVCodecContext）
+    bool isVideo() const;
+
+#ifdef ENABLE_ASCEND_VENC
+    /// 用昇腾 DVPP 打开视频编码通道（替代 libavcodec）
+    bool openAscendVideo(int width, int height, int bitrate);
+    /// 把 AVFrame 转成 NV12 后喂给昇腾编码器
+    bool encodeAscend(AVFrame *frame);
+#endif
+
     void onEncode(AVPacket *packet);
 
     bool encodeFrame(AVFrame *frame);
@@ -447,6 +469,18 @@ private:
     CodecId _codec_id;
     const AVCodec *_codec = nullptr;
     std::shared_ptr<AVCodecContext> _context;
+
+#ifdef ENABLE_ASCEND_VENC
+    /// 非空表示这条视频轨走昇腾 DVPP 硬编，_context 全程为空
+    std::shared_ptr<AscendVenc> _ascend;
+    bool _ascend_wanted = false;
+    /// AVFrame → NV12 的转换上下文与缓冲（semi-planar，DVPP 只吃这个）
+    struct SwsContext *_ascend_sws = nullptr;
+    int _ascend_nv12_w = 0;
+    int _ascend_nv12_h = 0;
+    std::vector<uint8_t> _ascend_nv12;
+    uint64_t _ascend_pts_us = 0;
+#endif
 
     std::unique_ptr<FFmpegSws> _sws;
     /** sws 当前的输出目标（尺寸/格式）；与编码器不一致时必须重建 */
