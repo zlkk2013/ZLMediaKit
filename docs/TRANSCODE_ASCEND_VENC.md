@@ -194,3 +194,33 @@ export LD_LIBRARY_PATH=$LIB:$DRV:$LD_LIBRARY_PATH
 ./venc_dual /tmp/out.h264 0
 ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 /tmp/out.h264
 ```
+
+## 接进 FFmpegEncoder 的实测状态（2026-11-03）
+
+开关 `-DENABLE_ASCEND_VENC=ON`，默认 OFF，对非 aarch64 构建零影响。
+
+### 已验证
+
+| 项 | 证据 |
+|---|---|
+| 分支选择正确 | 日志 `transcode: video will be encoded by Ascend DVPP VENC` |
+| DVPP 通道打开成功 | `ascend venc opened: 1280x720 H265 ch=0 fps=25` |
+| 预热产出配置帧 | `warmup done: config_nals=8, ready=1, size=1280x720` |
+| 目标轨就绪 | `transcoded video track ready=1, size=1280x720` |
+| 客户端能拉到转码流 | `ffprobe` 拉流返回 `hevc,1280,720` |
+| 无崩溃 | 清理版连续跑 20 秒 `crash=0` |
+
+### 接线期踩到的 6 个坑（全部已修，教训可复用）
+
+1. **`aclInit` 只能调一次**：`available()` 探测过后 `open()` 再调必失败 → 初始化只做一次，之后每线程 `aclrtSetCurrentContext`。
+2. **`encode()` 必须给调用线程绑 context**：不绑则多线程下一帧都送不进。
+3. **独立取流线程在本进程内拿不到数据**：`hi_mpi_venc_get_stream` 恒 `0xA008800e`（BUF_EMPTY），而同一线程同步取流稳定成功（探针 `send=1 got_packs=1`）→ 改为 `encode()` 内同步排空。
+4. **`get_stream` 超时不能取 0**：非阻塞路径会卡住不返回；也不能取大（5ms×20 轮把 25fps 限流到 8fps）→ 取 1ms + 极少次重试。
+5. **`onEncode` 里 `_context` 为空**：昇腾路径没有 libavcodec 上下文，`_context->codec_type` 直接 SIGSEGV → 判空。
+6. **`goto fail` 不能跨过变量初始化**：C++ 错误「跳转至标号 fail」。
+
+### 仍未闭环
+
+- **持续转码未稳定复现**：`addTranscode` 后发布轨有时仍是源 H264。查到的线索是转码走**按需**模式（日志 `on-demand check: readers=0` → 跳过），观众接入时机不对就不会真正转码。需要在「观众已在线」的时序下重测，或评估关掉 on-demand。
+- 客户端拉流取证在本机不稳：`curl` 全坏（`libldap` 符号 `EVP_md2`），`ffmpeg` RTSP 客户端间歇 `Operation not permitted`，只能用 `ffprobe`/原始 socket 兜底。
+- 帧率、码率、多路并发下的稳定性都还没在 ZLM 进程内测。
