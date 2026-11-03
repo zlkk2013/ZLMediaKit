@@ -136,6 +136,7 @@ struct AscendVenc::Impl {
     vector<void *> dev_buf;
     vector<uint8_t *> host_buf;      ///< 与 dev_buf 一一对应的 host 暂存
     vector<uint8_t> xfer;            ///< 取流时 D2H 的中转缓冲
+    vector<char> au;                 ///< 拼接同一个访问单元的所有 pack
 
     pthread_t th{};
     atomic<bool> stop{false};
@@ -168,7 +169,13 @@ struct AscendVenc::Impl {
         if (ret != 0) {
             return 0;
         }
-        int n = 0;
+        // 一次 get_stream 返回的所有 pack 属于**同一个访问单元**（IDR 会是
+        // AUD/VPS/SPS/PPS/SEI/切片…）。必须拼成一帧再回调：按 pack 逐个回调等于把
+        // 一帧拆成多帧，实测入口 27fps 却输出 38fps，下游还会拿到半帧。
+        // All packs of one get_stream() belong to the SAME access unit, so they must be
+        // concatenated and emitted once. Emitting per pack splits a frame into several.
+        au.clear();
+        uint64_t au_pts = 0;
         for (hi_u32 i = 0; i < stream.pack_cnt && i < (hi_u32) kMaxPacks; i++) {
             size_t len = packs[i].len;
             if (!packs[i].addr || len == 0 || len > (32u << 20)) {
@@ -181,15 +188,21 @@ struct AscendVenc::Impl {
                             ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
                 continue;
             }
-            local_out++;
-            n++;
-            if (cb) {
-                cb((const char *) xfer.data(), len, packs[i].pts,
-                   isKeyFrame(xfer.data(), len, h265));
+            if (au.empty()) {
+                au_pts = packs[i].pts;
             }
+            au.insert(au.end(), (const char *) xfer.data(), (const char *) xfer.data() + len);
         }
         hi_mpi_venc_release_stream(cfg.channel, &stream);
-        return n;
+        if (au.empty()) {
+            return 0;
+        }
+        local_out++;
+        if (cb) {
+            cb(au.data(), au.size(), au_pts,
+               isKeyFrame((const uint8_t *) au.data(), au.size(), h265));
+        }
+        return 1;
     }
 
     void loop() {
