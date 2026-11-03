@@ -1340,8 +1340,19 @@ FFmpegFrame::Ptr FFmpegEncoder::formatFrame(const FFmpegFrame::Ptr &frame) {
 }
 
 bool FFmpegEncoder::inputFrame(const FFmpegFrame::Ptr &frame, bool async) {
-    if (!_context || !frame || !frame->get()) {
+    if (!frame || !frame->get()) {
         return false;
+    }
+    if (!_context) {
+#ifdef ENABLE_ASCEND_VENC
+        // 昇腾路径没有 libavcodec 上下文：只有开了 AscendVenc 才继续，
+        // 否则必须照样丢弃（保持原有「无上下文不能编码」的语义）。
+        if (!_ascend) {
+            return false;
+        }
+#else
+        return false;
+#endif
     }
     _flush_done = false;
     if (async && TaskManager::isEnabled()) {
@@ -1494,6 +1505,12 @@ bool FFmpegEncoder::inputSilence() {
 bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     TimeTicker2(30, TraceL);
 
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾硬编自己负责格式转换与 pts 推进，不走下面的 libavcodec 路径
+    if (_ascend && !_context) {
+        return encodeAscend(frame->get());
+    }
+#endif
     if (!_context) {
         return false;
     }

@@ -163,10 +163,8 @@ struct AscendVenc::Impl {
         stream.pack = packs;
         stream.pack_cnt = kMaxPacks;
 
-        // 用 1ms 超时而不是 0：非阻塞(0)这条路径在本进程内会卡住不返回。
-        // 超时值就是等待上限，设太大等于给每帧加了固定延迟（实测 5ms×20 轮
-        // 把 25fps 的输入限流到 8fps），所以这里取最小可用值。
-        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 1);
+        // 非阻塞(0)这条路径在本进程内会卡住不返回，必须给正超时。
+        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 5);
         if (ret != 0) {
             return 0;
         }
@@ -476,25 +474,17 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
         // 同线程排空：实测「另起取流线程」在本进程里拿不到数据（恒 BUF_EMPTY），
         // 而同线程同步取流稳定拿得到（INLINE 探针 send=1/got_packs=1）。
         // 编码器出包有几毫秒延迟，所以要带等待重试，不能取一次空就放弃。
-        // 只在极短时间内等出包：编码器通常几毫秒内出包；没出来就留给下一帧
-        // 再取（包在驱动里排队，不会丢）。等待时间必须小，否则会把发送节奏
-        // 拖慢成帧率上限（实测 120ms 等待 → 输出只有 8fps）。
-        for (int w = 0; w < 4; w++) {
+        // 等出包：编码器出包有几毫秒延迟，一旦不等就会让「发送↔取流」错拍，
+        // 下游解码队列积压到丢帧（实测只剩预热那一帧能编出来）。
+        for (int w = 0; w < 25; w++) {
             if (im.drainOnce() > 0) {
                 break;
             }
-            usleep(200);
+            usleep(1000);
         }
         // 把同一时刻可取的包取干净，但必须有上界：
         // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
         for (int k = 0; k < 16 && im.drainOnce() > 0; k++) {
-        }
-        if (_sent.load() <= 3) {
-            hi_venc_chn_status st;
-            memset(&st, 0, sizeof(st));
-            auto qs = hi_mpi_venc_query_status(im.cfg.channel, &st);
-            fprintf(stderr, "[ascend venc] sent #%u pts=%llu query rc=0x%x left_pics=%u cur_packs=%u\n",
-                    _sent.load(), (unsigned long long) pts_us, qs, st.left_pics, st.cur_packs);
         }
     } else {
         // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看

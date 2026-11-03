@@ -219,8 +219,41 @@ ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 /tmp/o
 5. **`onEncode` 里 `_context` 为空**：昇腾路径没有 libavcodec 上下文，`_context->codec_type` 直接 SIGSEGV → 判空。
 6. **`goto fail` 不能跨过变量初始化**：C++ 错误「跳转至标号 fail」。
 
+### 端到端验收（2026-11-03 收口）
+
+```
+addTranscode(video_codec=H265, hw=1, on_demand=0) → 200
+服务端：onEncoded | transcoded 100/200/300/400 frames（持续产出）
+客户端：ffprobe → hevc,1280,720
+崩溃：0
+```
+
+### 最关键的一个堵点（第 7 个坑，也是真正卡了三小时的那个）
+
+`FFmpegEncoder::inputFrame()` 第一行是：
+
+```cpp
+if (!_context || !frame || !frame->get()) {
+    return false;      // ← 昇腾路径根本没有 _context，于是每一帧都被丢掉
+}
+```
+
+昇腾路径不创建 libavcodec 上下文，所以真实推流帧在进入 `inputFrame_l` 之前就被**静默丢弃**：
+`warmup()` 直接调 `encodeFrame()` 所以能出首包、目标轨能 ready，而直播帧一帧都到不了编码器。
+外部表现极具误导性——DVPP 通道正常、预热成功、无报错，只是「永远只有第 1 帧」。
+
+修法：`if (!_context)` 分支里放行 `_ascend`；`inputFrame_l` 开头在 `_ascend && !_context` 时
+直接 `return encodeAscend(frame->get())`。
+
+### 排查这类问题的有效顺序
+
+1. 入口计数（`TranscodeSink::inputFrame` 调用次数）→ 源帧到没到
+2. `onDecoded` 的 hit / no-encoder 计数 → 解码出来的帧有没有配上编码器
+3. `AscendVenc::encode` 送帧计数 → 有没有真送进 DVPP
+4. 卡住时 `gdb -p <pid> -batch -ex "thread apply all bt"` 看线程栈（对「卡住」和「SIGSEGV」都适用）
+
 ### 仍未闭环
 
-- **持续转码未稳定复现**：`addTranscode` 后发布轨有时仍是源 H264。查到的线索是转码走**按需**模式（日志 `on-demand check: readers=0` → 跳过），观众接入时机不对就不会真正转码。需要在「观众已在线」的时序下重测，或评估关掉 on-demand。
-- 客户端拉流取证在本机不稳：`curl` 全坏（`libldap` 符号 `EVP_md2`），`ffmpeg` RTSP 客户端间歇 `Operation not permitted`，只能用 `ffprobe`/原始 socket 兜底。
-- 帧率、码率、多路并发下的稳定性都还没在 ZLM 进程内测。
+- 帧率与源 25fps 的对应关系还需在长窗口上测准（当前里程碑显示输出快于源，需确认是否有重复帧）。
+- 多路并发（多流同时转码）在 ZLM 进程内未测。
+- 按需转码（`on_demand=1`，默认）下观众何时接入才会真正启用编码，需要产品口径上明确。
