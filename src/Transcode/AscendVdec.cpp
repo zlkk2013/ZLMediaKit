@@ -78,12 +78,20 @@ struct AscendVdec::Impl {
     bool streaming = false;
 
     /// 把一帧设备内存里的 NV12 拷成紧凑 NV12 并回调
+    uint32_t dropped = 0; ///< 取到句柄但拿不到有效图像的次数（诊断用）
+
     void emit(hi_video_frame_info &fi) {
         auto &vf = fi.v_frame;
         int w = (int) vf.width;
         int h = (int) vf.height;
         if (w <= 0 || h <= 0) {
-            // 宽高为 0 说明这一帧没有真正的图像头（常见于首包没带 SPS/PPS）
+            // 宽高为 0 说明这一帧没有真正的图像头（常见于首包没带 SPS/PPS）。
+            // 注意：_out 是在调用 emit() 之前自增的，所以「out 在涨」不代表真出了帧，
+            // 这里单独计数，避免再去猜。
+            if (++dropped <= 3) {
+                fprintf(stderr, "[ascend vdec] drop: width=%d height=%d stride0=%u virt0=%p\n",
+                        w, h, (unsigned) vf.width_stride[0], vf.virt_addr[0]);
+            }
             return;
         }
         // 注意字段名是 width_stride（不是 stride），设备侧可能按对齐给出大于 width 的跨度
@@ -92,9 +100,25 @@ struct AscendVdec::Impl {
         size_t need = (size_t) w * h * 3 / 2;
         nv12.resize(need);
 
+        // 平面地址兜底：调用方给了 pic.vir_addr（我们自己的 out_buf）时，
+        // 有些版本不回填 v_frame.virt_addr，此时解码数据就在 out_buf 里。
+        const uint8_t *base_y = (const uint8_t *) vf.virt_addr[0];
+        const uint8_t *base_uv = (const uint8_t *) vf.virt_addr[1];
+        if (!base_y) {
+            base_y = out_buf;
+            base_uv = out_buf ? out_buf + (size_t) y_stride * h : nullptr;
+        }
+        if (!base_y || !base_uv) {
+            if (++dropped <= 3) {
+                fprintf(stderr, "[ascend vdec] drop: no plane addr (virt0=%p virt1=%p out=%p)\n",
+                        vf.virt_addr[0], vf.virt_addr[1], out_buf);
+            }
+            return;
+        }
+
         // Y 平面逐行拷（设备侧 stride 可能大于 width，需要紧凑化）
         for (int row = 0; row < h; row++) {
-            auto src = (const uint8_t *) vf.virt_addr[0] + (size_t) row * y_stride;
+            auto src = base_y + (size_t) row * y_stride;
             auto dst = nv12.data() + (size_t) row * w;
             if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
                 return;
@@ -102,7 +126,7 @@ struct AscendVdec::Impl {
         }
         // UV 平面：NV12 是高度/2 行、每行 width 字节（interleaved）
         for (int row = 0; row < h / 2; row++) {
-            auto src = (const uint8_t *) vf.virt_addr[1] + (size_t) row * uv_stride;
+            auto src = base_uv + (size_t) row * uv_stride;
             auto dst = nv12.data() + (size_t) w * h + (size_t) row * w;
             if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
                 return;
@@ -279,7 +303,7 @@ bool AscendVdec::decode(const uint8_t *annexb, size_t len, uint32_t pts_ms) {
     if (_in % 500 == 0) {
         // 这版 SDK 没有 hi_mpi_vdec_get_chn_status（只有 get_chn_attr），状态只能自己计数。
         // 每 500 帧一行：既能确认硬解在跑，又不会刷屏（25fps 下约 20 秒一行）。
-        fprintf(stderr, "[ascend vdec] in=%u out=%u\n", _in, _out);
+        fprintf(stderr, "[ascend vdec] in=%u out=%u dropped=%u\n", _in, _out, im.dropped);
     }
 
     // 取走当前所有已就绪的帧
