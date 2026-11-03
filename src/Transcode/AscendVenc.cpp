@@ -50,9 +50,22 @@ struct DvppEnv {
             ref++;
             return true;
         }
-        if (aclInit(nullptr) != ACL_SUCCESS) { why = "aclInit 失败"; return false; }
-        if (aclrtSetDevice(dev) != ACL_SUCCESS) { why = "aclrtSetDevice 失败"; return false; }
-        if (aclrtCreateContext(&ctx, dev) != ACL_SUCCESS) { why = "aclrtCreateContext 失败"; return false; }
+        // aclInit 在"进程里别人已经初始化过"时会返回失败——这不是错误。
+        // 同一进程里 VDEC 封装/推理后端都可能先调过，因此这里只当警告，继续尝试建上下文。
+        if (aclInit(nullptr) != ACL_SUCCESS) {
+            // 不直接失败：后面的 setDevice 才是真正的判据
+        }
+        if (aclrtSetDevice(dev) != ACL_SUCCESS) {
+            // 设备已被别的模块 set 过也可能返回失败，再看能否建上下文
+            if (aclrtCreateContext(&ctx, dev) != ACL_SUCCESS) {
+                why = "aclrtSetDevice/aclrtCreateContext 均失败";
+                return false;
+            }
+        }
+        if (!ctx && aclrtCreateContext(&ctx, dev) != ACL_SUCCESS) {
+            why = "aclrtCreateContext 失败";
+            return false;
+        }
         if (aclrtSetCurrentContext(ctx) != ACL_SUCCESS) { why = "aclrtSetCurrentContext 失败"; return false; }
         auto ret = hi_mpi_sys_init();
         if (ret != 0) {

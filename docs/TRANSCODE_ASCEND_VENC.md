@@ -142,6 +142,28 @@ N 个通道各起一个线程并发喂 300 帧 720p H.264：
 - **关键帧判断不能只看首个 NAL**：IDR 访问单元通常以 SPS/PPS 打头，
   只看第一个 NAL 会把关键帧全判成非关键帧（实测 `keys=0`），必须扫描整个访问单元。
 
+## 解码+编码闭环（`tools/ascend/ascend_transcode_roundtrip.cpp`）
+
+把项目的 VDEC 封装（已在生产跑的 `_ascend_vdec_wrap.so`）和本仓的 `AscendVenc` 串起来，
+证明「硬解 → NV12 → 硬编」这条链在这台机器上是通的：
+
+```
+源码流 60 个访问单元 → VDEC 硬解 60 帧 → VENC 硬编 60 帧 → 输出 h264 1280x720 60 帧
+```
+
+ffprobe 校验：`h264,1280,720,60`，与输入帧数一致，0 丢帧。
+
+闭环过程中修掉的三个缺陷（都是"能跑但结果不对"这一类）：
+
+1. **`encode()` 没有为调用线程绑定 ACL context** —— 单线程自测碰不到，多路并发或多线程喂帧时
+   300/300 帧全部失败。`aclrtMemcpy` 的参数校验依赖当前线程的 context。
+2. **EOS 之后必须继续取流** —— 否则 VDEC 里残留 1~2 帧被丢掉（实测 60 帧只出 59 帧）。
+3. **只喂整帧** —— 取流返回的 `out_len` 小于整帧大小时喂进编码器会产出坏码流
+   （ffprobe 报 `cbp too large`）。判据：`out_len == width*height*3/2` 才送编码。
+
+另一个环境坑：`pkill -f <脚本路径>` 会匹配到执行它的 shell 自身，导致命令静默自杀、输出为空 ——
+远端清理一律用 `pkill -x <二进制名>`。
+
 ## 与 ZLMediaKit 的关系（架构结论）
 
 ZLM 的转码是**进程内 libavcodec**，而昇腾没有 libavcodec 后端（无 encoder、无 hwaccel）。
