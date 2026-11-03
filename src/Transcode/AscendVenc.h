@@ -55,6 +55,12 @@ public:
     /// 按分辨率给默认码率（kbps），与 ffmpeg 硬编路径保持同一套口径
     static int defaultBitrateKbps(int width, int height);
 
+    /// 通道号是整机共享资源，必须「用完归还」，否则第 17 路会复用通道 0/1…
+    /// 把正在跑的流打停（实测 18 路时路 1/路 5 视频在 1.8 秒后断流）。
+    /// Acquire a DVPP VENC channel; returns -1 when all are busy.
+    static int acquireChannel();
+    static void releaseChannel(int channel);
+
     ~AscendVenc();
     AscendVenc(); // 定义放 cpp：构造函数的异常清理会实例化 unique_ptr<Impl> 析构，需要完整类型
 

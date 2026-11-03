@@ -1913,15 +1913,18 @@ bool FFmpegEncoder::isVideo() const {
 #ifdef ENABLE_ASCEND_VENC
 
 bool FFmpegEncoder::openAscendVideo(int width, int height, int bitrate) {
-    // 通道号是整机共享资源，多路转码必须各用各的号；16 个足够（实测 16 路 720p 有余量）
-    static std::atomic<int> s_chan{0};
+    // 通道号是整机共享资源：必须申请/归还，不能取模复用（复用会把在跑的流打停）
     AscendVenc::Config cfg;
     cfg.width = width;
     cfg.height = height;
     cfg.h265 = (_codec_id == CodecH265);
     cfg.fps = (int) llround(_video_fps > 0.5f ? _video_fps : 25.0f);
     cfg.bitrate_kbps = bitrate > 0 ? bitrate / 1000 : 0;
-    cfg.channel = s_chan.fetch_add(1) % 16;
+    cfg.channel = AscendVenc::acquireChannel();
+    if (cfg.channel < 0) {
+        WarnL << "ascend venc: no free DVPP channel (max 16 concurrent), fallback to software";
+        return false;
+    }
 
     std::string err;
     auto enc = std::make_shared<AscendVenc>();

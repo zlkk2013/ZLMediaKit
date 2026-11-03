@@ -262,6 +262,31 @@ struct AscendVenc::Impl {
     }
 };
 
+namespace {
+constexpr int kMaxVencChannels = 16;
+std::mutex g_chan_mtx;
+bool g_chan_used[kMaxVencChannels] = {};
+} // namespace
+
+int AscendVenc::acquireChannel() {
+    lock_guard<mutex> lck(g_chan_mtx);
+    for (int i = 0; i < kMaxVencChannels; i++) {
+        if (!g_chan_used[i]) {
+            g_chan_used[i] = true;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void AscendVenc::releaseChannel(int channel) {
+    if (channel < 0 || channel >= kMaxVencChannels) {
+        return;
+    }
+    lock_guard<mutex> lck(g_chan_mtx);
+    g_chan_used[channel] = false;
+}
+
 int AscendVenc::defaultBitrateKbps(int width, int height) {
     long px = (long) width * height;
     if (px >= 1920L * 1080) return 6000;
@@ -532,6 +557,8 @@ void AscendVenc::close() {
     }
     hi_mpi_venc_stop_chn(im.cfg.channel);
     hi_mpi_venc_destroy_chn(im.cfg.channel);
+    // 通道必须归还，否则后续流申请不到号（池耗尽时会明确报错并回落软编）
+    releaseChannel(im.cfg.channel);
     for (auto p : im.dev_buf) {
         if (p) hi_mpi_dvpp_free(p);
     }
