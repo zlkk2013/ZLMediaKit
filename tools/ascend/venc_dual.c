@@ -10,14 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "acl/acl.h"
 #include "acl/dvpp/hi_mpi_sys.h"
 #include "acl/dvpp/hi_media_common.h"
 #include "acl/dvpp/hi_dvpp_venc.h"
 
-#define W 640
-#define H 360
+static int W = 640;
+static int H = 360;
 #define FRAMES 30
 #define CHN 0
 #define FPS 25
@@ -40,8 +41,9 @@ static void *get_thread(void *arg) {
         stream.pack = packs;
         stream.pack_cnt = 8;
 
-        hi_s32 ret = hi_mpi_venc_get_stream(CHN, &stream, 100);
-        if (ret != 0) { usleep(2 * 1000); continue; }
+        // 非阻塞取流 + 1ms 轮询：阻塞式 get 会占住驱动内部资源（实测影响下一帧 send）
+        hi_s32 ret = hi_mpi_venc_get_stream(CHN, &stream, 0);
+        if (ret != 0) { usleep(1000); continue; }
 
         for (hi_u32 i = 0; i < stream.pack_cnt; i++) {
             size_t len = packs[i].len;
@@ -60,6 +62,11 @@ static void *get_thread(void *arg) {
 int main(int argc, char **argv) {
     const char *out = argc > 1 ? argv[1] : "/tmp/venc_out.h264";
     int dev = argc > 2 ? atoi(argv[2]) : 0;
+    int use_h265 = (argc > 3 && strcmp(argv[3], "h265") == 0);
+    int nframes = argc > 4 ? atoi(argv[4]) : FRAMES;
+    int pace = (argc > 5 && strcmp(argv[5], "nopace") == 0) ? 0 : 1;
+    if (argc > 6) W = atoi(argv[6]);
+    if (argc > 7) H = atoi(argv[7]);
     hi_s32 ret;
 
     // ---- 初始化链 ----
@@ -71,19 +78,29 @@ int main(int argc, char **argv) {
 
     hi_venc_chn_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.venc_attr.type = HI_PT_H264;
+    attr.venc_attr.type = use_h265 ? HI_PT_H265 : HI_PT_H264;
     attr.venc_attr.max_pic_width = W;
     attr.venc_attr.max_pic_height = H;
     attr.venc_attr.pic_width = W;
     attr.venc_attr.pic_height = H;
     attr.venc_attr.buf_size = 2 * 1024 * 1024;
     attr.venc_attr.is_by_frame = HI_TRUE;
-    attr.rc_attr.rc_mode = HI_VENC_RC_MODE_H264_CBR;
-    attr.rc_attr.h264_cbr.gop = FPS;
-    attr.rc_attr.h264_cbr.stats_time = 1;
-    attr.rc_attr.h264_cbr.src_frame_rate = FPS;
-    attr.rc_attr.h264_cbr.dst_frame_rate = FPS;
-    attr.rc_attr.h264_cbr.bit_rate = 1000;
+    attr.rc_attr.rc_mode = use_h265 ? HI_VENC_RC_MODE_H265_CBR : HI_VENC_RC_MODE_H264_CBR;
+    if (use_h265) {
+        attr.rc_attr.h265_cbr.gop = FPS;
+        attr.rc_attr.h265_cbr.stats_time = 1;
+        attr.rc_attr.h265_cbr.src_frame_rate = FPS;
+        attr.rc_attr.h265_cbr.dst_frame_rate = FPS;
+        attr.rc_attr.h265_cbr.bit_rate = 1000;
+        attr.venc_attr.h265_attr.rcn_ref_share_buf_en = HI_FALSE;
+    } else {
+        attr.rc_attr.h264_cbr.gop = FPS;
+        attr.rc_attr.h264_cbr.stats_time = 1;
+        attr.rc_attr.h264_cbr.src_frame_rate = FPS;
+        attr.rc_attr.h264_cbr.dst_frame_rate = FPS;
+        attr.rc_attr.h264_cbr.bit_rate = 1000;
+        attr.venc_attr.h264_attr.rcn_ref_share_buf_en = HI_FALSE;
+    }
     attr.gop_attr.gop_mode = HI_VENC_GOP_MODE_NORMAL_P;
     attr.gop_attr.normal_p.ip_qp_delta = 2;
 
@@ -96,8 +113,11 @@ int main(int argc, char **argv) {
     printf("start_chn ret=0x%x\n", ret);
 
     hi_u64 y_size = (hi_u64)W * H, frame_size = y_size * 3 / 2;
-    hi_void *db = NULL;
-    hi_mpi_dvpp_malloc(0, &db, frame_size);
+    // 多缓冲轮换：send 之后驱动接管所有权，不能立刻复用同一块
+    #define NB 8
+    hi_void *dbv[NB] = {NULL};
+    for (int i = 0; i < NB; i++) hi_mpi_dvpp_malloc(0, &dbv[i], frame_size);
+    hi_void *db = dbv[0];
     unsigned char *host = (unsigned char *)malloc(frame_size);
     g_xfer = (unsigned char *)malloc(4 * 1024 * 1024);
     g_fp = fopen(out, "wb");
@@ -108,11 +128,13 @@ int main(int argc, char **argv) {
 
     // ---- 主线程：按 25fps 节奏喂帧，失败就退避重投同一帧（pts 不变） ----
     int sent = 0, retries = 0;
-    for (int f = 0; f < FRAMES; f++) {
+    double t0 = (double)clock() / CLOCKS_PER_SEC;
+    for (int f = 0; f < nframes; f++) {
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
                 host[y * W + x] = (unsigned char)((x + y + f * 8) & 0xFF);
         memset(host + y_size, 128, y_size / 2);
+        db = dbv[f % NB];
         aclrtMemcpy(db, frame_size, host, frame_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
         hi_video_frame_info fi;
@@ -122,21 +144,25 @@ int main(int argc, char **argv) {
         fi.v_frame.field = HI_VIDEO_FIELD_FRAME;
         fi.v_frame.pixel_format = HI_PIXEL_FORMAT_YUV_SEMIPLANAR_420;
         fi.v_frame.video_format = HI_VIDEO_FORMAT_LINEAR;
+        // 对齐官方样例 sample_encoder.cpp：这几个字段必须显式给，且不设 phys_addr
+        fi.v_frame.dynamic_range = HI_DYNAMIC_RANGE_SDR8;
+        fi.v_frame.compress_mode = HI_COMPRESS_MODE_NONE;
+        fi.v_frame.color_gamut = HI_COLOR_GAMUT_BT709;
         fi.v_frame.virt_addr[0] = db;
-        fi.v_frame.phys_addr[0] = (hi_u64)(size_t)db;
         fi.v_frame.width_stride[0] = W;
         fi.v_frame.height_stride[0] = H;
         fi.v_frame.virt_addr[1] = (unsigned char *)db + y_size;
-        fi.v_frame.phys_addr[1] = (hi_u64)(size_t)((unsigned char *)db + y_size);
         fi.v_frame.width_stride[1] = W;
         fi.v_frame.height_stride[1] = H / 2;
-        fi.v_frame.time_ref = (hi_u32)f;
-        fi.v_frame.pts = (hi_u64)f * 80000; /* 实验：帧间隔 80ms */
+        // ★ time_ref 必须是偶数（官方样例注释：timeref must be even）——
+        //   传奇数会被 send_frame 判为非法参数（0xA0088003），表现为「隔帧失败」。
+        fi.v_frame.time_ref = (hi_u32)(f * 2);
+        fi.v_frame.pts = (hi_u64)f * (1000000 / FPS);
 
         hi_user_frame_info ufi;
         memset(&ufi, 0, sizeof(ufi));
         ufi.user_frame = fi;
-        /* 实验：user_rc_info 全零（不设置 frame_type） */
+        ufi.user_rc_info.frame_type = VENC_FRAME_TYPE_NONE;
 
         int ok = 0;
         for (int t = 0; t < 200 && !ok; t++) { // 最多等 2s
@@ -147,8 +173,7 @@ int main(int argc, char **argv) {
         if (!ok) printf("frame %d 最终失败 ret=0x%x（重试 %d 次）\n", f, ret, retries);
         else sent++;
 
-        // 按帧率节流
-        usleep(1000000 / FPS);
+        if (pace) usleep(1000000 / FPS);
     }
 
     // 等取流线程把尾巴排空
@@ -160,7 +185,8 @@ int main(int argc, char **argv) {
     fclose(g_fp);
     hi_mpi_venc_stop_chn(CHN);
     hi_mpi_venc_destroy_chn(CHN);
-    printf("DONE sent=%d retries=%d frames_out=%d bytes=%ld file=%s\n", sent,
-           retries, g_frames_out, g_bytes, out);
+    double dt = (double)clock() / CLOCKS_PER_SEC - t0;
+    printf("DONE sent=%d retries=%d frames_out=%d bytes=%ld  用时%.2fs  %.1f fps  file=%s\n",
+           sent, retries, g_frames_out, g_bytes, dt, dt > 0 ? g_frames_out / dt : 0, out);
     return (g_frames_out > 0) ? 0 : 5;
 }
