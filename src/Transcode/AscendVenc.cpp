@@ -155,7 +155,12 @@ struct AscendVenc::Impl {
 
     void loop() {
         // 线程内必须重绑上下文，否则 runtime 参数校验失败
-        aclrtSetCurrentContext(env().ctx);
+        {
+            auto dev_rc = aclrtSetDevice(cfg.device);
+            auto ctx_rc = aclrtSetCurrentContext(env().ctx);
+            fprintf(stderr, "[ascend venc] get-thread bind: setDevice=%d setCtx=%d ctx=%p dev=%d\n",
+                    (int) dev_rc, (int) ctx_rc, (void *) env().ctx, cfg.device);
+        }
         while (!stop.load()) {
             // 一个访问单元可能吐出多个 pack（IDR = AUD/VPS/SPS/PPS/SEI/切片…）。
             // 数组小了驱动会写越界，之后读到野指针长度 → aclrtMemcpy 段错误（实测）。
@@ -338,6 +343,26 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
 
     _impl = std::move(impl);
     _opened = true;
+
+    if (getenv("ASCEND_VENC_SELFTEST")) { // 决定性探针：同线程编码+同步取流，默认关闭
+        // 打开后立刻在**当前线程**编一帧并同步取流：用于区分
+        // 「取流线程绑不到上下文」和「本进程里编码器根本不出流」。
+        std::vector<uint8_t> gray(impl->frame_size, 128);
+        auto ok_send = encode(gray.data(), 1000);
+        int got = 0;
+        for (int i = 0; i < 200 && got == 0; i++) {
+            hi_venc_pack pk[64];
+            hi_venc_stream st;
+            memset(&st, 0, sizeof(st));
+            memset(pk, 0, sizeof(pk));
+            st.pack = pk;
+            st.pack_cnt = 64;
+            auto r = hi_mpi_venc_get_stream(cfg.channel, &st, 10);
+            if (r == 0) { got = (int) st.pack_cnt; hi_mpi_venc_release_stream(cfg.channel, &st); }
+            else usleep(5000);
+        }
+        fprintf(stderr, "[ascend venc] INLINE selftest: send=%d got_packs=%d\n", (int) ok_send, got);
+    }
     return true;
 
 fail:
@@ -413,8 +438,11 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
         im.idx++;
         _sent++;
         if (_sent.load() <= 3) {
-            fprintf(stderr, "[ascend venc] sent frame #%u pts=%llu idx=%u\n", _sent.load(),
-                    (unsigned long long) pts_us, im.idx);
+            hi_venc_chn_status st;
+            memset(&st, 0, sizeof(st));
+            auto qs = hi_mpi_venc_query_status(im.cfg.channel, &st);
+            fprintf(stderr, "[ascend venc] sent #%u pts=%llu query rc=0x%x left_pics=%u cur_packs=%u\n",
+                    _sent.load(), (unsigned long long) pts_us, qs, st.left_pics, st.cur_packs);
         }
     } else {
         // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看

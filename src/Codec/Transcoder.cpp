@@ -1960,9 +1960,18 @@ bool FFmpegEncoder::encodeAscend(AVFrame *frame) {
     int dst_stride[4] = {w, w, 0, 0};
     sws_scale(_ascend_sws, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
 
-    // pts 必须严格递增（设备侧实测约束），按输出帧率匀速推进
-    uint64_t pts = _ascend_pts_us;
-    _ascend_pts_us += (uint64_t) (1000000.0 / (_video_fps > 0.5f ? _video_fps : 25.0f));
+    // pts 必须严格递增（设备侧实测约束）。
+    // 用「自 open 以来的墙上时间」而不是帧序号 × 间隔：设备侧码控会参考真实时间，
+    // 首帧若比 open 晚太多（ZLM 里 warmup 前有解码器初始化），帧序号推算的 pts
+    // 会落后于设备时钟，编码器直接把帧丢掉（实测 left_pics 归零但无码流）。
+    static const auto t0 = std::chrono::steady_clock::now();
+    uint64_t pts = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    if (pts <= _ascend_pts_us) {
+        pts = _ascend_pts_us + 1;
+    }
+    _ascend_pts_us = pts;
     if (!_ascend->encode(_ascend_nv12.data(), pts)) {
         WarnL << "ascend venc encode failed";
         return false;
