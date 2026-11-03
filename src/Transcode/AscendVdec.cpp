@@ -105,8 +105,13 @@ struct AscendVdec::Impl {
         const uint8_t *base_y = (const uint8_t *) vf.virt_addr[0];
         const uint8_t *base_uv = (const uint8_t *) vf.virt_addr[1];
         if (!base_y) {
-            base_y = out_buf;
-            base_uv = out_buf ? out_buf + (size_t) y_stride * h : nullptr;
+            base_y = out_buf; // 我们给 pic.vir_addr 时，数据落在自己的输出缓冲里
+        }
+        if (!base_uv && base_y) {
+            // 实测：NV12 半平面输出的 virt_addr[1] 恒为 NULL —— UV 紧跟在 Y 后面
+            // 同一块连续内存里（offset = 行跨度 × 高度）。不这么兜底会整帧丢弃
+            // （日志形如 `drop: no plane addr (virt0=0x... virt1=(nil))`）。
+            base_uv = base_y + (size_t) y_stride * h;
         }
         if (!base_y || !base_uv) {
             if (++dropped <= 3) {
@@ -116,25 +121,55 @@ struct AscendVdec::Impl {
             return;
         }
 
-        // Y 平面逐行拷（设备侧 stride 可能大于 width，需要紧凑化）
-        for (int row = 0; row < h; row++) {
-            auto src = base_y + (size_t) row * y_stride;
-            auto dst = nv12.data() + (size_t) row * w;
-            if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+        // 拷贝策略：stride == width 时整块一次拷完（常见情况，一帧 2 次 memcpy）；
+        // 只有设备给了对齐跨度（stride > width）才退化为逐行紧凑化。
+        // 逐行拷是每帧上千次 aclrtMemcpy，实测把硬解拖到跟不上 25fps 实时
+        // （客户端视频比音频落后 1.5 秒），所以必须区分这两种情况。
+        if (y_stride == w && uv_stride == w) {
+            if (aclrtMemcpy(nv12.data(), need, base_y, need, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
                 return;
             }
-        }
-        // UV 平面：NV12 是高度/2 行、每行 width 字节（interleaved）
-        for (int row = 0; row < h / 2; row++) {
-            auto src = base_uv + (size_t) row * uv_stride;
-            auto dst = nv12.data() + (size_t) w * h + (size_t) row * w;
-            if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-                return;
+        } else {
+            for (int row = 0; row < h; row++) {
+                auto src = base_y + (size_t) row * y_stride;
+                auto dst = nv12.data() + (size_t) row * w;
+                if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                    return;
+                }
+            }
+            for (int row = 0; row < h / 2; row++) {
+                auto src = base_uv + (size_t) row * uv_stride;
+                auto dst = nv12.data() + (size_t) w * h + (size_t) row * w;
+                if (aclrtMemcpy(dst, w, src, w, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                    return;
+                }
             }
         }
         if (cb) {
             cb(nv12.data(), w, h, (uint32_t) vf.pts);
         }
+    }
+
+    /// 取走当前所有已就绪的帧，返回取到的帧数。
+    /// 送包返回 0xA005800F(BUF_FULL) 时必须先调它腾出空间，
+    /// 只退避重投会一直失败到重试用尽（实测一帧都取不出来）。
+    int drainFrames() {
+        int n = 0;
+        for (;;) {
+            hi_video_frame_info fi;
+            hi_vdec_supplement_info supp;
+            hi_vdec_stream out_st;
+            memset(&fi, 0, sizeof(fi));
+            memset(&supp, 0, sizeof(supp));
+            // 第 4 参是纯出参，官方从不预填
+            if (hi_mpi_vdec_get_frame(cfg.channel, &fi, &supp, &out_st, 0) != 0) {
+                break;
+            }
+            n++;
+            emit(fi);
+            hi_mpi_vdec_release_frame(cfg.channel, &fi);
+        }
+        return n;
     }
 };
 
@@ -290,7 +325,10 @@ bool AscendVdec::decode(const uint8_t *annexb, size_t len, uint32_t pts_ms) {
         if (ret == 0) {
             break;
         }
-        usleep(1000); // 缓冲满时退避重投
+        // 0xA005800F(BUF_FULL)：输入/输出缓冲被占满。**必须先取帧腾出空间**，
+        // 只退避重投永远等不到空位（实测一直失败到重试用尽，且一帧都取不出来）。
+        _out += (uint32_t) im.drainFrames();
+        usleep(500);
     }
     if (ret != 0) {
         static int warn = 0;
@@ -306,22 +344,7 @@ bool AscendVdec::decode(const uint8_t *annexb, size_t len, uint32_t pts_ms) {
         fprintf(stderr, "[ascend vdec] in=%u out=%u dropped=%u\n", _in, _out, im.dropped);
     }
 
-    // 取走当前所有已就绪的帧
-    for (;;) {
-        hi_video_frame_info fi;
-        hi_vdec_supplement_info supp;
-        hi_vdec_stream out_st;
-        memset(&fi, 0, sizeof(fi));
-        memset(&supp, 0, sizeof(supp));
-        // 第 4 参是纯出参，官方从不预填
-        auto gret = hi_mpi_vdec_get_frame(im.cfg.channel, &fi, &supp, &out_st, kGetTimeoutMs);
-        if (gret != 0) {
-            break;
-        }
-        _out++;
-        im.emit(fi);
-        hi_mpi_vdec_release_frame(im.cfg.channel, &fi);
-    }
+    _out += (uint32_t) im.drainFrames();
     return true;
 }
 

@@ -89,7 +89,9 @@ struct AscendVenc::Impl {
         stream.pack_cnt = kMaxPacks;
 
         // 非阻塞(0)这条路径在本进程内会卡住不返回，必须给正超时。
-        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 5);
+        // 超时就是阻塞等待上限：5ms × 每帧多次调用会把线程钉在驱动里（实测单路就吃满一个核），
+        // 取 1ms 足够（编码器通常几百微秒出包），没出来就留给下一帧再取。
+        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 1);
         if (ret != 0) {
             return 0;
         }
@@ -388,7 +390,7 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
         }
         // 把同一时刻可取的包取干净，但必须有上界：
         // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
-        for (int k = 0; k < 16 && im.drainOnce() > 0; k++) {
+        for (int k = 0; k < 4 && im.drainOnce() > 0; k++) {
         }
     } else {
         // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看

@@ -1976,18 +1976,28 @@ bool FFmpegEncoder::encodeAscend(AVFrame *frame) {
     if (_ascend_nv12.size() != need) {
         _ascend_nv12.resize(need);
     }
-    _ascend_sws = sws_getCachedContext(_ascend_sws, frame->width, frame->height,
-                                       (AVPixelFormat) frame->format, w, h,
-                                       AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!_ascend_sws) {
-        WarnL << "ascend venc: sws_getCachedContext failed src=" << frame->width << "x"
-              << frame->height << " fmt=" << frame->format;
-        return false;
+    // 快路径：硬解（DVPP VDEC）出来的帧本身就是 NV12 且尺寸一致时，直接搬内存，
+    // 不要再过一遍 sws —— 720p 每帧一次全幅颜色转换在 25fps 下是可观的纯浪费
+    // （实测硬解链路 CPU 98%，其中很大一块来自这里）。
+    const bool already_nv12 = (frame->format == AV_PIX_FMT_NV12) &&
+                              (frame->width == w) && (frame->height == h);
+    if (!already_nv12) {
+        _ascend_sws = sws_getCachedContext(_ascend_sws, frame->width, frame->height,
+                                           (AVPixelFormat) frame->format, w, h,
+                                           AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!_ascend_sws) {
+            WarnL << "ascend venc: sws_getCachedContext failed src=" << frame->width << "x"
+                  << frame->height << " fmt=" << frame->format;
+            return false;
+        }
+        uint8_t *dst[4] = {_ascend_nv12.data(), _ascend_nv12.data() + (size_t) w * h, nullptr,
+                           nullptr};
+        int dst_stride[4] = {w, w, 0, 0};
+        sws_scale(_ascend_sws, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
+    } else {
+        memcpy(_ascend_nv12.data(), frame->data[0], (size_t) w * h);
+        memcpy(_ascend_nv12.data() + (size_t) w * h, frame->data[1], (size_t) w * h / 2);
     }
-    uint8_t *dst[4] = {_ascend_nv12.data(), _ascend_nv12.data() + (size_t) w * h, nullptr,
-                       nullptr};
-    int dst_stride[4] = {w, w, 0, 0};
-    sws_scale(_ascend_sws, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
 
     // pts 必须严格递增（设备侧实测约束），按**输出帧率匀速推进**。
     // 不要用墙上时钟：解码偶发突发时墙上时间与源时间轴脱节，会把输出时间轴
