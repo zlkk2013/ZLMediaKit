@@ -582,12 +582,20 @@ if(ENABLE_ASCEND_VENC)
     else()
       include_directories(SYSTEM ${ASCEND_CANN_INC} ${ASCEND_CANN_INC}/acl)
       update_cached_list(MK_COMPILE_DEFINITIONS ENABLE_ASCEND_VENC)
-      # 驱动侧的 libascend_hal 在 driver/lib64/driver 下，不在 toolkit 里
+      # ACL runtime（aclInit/aclrtMemcpy 等）、DVPP、以及驱动侧的 libascend_hal
+      find_library(ASCEND_CL_LIB ascendcl PATHS /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64)
       find_library(ASCEND_HAL_LIB ascend_hal PATHS /usr/local/Ascend/driver/lib64/driver)
       update_cached_list(MK_LINK_LIBRARIES ${ASCEND_DVPP_LIB})
+      if(ASCEND_CL_LIB)
+        update_cached_list(MK_LINK_LIBRARIES ${ASCEND_CL_LIB})
+      endif()
       if(ASCEND_HAL_LIB)
         update_cached_list(MK_LINK_LIBRARIES ${ASCEND_HAL_LIB})
       endif()
+      # 运行时也要能找到这两套库
+      set(CMAKE_INSTALL_RPATH "${ASCEND_CANN_INC}/../lib64")
+      link_directories(/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64
+                       /usr/local/Ascend/driver/lib64/driver)
       message(STATUS "Ascend VENC enabled: ${ASCEND_CANN_INC}")
     endif()
   endif()

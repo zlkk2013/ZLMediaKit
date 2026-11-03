@@ -494,9 +494,25 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
     _src_fps_measure = track->getTrackType() == TrackVideo && src_video &&
                        (src_fps <= 0.5f || src_video->getCodecId() == CodecVP8 ||
                         src_video->getCodecId() == CodecVP9 || src_video->getCodecId() == CodecAV1);
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾硬编：只在「视频 + 要求硬编 + H264/H265 + 本机 DVPP 可用」时接管。
+    // 注意这条路径不需要 libavcodec 编码器（_context 全程为空），
+    // 所以下面的 findEncoder 失败不算错误。
+    if (_video_params.hw_encode && track->getTrackType() == TrackVideo &&
+        (_codec_id == CodecH264 || _codec_id == CodecH265) && AscendVenc::available(0)) {
+        _ascend_wanted = true;
+        InfoL << "transcode: video will be encoded by Ascend DVPP VENC";
+    }
+#endif
     _codec = findEncoder(_codec_id,
                          _video_params.hw_encode && track->getTrackType() == TrackVideo);
-    if (!_codec) {
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾路径不需要 libavcodec 编码器，这里不能因为找不到就抛异常
+    const bool ascend_ready = _ascend_wanted;
+#else
+    const bool ascend_ready = false;
+#endif
+    if (!_codec && !ascend_ready) {
         throw std::runtime_error("未找到编码器: " + string(::mediakit::getCodecName(_codec_id)));
     }
 
@@ -550,7 +566,15 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
                       : px >= 640L * 480 ? 1500000 : 800000;
             InfoL << "hw encoder without explicit bitrate, defaulting to " << bitrate << "bps";
         }
-        auto ret = openVideoCodec(width, height, bitrate, _codec);
+        bool ret;
+#ifdef ENABLE_ASCEND_VENC
+        if (_ascend_wanted) {
+            ret = openAscendVideo(width, height, bitrate);
+        } else
+#endif
+        {
+            ret = openVideoCodec(width, height, bitrate, _codec);
+        }
         if (!ret && _video_params.hw_encode && isHwEncoderCodec(_codec)) {
             // 硬件编码器存在但打不开（驱动异常、并发会话数上限、分辨率超出硬件能力）
             // 必须回落软件编码：宁可用 CPU 也不能让这条流起不来。
@@ -610,6 +634,16 @@ FFmpegEncoder::FFmpegEncoder(const Track::Ptr &track, int thread_num, float src_
 FFmpegEncoder::~FFmpegEncoder() {
     stopThread(true);
     flush();
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend) {
+        _ascend->close();
+        _ascend.reset();
+    }
+    if (_ascend_sws) {
+        sws_freeContext(_ascend_sws);
+        _ascend_sws = nullptr;
+    }
+#endif
     if (_context) {
         _context.reset();
     }
@@ -1312,8 +1346,19 @@ FFmpegFrame::Ptr FFmpegEncoder::formatFrame(const FFmpegFrame::Ptr &frame) {
 }
 
 bool FFmpegEncoder::inputFrame(const FFmpegFrame::Ptr &frame, bool async) {
-    if (!_context || !frame || !frame->get()) {
+    if (!frame || !frame->get()) {
         return false;
+    }
+    if (!_context) {
+#ifdef ENABLE_ASCEND_VENC
+        // 昇腾路径没有 libavcodec 上下文：只有开了 AscendVenc 才继续，
+        // 否则必须照样丢弃（保持原有「无上下文不能编码」的语义）。
+        if (!_ascend) {
+            return false;
+        }
+#else
+        return false;
+#endif
     }
     _flush_done = false;
     if (async && TaskManager::isEnabled()) {
@@ -1466,6 +1511,12 @@ bool FFmpegEncoder::inputSilence() {
 bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
     TimeTicker2(30, TraceL);
 
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾硬编自己负责格式转换与 pts 推进，不走下面的 libavcodec 路径
+    if (_ascend && !_context) {
+        return encodeAscend(frame->get());
+    }
+#endif
     if (!_context) {
         return false;
     }
@@ -1630,7 +1681,14 @@ bool FFmpegEncoder::inputFrame_l(const FFmpegFrame::Ptr &frame) {
 }
 
 bool FFmpegEncoder::warmup(const Track::Ptr &target) {
-    if (!target || !_context) {
+    if (!target) {
+        return false;
+    }
+#ifdef ENABLE_ASCEND_VENC
+    // 昇腾硬编没有 _context，尺寸取输出尺寸、像素格式用 YUV420P（encodeAscend 会转 NV12）
+    if (!_ascend)
+#endif
+    if (!_context) {
         return false;
     }
     // 预热用的尺寸必须是「编码器的输出尺寸」，不是源尺寸：缩放场景下两者不同，
@@ -1640,6 +1698,14 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
     // return EINVAL immediately.
     int width = _context->width;
     int height = _context->height;
+    AVPixelFormat warm_fmt = _context->pix_fmt;
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend) {
+        width = _out_width;
+        height = _out_height;
+        warm_fmt = AV_PIX_FMT_YUV420P;
+    }
+#endif
     if (width <= 0 || height <= 0) {
         WarnL << "warmup: encoder has no valid size";
         return false;
@@ -1665,7 +1731,7 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
     if (!frame) {
         return false;
     }
-    frame->format = _context->pix_fmt;
+    frame->format = warm_fmt;
     frame->width = width;
     frame->height = height;
     int ret = av_frame_get_buffer(frame, 32);
@@ -1720,6 +1786,17 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
         if (!ok) {
             break;
         }
+#ifdef ENABLE_ASCEND_VENC
+        // 昇腾链路是同步排空但仍然要等：encodeFrame 返回时码流已经回调过，
+        // 但要防止个别帧在这一拍没出包（驱动排队）就往下走 —— 一旦 config_frames 还空着
+        // 就恢复 _cb，预热包会被当真实帧推下去，此时目标轨尚未 ready，
+        // muxer 取 SPS 直接断言 abort（实测段错误）。
+        if (_ascend) {
+            for (int w = 0; w < 40 && config_frames.empty(); w++) {
+                usleep(5 * 1000);
+            }
+        }
+#endif
     }
     _cb = old_cb;
     av_frame_free(&frame);
@@ -1820,7 +1897,119 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
     return video->ready();
 }
 
+
+bool FFmpegEncoder::isVideo() const {
+    if (_context) {
+        return _context->codec_type == AVMEDIA_TYPE_VIDEO;
+    }
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend || _ascend_wanted) {
+        return true;
+    }
+#endif
+    return _codec_id == CodecH264 || _codec_id == CodecH265 || _codec_id == CodecVP8 ||
+           _codec_id == CodecVP9 || _codec_id == CodecAV1;
+}
+
+#ifdef ENABLE_ASCEND_VENC
+
+bool FFmpegEncoder::openAscendVideo(int width, int height, int bitrate) {
+    // 通道号必须走池申请/归还，不能取模复用（复用会把正在跑的流打停，实测 18 路时发生）
+    // 池满（>16 路）时返回 -1，这里直接回落软编，已在跑的流不受影响
+    AscendVenc::Config cfg;
+    cfg.width = width;
+    cfg.height = height;
+    cfg.h265 = (_codec_id == CodecH265);
+    cfg.fps = (int) llround(_video_fps > 0.5f ? _video_fps : 25.0f);
+    cfg.bitrate_kbps = bitrate > 0 ? bitrate / 1000 : 0;
+    cfg.channel = AscendVenc::acquireChannel();
+    if (cfg.channel < 0) {
+        WarnL << "ascend venc: no free DVPP channel (max 16 concurrent), fallback to software";
+        return false;
+    }
+
+    std::string err;
+    auto enc = std::make_shared<AscendVenc>();
+    // 回调跑在 AscendVenc::encode() 的调用线程上（同步排空，无后台取流线程）：
+    // 组装成 AVPacket 后复用 onEncode 的
+    // 整条下游逻辑（Annex-B 组装、关键帧标记、时间轴推进），与软编路径完全一致。
+    auto cb = [this](const char *data, size_t len, uint64_t, bool key) {
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            return;
+        }
+        if (av_new_packet(pkt, (int) len) < 0) {
+            av_packet_free(&pkt);
+            return;
+        }
+        memcpy(pkt->data, data, len);
+        if (key) {
+            pkt->flags |= AV_PKT_FLAG_KEY;
+        }
+        onEncode(pkt);
+        av_packet_free(&pkt);
+    };
+    if (!enc->open(cfg, cb, err)) {
+        WarnL << "ascend venc open failed: " << err << " (fallback to software)";
+        return false;
+    }
+    InfoL << "ascend venc opened: " << width << "x" << height << " "
+          << (cfg.h265 ? "H265" : "H264") << " ch=" << cfg.channel
+          << " fps=" << cfg.fps << " bitrate=" << cfg.bitrate_kbps << "kbps";
+    _ascend = enc;
+    return true;
+}
+
+bool FFmpegEncoder::encodeAscend(AVFrame *frame) {
+    if (!_ascend || !frame) {
+        if (!_ascend) {
+            WarnL << "encodeAscend called without ascend encoder";
+        }
+        return false;
+    }
+    int w = _out_width > 0 ? _out_width : frame->width;
+    int h = _out_height > 0 ? _out_height : frame->height;
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    size_t need = (size_t) w * h * 3 / 2;
+    if (_ascend_nv12.size() != need) {
+        _ascend_nv12.resize(need);
+    }
+    _ascend_sws = sws_getCachedContext(_ascend_sws, frame->width, frame->height,
+                                       (AVPixelFormat) frame->format, w, h,
+                                       AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!_ascend_sws) {
+        WarnL << "ascend venc: sws_getCachedContext failed src=" << frame->width << "x"
+              << frame->height << " fmt=" << frame->format;
+        return false;
+    }
+    uint8_t *dst[4] = {_ascend_nv12.data(), _ascend_nv12.data() + (size_t) w * h, nullptr,
+                       nullptr};
+    int dst_stride[4] = {w, w, 0, 0};
+    sws_scale(_ascend_sws, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
+
+    // pts 必须严格递增（设备侧实测约束），按**输出帧率匀速推进**。
+    // 不要用墙上时钟：解码偶发突发时墙上时间与源时间轴脱节，会把输出时间轴
+    // 压缩（实测 dts 间隔 25ms 而非 40ms），下游按 25fps 播就会变速。
+    // Advance pts by the nominal frame interval instead of wall-clock time: a decode
+    // burst made the output timeline ~1.6x too fast (25ms instead of 40ms spacing).
+    uint64_t pts = _ascend_pts_us;
+    _ascend_pts_us += (uint64_t) (1000000.0 / (_video_fps > 0.5f ? _video_fps : 25.0f));
+    if (!_ascend->encode(_ascend_nv12.data(), pts)) {
+        WarnL << "ascend venc encode failed";
+        return false;
+    }
+    return true;
+}
+#endif // ENABLE_ASCEND_VENC
+
 bool FFmpegEncoder::encodeFrame(AVFrame *frame) {
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend) {
+        return encodeAscend(frame);
+    }
+#endif
     auto ret = avcodec_send_frame(_context.get(), frame);
     if (ret < 0) {
         if (ret != AVERROR(EAGAIN)) {
@@ -1855,6 +2044,16 @@ bool FFmpegEncoder::drainEncoder() {
 }
 
 void FFmpegEncoder::flush() {
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend) {
+        if (_flush_done) {
+            return;
+        }
+        _flush_done = true;
+        _ascend->flush();
+        return;
+    }
+#endif
     if (!_context || _flush_done) {
         return;
     }
@@ -1892,7 +2091,7 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     // Use our own millisecond clock advancing by a fixed step per frame so
     // downstream sees strictly monotonic dts starting at 0.
     int64_t next_ms;
-    if (_context->codec_type == AVMEDIA_TYPE_VIDEO) {
+    if (isVideo()) {
         // 视频时间轴完全由 videoStepMs() 决定的步进累加（见那里的说明），
         // 这里不另起时钟。
         // The video timeline is the accumulation of videoStepMs() (see there); no
@@ -1921,7 +2120,10 @@ void FFmpegEncoder::onEncode(AVPacket *packet) {
     // 只有音频才需要它兜底乱序。
     // The video next_ms is already strictly increasing from the packet index and must
     // not be rewritten by this guard; only audio needs it as a reorder backstop.
-    if (_context->codec_type != AVMEDIA_TYPE_VIDEO && next_ms <= _emitted_ms) {
+    // 昇腾硬编路径没有 libavcodec 上下文（_context 为空），这里必须判空，
+    // 否则视频首包就在这里解引用空指针（实测 SIGSEGV）
+    // The Ascend path has no libavcodec context, so this must be null-checked
+    if ((!_context || _context->codec_type != AVMEDIA_TYPE_VIDEO) && next_ms <= _emitted_ms) {
         next_ms = _emitted_ms + (_frame_interval_ms > 0 ? _frame_interval_ms : 20);
     }
     _emitted_ms = next_ms;

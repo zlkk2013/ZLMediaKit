@@ -8,7 +8,6 @@
 
 #ifdef ENABLE_ASCEND_VENC
 
-#include <pthread.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -136,61 +135,91 @@ struct AscendVenc::Impl {
     vector<void *> dev_buf;
     vector<uint8_t *> host_buf;      ///< 与 dev_buf 一一对应的 host 暂存
     vector<uint8_t> xfer;            ///< 取流时 D2H 的中转缓冲
+    vector<char> au;                 ///< 拼接同一个访问单元的所有 pack
 
-    pthread_t th{};
-    atomic<bool> stop{false};
-    atomic<bool> running{false};
     mutex send_mtx;
     uint32_t idx = 0;                ///< 帧序号（time_ref 用 idx*2）
 
     // 统计
     uint32_t local_out = 0;
 
-    // ---- 取流线程 ----
-    static void *threadEntry(void *p) {
-        auto self = static_cast<Impl *>(p);
-        self->loop();
-        return nullptr;
-    }
+    /// 取一次码流（非阻塞），把拿到的包全部回调出去。返回本次取到的 pack 数。
+    int drainOnce() {
+        static constexpr int kMaxPacks = 64;
+        hi_venc_pack packs[kMaxPacks];
+        hi_venc_stream stream;
+        memset(&stream, 0, sizeof(stream));
+        memset(packs, 0, sizeof(packs));
+        stream.pack = packs;
+        stream.pack_cnt = kMaxPacks;
 
-    void loop() {
-        // 线程内必须重绑上下文，否则 runtime 参数校验失败
-        aclrtSetCurrentContext(env().ctx);
-        while (!stop.load()) {
-            hi_venc_pack packs[8];
-            hi_venc_stream stream;
-            memset(&stream, 0, sizeof(stream));
-            memset(packs, 0, sizeof(packs));
-            stream.pack = packs;
-            stream.pack_cnt = 8;
-
-            auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 0);
-            if (ret != 0) {
-                usleep(500); // 非阻塞轮询
+        // 非阻塞(0)这条路径在本进程内会卡住不返回，必须给正超时。
+        auto ret = hi_mpi_venc_get_stream(cfg.channel, &stream, 5);
+        if (ret != 0) {
+            return 0;
+        }
+        // 一次 get_stream 返回的所有 pack 属于**同一个访问单元**（IDR 会是
+        // AUD/VPS/SPS/PPS/SEI/切片…）。必须拼成一帧再回调：按 pack 逐个回调等于把
+        // 一帧拆成多帧，实测入口 27fps 却输出 38fps，下游还会拿到半帧。
+        // All packs of one get_stream() belong to the SAME access unit, so they must be
+        // concatenated and emitted once. Emitting per pack splits a frame into several.
+        au.clear();
+        uint64_t au_pts = 0;
+        for (hi_u32 i = 0; i < stream.pack_cnt && i < (hi_u32) kMaxPacks; i++) {
+            size_t len = packs[i].len;
+            if (!packs[i].addr || len == 0 || len > (32u << 20)) {
                 continue;
             }
-            for (hi_u32 i = 0; i < stream.pack_cnt; i++) {
-                size_t len = packs[i].len;
-                if (!packs[i].addr || len == 0) {
-                    continue;
-                }
-                if (xfer.size() < len) {
-                    xfer.resize(len);
-                }
-                if (aclrtMemcpy(xfer.data(), len, packs[i].addr, len,
-                                ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-                    continue;
-                }
-                local_out++;
-                if (cb) {
-                    cb((const char *) xfer.data(), len, packs[i].pts,
-                       isKeyFrame(xfer.data(), len, h265));
-                }
+            if (xfer.size() < len) {
+                xfer.resize(len);
             }
-            hi_mpi_venc_release_stream(cfg.channel, &stream);
+            if (aclrtMemcpy(xfer.data(), len, packs[i].addr, len,
+                            ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                continue;
+            }
+            if (au.empty()) {
+                au_pts = packs[i].pts;
+            }
+            au.insert(au.end(), (const char *) xfer.data(), (const char *) xfer.data() + len);
+        }
+        hi_mpi_venc_release_stream(cfg.channel, &stream);
+        if (au.empty()) {
+            return 0;
+        }
+        local_out++;
+        if (cb) {
+            cb(au.data(), au.size(), au_pts,
+               isKeyFrame((const uint8_t *) au.data(), au.size(), h265));
+        }
+        return 1;
+    }
+
+};
+
+namespace {
+constexpr int kMaxVencChannels = 16;
+std::mutex g_chan_mtx;
+bool g_chan_used[kMaxVencChannels] = {};
+} // namespace
+
+int AscendVenc::acquireChannel() {
+    lock_guard<mutex> lck(g_chan_mtx);
+    for (int i = 0; i < kMaxVencChannels; i++) {
+        if (!g_chan_used[i]) {
+            g_chan_used[i] = true;
+            return i;
         }
     }
-};
+    return -1;
+}
+
+void AscendVenc::releaseChannel(int channel) {
+    if (channel < 0 || channel >= kMaxVencChannels) {
+        return;
+    }
+    lock_guard<mutex> lck(g_chan_mtx);
+    g_chan_used[channel] = false;
+}
 
 int AscendVenc::defaultBitrateKbps(int width, int height) {
     long px = (long) width * height;
@@ -288,9 +317,24 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
         env().release();
         return false;
     }
+    // 官方样例 create_chn 之后还有两步，缺了不影响「能建通道」但可能让码控丢帧：
+    //   1) set_scene_mode(SCENE_0)：声明画面内容特征（静止/规律运动）
+    //   2) get_rc_param → set_rc_param 往返：把驱动默认码控参数显式下发一次
+    {
+        auto sm = hi_mpi_venc_set_scene_mode(cfg.channel, HI_VENC_SCENE_0);
+        hi_venc_rc_param rcp;
+        memset(&rcp, 0, sizeof(rcp));
+        auto gr = hi_mpi_venc_get_rc_param(cfg.channel, &rcp);
+        auto sr = (gr == 0) ? hi_mpi_venc_set_rc_param(cfg.channel, &rcp) : gr;
+        fprintf(stderr, "[ascend venc] scene_mode=0x%x rc_roundtrip get=0x%x set=0x%x\n",
+                sm, gr, sr);
+    }
+
+    fprintf(stderr, "[ascend venc] before start_chn\n");
     hi_venc_start_param sp;
     sp.recv_pic_num = -1;
     ret = hi_mpi_venc_start_chn(cfg.channel, &sp);
+    fprintf(stderr, "[ascend venc] start_chn ret=0x%x\n", ret);
     if (ret != 0) {
         char buf[96];
         snprintf(buf, sizeof(buf), "hi_mpi_venc_start_chn 失败 0x%x", ret);
@@ -315,16 +359,13 @@ bool AscendVenc::open(const Config &cfg_in, OnPacket cb, std::string &err) {
         impl->host_buf[i] = (uint8_t *) malloc(impl->frame_size);
     }
     impl->xfer.resize(4 * 1024 * 1024);
+    fprintf(stderr, "[ascend venc] buffers ready (%d x %u bytes)\n", cfg.bufs,
+            (unsigned) impl->frame_size);
 
-    impl->stop.store(false);
-    if (pthread_create(&impl->th, nullptr, &Impl::threadEntry, impl.get()) != 0) {
-        err = "取流线程创建失败";
-        goto fail;
-    }
-    impl->running.store(true);
 
     _impl = std::move(impl);
     _opened = true;
+
     return true;
 
 fail:
@@ -399,6 +440,27 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
     if (ok) {
         im.idx++;
         _sent++;
+        // 同线程排空：实测「另起取流线程」在本进程里拿不到数据（恒 BUF_EMPTY），
+        // 而同线程同步取流稳定拿得到（INLINE 探针 send=1/got_packs=1）。
+        // 编码器出包有几毫秒延迟，所以要带等待重试，不能取一次空就放弃。
+        // 等出包：编码器出包有几毫秒延迟，一旦不等就会让「发送↔取流」错拍，
+        // 下游解码队列积压到丢帧（实测只剩预热那一帧能编出来）。
+        for (int w = 0; w < 25; w++) {
+            if (im.drainOnce() > 0) {
+                break;
+            }
+            usleep(1000);
+        }
+        // 把同一时刻可取的包取干净，但必须有上界：
+        // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
+        for (int k = 0; k < 16 && im.drainOnce() > 0; k++) {
+        }
+    } else {
+        // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看
+        if (_sent.load() < 5) {
+            fprintf(stderr, "[ascend venc] send failed after retries, ch=%d size=%dx%d\n",
+                    im.cfg.channel, im.cfg.width, im.cfg.height);
+        }
     }
     return ok;
 }
@@ -407,9 +469,13 @@ void AscendVenc::flush() {
     if (!_opened || !_impl) {
         return;
     }
-    // 给取流线程一点时间把残余码流取干净
-    for (int i = 0; i < 50 && _out.load() < _sent.load(); i++) {
-        usleep(2 * 1000);
+    // 主动排空：编码器里可能还有排队未出的帧（没有独立取流线程，这里必须自己取）
+    // Drain inline: there is deliberately no background drain thread, so flush() must
+    // poll the channel itself until the pending frames come out (bounded wait).
+    for (int i = 0; i < 100 && _out.load() < _sent.load(); i++) {
+        if (_impl->drainOnce() == 0) {
+            usleep(2 * 1000);
+        }
     }
 }
 
@@ -419,13 +485,10 @@ void AscendVenc::close() {
     }
     auto &im = *_impl;
     flush();
-    im.stop.store(true);
-    if (im.running.load()) {
-        pthread_join(im.th, nullptr);
-        im.running.store(false);
-    }
     hi_mpi_venc_stop_chn(im.cfg.channel);
     hi_mpi_venc_destroy_chn(im.cfg.channel);
+    // 通道必须归还，否则后续流申请不到号（池耗尽时会明确报错并回落软编）
+    releaseChannel(im.cfg.channel);
     for (auto p : im.dev_buf) {
         if (p) hi_mpi_dvpp_free(p);
     }

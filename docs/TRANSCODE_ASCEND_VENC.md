@@ -194,3 +194,170 @@ export LD_LIBRARY_PATH=$LIB:$DRV:$LD_LIBRARY_PATH
 ./venc_dual /tmp/out.h264 0
 ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 /tmp/out.h264
 ```
+
+## 接进 FFmpegEncoder 的实测状态（2026-11-03）
+
+开关 `-DENABLE_ASCEND_VENC=ON`，默认 OFF，对非 aarch64 构建零影响。
+
+### 已验证
+
+| 项 | 证据 |
+|---|---|
+| 分支选择正确 | 日志 `transcode: video will be encoded by Ascend DVPP VENC` |
+| DVPP 通道打开成功 | `ascend venc opened: 1280x720 H265 ch=0 fps=25` |
+| 预热产出配置帧 | `warmup done: config_nals=8, ready=1, size=1280x720` |
+| 目标轨就绪 | `transcoded video track ready=1, size=1280x720` |
+| 客户端能拉到转码流 | `ffprobe` 拉流返回 `hevc,1280,720` |
+| 无崩溃 | 清理版连续跑 20 秒 `crash=0` |
+
+### 接线期踩到的 6 个坑（全部已修，教训可复用）
+
+1. **`aclInit` 只能调一次**：`available()` 探测过后 `open()` 再调必失败 → 初始化只做一次，之后每线程 `aclrtSetCurrentContext`。
+2. **`encode()` 必须给调用线程绑 context**：不绑则多线程下一帧都送不进。
+3. **独立取流线程在本进程内拿不到数据**：`hi_mpi_venc_get_stream` 恒 `0xA008800e`（BUF_EMPTY），而同一线程同步取流稳定成功（探针 `send=1 got_packs=1`）→ 改为 `encode()` 内同步排空。
+4. **`get_stream` 超时不能取 0**：非阻塞路径会卡住不返回；也不能取大（5ms×20 轮把 25fps 限流到 8fps）→ 取 1ms + 极少次重试。
+5. **`onEncode` 里 `_context` 为空**：昇腾路径没有 libavcodec 上下文，`_context->codec_type` 直接 SIGSEGV → 判空。
+6. **`goto fail` 不能跨过变量初始化**：C++ 错误「跳转至标号 fail」。
+
+### 端到端验收（2026-11-03 收口）
+
+```
+addTranscode(video_codec=H265, hw=1, on_demand=0) → 200
+服务端：onEncoded | transcoded 100/200/300/400 frames（持续产出）
+客户端：ffprobe → hevc,1280,720
+崩溃：0
+```
+
+### 最关键的一个堵点（第 7 个坑，也是真正卡了三小时的那个）
+
+`FFmpegEncoder::inputFrame()` 第一行是：
+
+```cpp
+if (!_context || !frame || !frame->get()) {
+    return false;      // ← 昇腾路径根本没有 _context，于是每一帧都被丢掉
+}
+```
+
+昇腾路径不创建 libavcodec 上下文，所以真实推流帧在进入 `inputFrame_l` 之前就被**静默丢弃**：
+`warmup()` 直接调 `encodeFrame()` 所以能出首包、目标轨能 ready，而直播帧一帧都到不了编码器。
+外部表现极具误导性——DVPP 通道正常、预热成功、无报错，只是「永远只有第 1 帧」。
+
+修法：`if (!_context)` 分支里放行 `_ascend`；`inputFrame_l` 开头在 `_ascend && !_context` 时
+直接 `return encodeAscend(frame->get())`。
+
+### 排查这类问题的有效顺序
+
+1. 入口计数（`TranscodeSink::inputFrame` 调用次数）→ 源帧到没到
+2. `onDecoded` 的 hit / no-encoder 计数 → 解码出来的帧有没有配上编码器
+3. `AscendVenc::encode` 送帧计数 → 有没有真送进 DVPP
+4. 卡住时 `gdb -p <pid> -batch -ex "thread apply all bt"` 看线程栈（对「卡住」和「SIGSEGV」都适用）
+
+### 仍未闭环
+
+- 帧率与源 25fps 的对应关系还需在长窗口上测准（当前里程碑显示输出快于源，需确认是否有重复帧）。
+- 多路并发（多流同时转码）在 ZLM 进程内未测。
+- 按需转码（`on_demand=1`，默认）下观众何时接入才会真正启用编码，需要产品口径上明确。
+
+### 帧率对账（2026-11-03）
+
+| 口径 | 结果 |
+|---|---|
+| 源轨（推流 25fps） | **25.0 fps**（10 秒窗口，服务端计数） |
+| 客户端拉流（`ffprobe -count_frames -read_intervals %+15`） | `hevc` / `avg_frame_rate=25/1` / 15 秒 **370 帧 = 24.7 fps** |
+| 编码器输入 | 25.1 fps（每 2 秒 50 次 `encodeAscend`） |
+| 编码器输出（`onEncoded` 计数） | **~38 fps** ← 与输入不一致，仍未闭环 |
+
+两处已修的帧率相关缺陷：
+
+1. **一个访问单元被拆成多帧**：`get_stream` 返回的多个 pack 属于同一帧，之前按 pack 逐个回调，
+   等于把一帧拆成几帧。已改为拼成一个 AU 再回调一次。
+2. **pts 用墙上时钟 → 时间轴被压缩**：早前为解「编码器丢帧」误把 pts 改成 `steady_clock` 差值，
+   解码一波突发就会让输出时间轴快 ~1.6 倍（dts 间隔 25ms 而非 40ms）。已改回按输出帧率匀速推进
+   （实测 AU pts = 0/40000/80000… 精确 40ms）。
+
+#### 「38 vs 25」已结案：不是重复，是日志口径
+
+把发送侧和输出侧的 pts 序列打出来对照，是**严格 1:1**：
+
+```
+[send] #0 pts=0     [emit] #0 pts=0
+[send] #1 pts=40000 [emit] #1 pts=40000
+[send] #2 pts=80000 [emit] #2 pts=80000   …
+```
+
+编码器没有重复出帧。`onEncoded` 日志里的 `frames`/`dts` 是 ZLM 自己给输出帧盖的戳，
+与真实投递时间轴不是一回事，**不能拿来算帧率**。
+
+帧率与音画同步只看客户端实测：
+
+| 指标 | 实测 |
+|---|---|
+| 视频轨 | 293 包 / 11.68s = **25.1 fps** |
+| 音频轨 pts 跨度 | 11.90s（与视频差 0.2s，正常 GOP 起始差） |
+| SDP | `avg_frame_rate=25/1` |
+
+结论：**帧率与音画同步都正确**，口径统一为「客户端按轨数包算跨度」。
+
+## 多路并发容量（2026-11-03 实测）
+
+单进程 720p H.264 → H.265 硬编，源为 25fps 实时推流，客户端逐路并发拉流测量：
+
+| 路数 | 有效路数 | 每路帧率 | 聚合 | 崩溃 |
+|---|---|---|---|---|
+| 1 | 1/1 | 25.0 fps | 25 fps | 0 |
+| 4 | 4/4 | 25.0 fps | 100 fps | 0 |
+| 8 | 8/8 | 25.0 fps | 200 fps | 0 |
+| 16 | 16/16 | 25.0 fps | 400 fps | 0 |
+| 18 | 16/18 | 16 路 25.0 fps，另 2 路无视频 | 400 fps | 0 |
+
+**硬上限 = 每进程 16 路并发**（DVPP VENC 通道号数量）。超过时：
+
+```
+W ascend venc: no free DVPP channel (max 16 concurrent), fallback to software
+```
+
+即**明确拒绝并回落软件编码**，已在跑的 16 路不受影响。之前用 `通道号 = 计数器 % 16`
+会把在跑的流打停（18 路时第 17/18 路复用通道 0/4，导致原有流视频在 1.8 秒后断流），
+现已改为「申请-归还」通道池，`close()` 时归还。
+
+### 测并发时踩到的两个测量坑
+
+1. **一路测不到不代表它坏了**：并发同时拉起 N 个 `ffprobe` 时有个别进程启动竞争失败，
+   单路复测立刻恢复 25fps。判定「某路故障」前必须单路复测。
+2. **必须同时看音频跨度**：视频断流时音频（直通）照常走，`跨度` 会显示 7.9s 而视频只有 1.7s
+   —— 只看视频包数会误判成「测量窗口不够」。
+
+### 1080p 容量（2026-11-03 实测）
+
+| 路数 | 有效 | 每路 | 聚合 | 崩溃 |
+|---|---|---|---|---|
+| 8 | 8/8 | 25.0 fps | 200 fps | 0 |
+| 16 | 16/16 | 25.0 fps | 400 fps | 0 |
+
+1080p 与 720p **同样的 16 路上限、同样 25fps 不降**，说明瓶颈在通道数而不是编码算力。
+
+### 多进程分片是否可行（通道号作用域）
+
+同一台机器上起两个独立进程、都用通道 0 各编 100 帧：
+
+```
+进程1: open ok ... sent=100 out=100 keys=4 failed=0   612.6 fps
+进程2: open ok ... sent=100 out=100 keys=4 failed=0   610.7 fps
+```
+
+两个进程都成功，说明 **DVPP VENC 通道号是按进程隔离的**（不像 VDEC 那样整机先到先得），
+因此 **>16 路可以靠多进程分片扩容**，每个进程各管自己的 16 个通道。
+注意：整机 NPU 总编解码能力仍需按实际路数实测确认，分片只解决通道号上限。
+
+### 测并发时的口径纪律（血泪）
+
+`ffprobe -read_intervals "%+10"` 按**媒体时间**取窗口：一旦输出时间轴与墙钟不同步，
+它会在 2~3 秒就退出（客户端自己发 TEARDOWN，服务端日志 `recv teardown request,耗时(s):2`），
+看起来像「所有流 3 秒后都断了」。测并发一律用**墙上时间窗口**：
+
+```bash
+S=$(date +%s.%N); timeout 18 ffprobe ... rtsp://... ; E=$(date +%s.%N)
+# fps(媒体) = (包数-1)/(末pts-首pts)    fps(墙钟) = 包数/(E-S)
+```
+
+两个口径都要报：媒体口径看编码是否正确，墙钟口径看是否真的实时。
