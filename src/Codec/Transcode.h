@@ -38,6 +38,10 @@ extern "C" {
 
 namespace mediakit {
 
+#ifdef ENABLE_ASCEND_VENC
+class AscendVdec;
+#endif
+
 class FFmpegFrame {
 public:
     using Ptr = std::shared_ptr<FFmpegFrame>;
@@ -159,6 +163,10 @@ private:
     FrameMerger _merger{FrameMerger::h264_prefix};
     /** 硬件解码设备；空表示走软件解码 */
     AVBufferRef *_hw_device = nullptr;
+#ifdef ENABLE_ASCEND_VENC
+    /** 昇腾 DVPP 硬解；非空时解码完全不走 libavcodec */
+    std::shared_ptr<AscendVdec> _ascend_dec;
+#endif
     toolkit::ResourcePool<FFmpegFrame> _frame_pool;
 };
 

@@ -5,6 +5,7 @@
  * 因此没有昇腾环境的构建完全不受影响。
  */
 #include "AscendVenc.h"
+#include "AscendEnv.h"
 
 #ifdef ENABLE_ASCEND_VENC
 
@@ -25,75 +26,9 @@ namespace mediakit {
 
 namespace {
 
-/// 进程级 DVPP 初始化（引用计数，避免多路编码器重复 aclInit / sys_init）
-struct DvppEnv {
-    mutex mtx;
-    int ref = 0;
-    int device = -1;
-    aclrtContext ctx = nullptr;
-    bool ok = false;
-    bool inited = false;  ///< aclInit/sys_init 只能做一次（重复调用返回失败）
-
-    bool acquire(int dev, const char *&why) {
-        lock_guard<mutex> lck(mtx);
-        if (inited) {
-            if (dev != device) {
-                why = "同一进程内已用其它 device 初始化过 DVPP";
-                return false;
-            }
-            // 已初始化：只需为当前线程重绑上下文（runtime 参数校验依赖它）
-            if (aclrtSetCurrentContext(ctx) != ACL_SUCCESS) {
-                why = "aclrtSetCurrentContext 失败";
-                return false;
-            }
-            ref++;
-            return true;
-        }
-        // aclInit 在"进程里别人已经初始化过"时会返回失败——这不是错误。
-        // 同一进程里 VDEC 封装/推理后端都可能先调过，因此这里只当警告，继续尝试建上下文。
-        if (aclInit(nullptr) != ACL_SUCCESS) {
-            // 不直接失败：后面的 setDevice 才是真正的判据
-        }
-        if (aclrtSetDevice(dev) != ACL_SUCCESS) {
-            // 设备已被别的模块 set 过也可能返回失败，再看能否建上下文
-            if (aclrtCreateContext(&ctx, dev) != ACL_SUCCESS) {
-                why = "aclrtSetDevice/aclrtCreateContext 均失败";
-                return false;
-            }
-        }
-        if (!ctx && aclrtCreateContext(&ctx, dev) != ACL_SUCCESS) {
-            why = "aclrtCreateContext 失败";
-            return false;
-        }
-        if (aclrtSetCurrentContext(ctx) != ACL_SUCCESS) { why = "aclrtSetCurrentContext 失败"; return false; }
-        auto ret = hi_mpi_sys_init();
-        if (ret != 0) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "hi_mpi_sys_init 失败 0x%x", ret);
-            why = buf;
-            return false;
-        }
-        device = dev;
-        ref = 1;
-        ok = true;
-        inited = true;
-        return true;
-    }
-
-    void release() {
-        lock_guard<mutex> lck(mtx);
-        if (ref > 0) {
-            // 仅减计数：不主动 destroy context / reset device / aclFinalize。
-            // 真机上这些动作有崩溃风险，且后续编码器还要复用同一套初始化
-            // （VDEC 封装里踩过同样的坑）。进程退出时由系统回收。
-            --ref;
-        }
-    }
-};
-
+/// 初始化链收口在 AscendEnv（VENC/VDEC 共用，aclInit 进程内只能成功一次）
 DvppEnv &env() {
-    static DvppEnv e;
-    return e;
+    return ascendEnv();
 }
 
 /// Annex-B 码流里判断是否关键帧。
