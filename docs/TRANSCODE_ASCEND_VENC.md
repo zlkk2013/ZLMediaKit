@@ -361,3 +361,42 @@ S=$(date +%s.%N); timeout 18 ffprobe ... rtsp://... ; E=$(date +%s.%N)
 ```
 
 两个口径都要报：媒体口径看编码是否正确，墙钟口径看是否真的实时。
+
+## 硬解接入：DVPP VDEC（2026-11-03）
+
+源流解码原来是 ffmpeg 软解，这次把解码也搬到 NPU，形成 **硬解 → 硬编** 闭环。
+
+### 结构
+
+| 文件 | 职责 |
+|---|---|
+| `src/Transcode/AscendEnv.{h,cpp}` | **新增**。CANN 初始化收口：`aclInit`/`hi_mpi_sys_init` 进程内只能成功一次，VENC/VDEC 共用一套 refcount |
+| `src/Transcode/AscendVdec.{h,cpp}` | **新增**。对外只有 `open/decode/flush/close` + 通道池；送进 Annex-B，取出紧凑 NV12 |
+| `src/Codec/Transcode.{h,cpp}` | `FFmpegDecoder` 接管：`hw_decode` + H264/H265 + 本机 VDEC 可用时**完全不走 libavcodec**（连 `avcodec_open2` 都不调用） |
+
+### 五个真坑（全部已修）
+
+1. **缺 `hi_mpi_vdec_start_recv_stream`** → `send_stream` 一律 `0xA0058009 (NOT_PERM)`。
+   `create_chn` 只是分配资源，通道还在 stop 态，必须显式开始收流。
+2. **`pic.vir_addr = 0`** → `0xA0058011 (BAD_ADDR)`，驱动要往地址 0 写输出。
+   必须自己 `hi_mpi_dvpp_malloc` 一块输出缓冲并把设备地址告诉驱动。
+3. **送包失败时只退避重投、不取帧** → `0xA005800F (BUF_FULL)` 永远等不到空位，
+   一路失败到重试用尽且一帧都出不来。**送失败要先 `drainFrames()` 腾空间**。
+4. **NV12 的 `virt_addr[1]` 恒为 NULL**：UV 平面紧跟在 Y 后面同一块连续内存里
+   （offset = 行跨度 × 高度）。不这么兜底会整帧丢弃，日志形如
+   `drop: no plane addr (virt0=0x… virt1=(nil))`。
+5. **逐行 `aclrtMemcpy` 把硬解拖到跟不上实时**：每帧上千次拷贝，客户端视频比音频落后 1.5 秒。
+   改成 `stride == width` 时整块一次拷（一帧 2 次），只有对齐跨度才退化逐行。
+
+### 实测（192.168.210.89，单路 720p，硬解 + 硬编）
+
+| 指标 | 结果 |
+|---|---|
+| 客户端视频 | 292 包 / 11.64s = **25.1 fps** |
+| 音画对齐 | 视频 11.64s / 音频 11.90s（差 0.26s，正常 GOP 起差） |
+| 进程 CPU | **17%**（有观众 / 无观众一致，`on_demand=0` 持续转码） |
+| 4 路并发 | 4/4 全部 25.0fps，聚合 100fps，crash=0 |
+| 丢帧 | 前几帧空帧（`width=0`）约 3%，属参数集到达前的正常现象 |
+
+⚠️ **CPU 测量陷阱**：用 `pgrep -f cfg_asc.ini | head -1` 取 PID 会取到过期/错误进程，
+测出「98%」这种假数（同一脚本改用自己启动的 `$!` 后是 17%）。测 CPU 一律用自己启动的 PID。

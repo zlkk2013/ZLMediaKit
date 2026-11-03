@@ -103,3 +103,39 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 - ffmpeg 的 RTSP 客户端间歇 `Operation not permitted`，取证优先 `ffprobe` 或裸 socket。
 - 推流素材必须 `-stream_loop -1`，否则素材放完即断流，会被误判成产品问题。
 - 测试实例只按 `[c]cfg_asc.ini` 精确匹配 PID 清理；**绝不能 `pkill -f MediaServer`**。
+
+## 2026-11-03 追加：DVPP 硬解接入（硬解 → 硬编闭环）
+
+### 结果
+
+| 项 | 实测 |
+|---|---|
+| 客户端视频 | 25.1 fps（源 25fps） |
+| 音画对齐 | 视频 11.64s / 音频 11.90s |
+| 进程 CPU | **17%**（单路 720p，硬解+硬编） |
+| 4 路并发 | 4/4 全 25.0fps，crash=0 |
+
+### 结构改动
+
+- 新增 `AscendEnv`：`aclInit`/`hi_mpi_sys_init` 进程内只能成功一次，VENC/VDEC 共用 refcount 初始化
+- 新增 `AscendVdec`：`open/decode/flush/close` + 32 通道池，送 Annex-B 出紧凑 NV12
+- `FFmpegDecoder` 接管：`hw_decode` + H264/H265 + VDEC 可用时完全不碰 libavcodec
+
+### 五个坑（按踩到顺序）
+
+1. 缺 `hi_mpi_vdec_start_recv_stream` → `send_stream` 恒 `0xA0058009 (NOT_PERM)`
+2. `pic.vir_addr = 0` → `0xA0058011 (BAD_ADDR)`，必须给驱动真实输出缓冲
+3. 送包失败只退避不排空 → `0xA005800F (BUF_FULL)` 永远解不了锁，要先取帧腾空
+4. NV12 的 `virt_addr[1]` 恒 NULL（UV 在 Y 后面的连续内存）→ 不兜底就整帧丢
+5. 逐行 `aclrtMemcpy`（每帧上千次）把硬解拖到比音频慢 1.5 秒 → 改整块拷贝
+
+### 测量陷阱（新）
+
+`pgrep -f cfg_asc.ini | head -1` 会取到过期进程，CPU 测出「98%」假数；
+同一脚本改用自己启动的 `$!` 后是 17%。**测 CPU 只用自己启动的 PID。**
+
+### 待办
+
+- 1080p 硬解未单独测（720p 已验证）
+- 硬解 + 多路（>4）容量待测
+- 解码掉线重连、码流参数中途变化（分辨率切换）未处理

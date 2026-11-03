@@ -15,6 +15,9 @@
 #include "Util/File.h"
 #include "Util/uv_errno.h"
 #include "Transcode.h"
+#ifdef ENABLE_ASCEND_VENC
+#include "Transcode/AscendVdec.h"
+#endif
 #include "Common/config.h"
 
 #define MAX_DELAY_SECOND 3
@@ -617,6 +620,58 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
             }
         }
 
+#ifdef ENABLE_ASCEND_VENC
+        // 昇腾 DVPP 硬解接管：成功就完全不走 libavcodec（连 avcodec_open2 都不需要），
+        // 所以必须放在这里 return，而不是"先开 avcodec 再替换"。
+        if (hw_decode && (track->getCodecId() == CodecH264 || track->getCodecId() == CodecH265)
+            && AscendVdec::available()) {
+            auto dec = std::make_shared<AscendVdec>();
+            AscendVdec::Config acfg;
+            acfg.h265 = (track->getCodecId() == CodecH265);
+            // 源轨在这一刻可能还没解析出宽高（目标轨是空构造）——给一个上界即可，
+            // VDEC 的 attr 里这两个字段就是"最大宽高"，实际尺寸由码流决定。
+            auto vtrack = static_pointer_cast<VideoTrack>(track);
+            acfg.width = MAX((int) vtrack->getVideoWidth(), 1920);
+            acfg.height = MAX((int) vtrack->getVideoHeight(), 1080);
+            acfg.channel = AscendVdec::acquireChannel();
+            std::string err;
+            auto self = this;
+            bool ok = false;
+            if (acfg.channel >= 0) {
+                ok = dec->open(acfg, [self](const uint8_t *nv12, int w, int h, uint32_t pts_ms) {
+                    // 把 DVPP 吐出来的 NV12 包成 AVFrame 交给下游：
+                    // 下游（sws / 昇腾硬编）本来就吃 NV12，这样硬解→硬编可以省掉一次颜色转换。
+                    auto av = av_frame_alloc();
+                    if (!av) {
+                        return;
+                    }
+                    av->format = AV_PIX_FMT_NV12;
+                    av->width = w;
+                    av->height = h;
+                    if (av_frame_get_buffer(av, 32) < 0) {
+                        av_frame_free(&av);
+                        return;
+                    }
+                    memcpy(av->data[0], nv12, (size_t) w * h);
+                    memcpy(av->data[1], nv12 + (size_t) w * h, (size_t) w * h / 2);
+                    av->pts = av->pkt_dts = pts_ms;
+                    auto holder = std::shared_ptr<AVFrame>(av, [](AVFrame *f) { av_frame_free(&f); });
+                    self->onDecode(std::make_shared<FFmpegFrame>(holder));
+                }, err);
+            }
+            if (ok) {
+                _ascend_dec = dec;
+                InfoL << "hw decode: 使用昇腾 DVPP VDEC (channel=" << acfg.channel
+                      << ", max " << acfg.width << "x" << acfg.height << ")";
+                return; // 不再打开 libavcodec
+            }
+            if (acfg.channel >= 0) {
+                AscendVdec::releaseChannel(acfg.channel);
+            }
+            WarnL << "昇腾 DVPP 硬解不可用，回落 libavcodec: " << err;
+        }
+#endif
+
         int ret = avcodec_open2(_context.get(), codec, &dict);
         av_dict_free(&dict);
         if (ret >= 0) {
@@ -639,6 +694,12 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
 
 FFmpegDecoder::~FFmpegDecoder() {
     stopThread(true);
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend_dec) {
+        _ascend_dec->close();
+        _ascend_dec.reset();
+    }
+#endif
     if (_do_merger) {
         _merger.flush();
     }
@@ -707,6 +768,12 @@ bool FFmpegDecoder::inputFrame(const Frame::Ptr &frame, bool live, bool async, b
 bool FFmpegDecoder::decodeFrame(const char *data, size_t size, uint64_t dts, uint64_t pts, bool live, bool key_frame) {
     TimeTicker2(30, TraceL);
 
+#ifdef ENABLE_ASCEND_VENC
+    if (_ascend_dec) {
+        // 硬解路径：ZLM 给的 data 已经是整帧 Annex-B，直接送 VDEC（FRAME 模式）
+        return _ascend_dec->decode((const uint8_t *) data, size, (uint32_t) pts);
+    }
+#endif
     auto pkt = alloc_av_packet();
     pkt->data = (uint8_t *)data;
     pkt->size = size;
