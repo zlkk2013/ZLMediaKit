@@ -100,6 +100,31 @@ hi_mpi_venc_release_stream(chn, &stream);
 
 口径说明：纯编码 + CPU 内存喂帧，不含解码/抽帧/NV12 转换，是**编码器上限**而非端到端吞吐。
 
+## 编码后端封装（`src/Transcode/AscendVenc.*`，已实现并真机验证）
+
+把 DVPP VENC 封成可复用的编码器类，对外只有三件事：`open()` / `encode(NV12, pts)` / `close()`，
+调用方看不到任何 CANN 头文件。取流在内部线程里跑（非阻塞轮询 + D2H 拷贝），逐包回调 Annex-B
+码流并标记关键帧。
+
+编译开关 `-DENABLE_ASCEND_VENC=ON`（**默认 OFF**）：关闭时该 .cpp 编译成空文件，
+对上游构建零影响，CMake 会自动探测 CANN 路径，找不到就退回 OFF 并告警。
+
+自测程序 `tools/ascend/ascend_venc_selftest.cpp`，真机（2×310P3）结果：
+
+| 用例 | 结果 |
+|---|---|
+| H.264 1280x720 × 300 帧 | **PASS** 300/300，关键帧 12 个，612.8 fps |
+| H.265 1280x720 × 300 帧 | **PASS** 300/300，关键帧 12 个，574.5 fps |
+| H.264 1920x1080 × 200 帧 | **PASS** 200/200，关键帧 8 个，276.1 fps |
+
+三份产物 ffprobe 全部校验通过（codec/分辨率/帧数一致）。
+
+封装里踩到的两个自身缺陷（都已修）：
+- **`aclInit` 不能调用两次**：`available()` 探测过一次后，`open()` 再调就返回失败。
+  改为「初始化只做一次，后续只 `aclrtSetCurrentContext` 重绑线程」。
+- **关键帧判断不能只看首个 NAL**：IDR 访问单元通常以 SPS/PPS 打头，
+  只看第一个 NAL 会把关键帧全判成非关键帧（实测 `keys=0`），必须扫描整个访问单元。
+
 ## 与 ZLMediaKit 的关系（架构结论）
 
 ZLM 的转码是**进程内 libavcodec**，而昇腾没有 libavcodec 后端（无 encoder、无 hwaccel）。

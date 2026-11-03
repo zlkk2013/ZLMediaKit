@@ -41,6 +41,10 @@ option(ENABLE_ASAN "Enable Address Sanitize" OFF)
 option(ENABLE_CXX_API "Enable C++ API SDK" OFF)
 option(ENABLE_FAAC "Enable FAAC" OFF)
 option(ENABLE_FFMPEG "Enable FFmpeg" OFF)
+# 昇腾 DVPP 硬编码（H.264/H.265）。默认关闭：需要 CANN 8.x + aarch64，
+# 关闭时 src/Transcode/AscendVenc.cpp 编译成空文件，对普通构建零影响。
+# Ascend DVPP hardware encoder (H.264/H.265). OFF by default; requires CANN 8.x on aarch64.
+option(ENABLE_ASCEND_VENC "Enable Ascend DVPP hardware encoder" OFF)
 option(ENABLE_HLS "Enable HLS" ON)
 option(ENABLE_JEMALLOC_STATIC "Enable static linking to the jemalloc library" OFF)
 option(ENABLE_JEMALLOC_DUMP "Enable jemalloc to dump malloc statistics" OFF)
@@ -559,6 +563,33 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
     # 必须放在所有 find_package 之后, 否则 homebrew 的头文件会覆盖 vcpkg/pkg-config 找到的同名库头文件,
     # 导致头文件与实际链接的库版本不一致(例如 homebrew 的 openssl 头文件 vs vcpkg 的 openssl 库)。
     include_directories(SYSTEM "/opt/homebrew/include")
+  endif()
+endif()
+
+# ── 昇腾 DVPP 硬编码（可选）─────────────────────────────────────────────
+if(ENABLE_ASCEND_VENC)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    message(WARNING "ENABLE_ASCEND_VENC 只支持 aarch64（当前 ${CMAKE_SYSTEM_PROCESSOR}），已关闭")
+    set(ENABLE_ASCEND_VENC OFF)
+  else()
+    find_path(ASCEND_CANN_INC acl/dvpp/hi_dvpp_venc.h
+      PATHS /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/include)
+    find_library(ASCEND_DVPP_LIB acl_dvpp_mpi
+      PATHS /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64)
+    if(NOT ASCEND_CANN_INC OR NOT ASCEND_DVPP_LIB)
+      message(WARNING "找不到 CANN（acl/dvpp 头或 libacl_dvpp_mpi），ENABLE_ASCEND_VENC 已关闭")
+      set(ENABLE_ASCEND_VENC OFF)
+    else()
+      include_directories(SYSTEM ${ASCEND_CANN_INC} ${ASCEND_CANN_INC}/acl)
+      update_cached_list(MK_COMPILE_DEFINITIONS ENABLE_ASCEND_VENC)
+      # 驱动侧的 libascend_hal 在 driver/lib64/driver 下，不在 toolkit 里
+      find_library(ASCEND_HAL_LIB ascend_hal PATHS /usr/local/Ascend/driver/lib64/driver)
+      update_cached_list(MK_LINK_LIBRARIES ${ASCEND_DVPP_LIB})
+      if(ASCEND_HAL_LIB)
+        update_cached_list(MK_LINK_LIBRARIES ${ASCEND_HAL_LIB})
+      endif()
+      message(STATUS "Ascend VENC enabled: ${ASCEND_CANN_INC}")
+    endif()
   endif()
 endif()
 
