@@ -1,0 +1,21 @@
+[Unit]
+Description=ZLMediaKit 昇腾分片调度器（按流名分配 MediaServer 分片）
+Documentation=file:/opt/zlm-transcode/tools/shard-dispatcher/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 纯标准库实现，不需要虚拟环境；用系统 python3 即可
+ExecStart=/usr/bin/python3 /opt/zlm-transcode/tools/shard-dispatcher/shard_dispatcher.py -c /etc/zlm/shard-dispatcher.json --gc
+Restart=always
+RestartSec=3
+# 状态文件目录（粘性分配落盘）
+StateDirectory=zlm-shard
+User=root
+# 只读系统 + 可写状态目录，够用即可
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

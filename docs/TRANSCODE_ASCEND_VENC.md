@@ -555,3 +555,46 @@ cfg_asc2.ini  → http 58980 / rtsp 58554      # 端口 +1000
 （那是另一套分析引擎包装库的观测）。在本仓库这套 `hi_mpi_vdec_*` 用法下，
 **两个进程各自的 VDEC 通道都成功**（A 16 路 / B 16 路全部 `decode_backend=ascend`，零回落）。
 结论按本次实测为准，旧记录已标注。
+
+## 分片调度层（tools/shard-dispatcher，2026-11-04）
+
+分片一多，「这路流去哪个分片」就没人回答了。新增一个独立小服务（纯标准库、离线可跑、不代理媒体）：
+
+| 接口 | 作用 |
+|---|---|
+| `GET /assign?stream=<名>` | 分配分片；**幂等**，同名流永远同一片（粘性，不迁移） |
+| `GET /release?stream=<名>` | 释放 |
+| `GET /shards` | 健康 + 负载 + `stranded_streams`（挂在不可用分片上的流） |
+| `GET /metrics` | Prometheus 文本指标 |
+
+分配策略：只用健康且未满的分片（默认每片 16 路）；已分配的流不迁移（迁移=断流重推）；
+新流按负载最少 + 流名哈希打散；全满返回 503 而不是硬塞。
+
+### 真机验证（192.168.210.89，720p 硬解+硬编）
+
+```
+分配分布: {'b': 12, 'a': 12}
+有效 24/24 路，聚合 600 fps
+调度器快照: assigned=24 stranded=0
+  分片 a healthy=True load=12/16 latency=2ms
+  分片 b healthy=True load=12/16 latency=1ms
+```
+
+故障演练（杀掉分片 b）：
+
+```
+分片 a healthy=True  load=10
+分片 b healthy=False load=10  last_error=Connection refused
+stranded=10                      ← 挂在 b 上的 10 路流被点出来
+新流分配 → a
+重新分配示例: f..._0 → a（reason=previous-shard-unhealthy）
+```
+
+**刻意不自动迁移**：偷偷把流挪到别的分片会让客户端莫名断流且没人知道。
+调度器只负责「标出来 + 新流避开」，迁移由上层重新推流完成。
+
+### 部署
+
+- 服务：`tools/shard-dispatcher/shard_dispatcher.py`（systemd 单元 `zlm-shard-dispatcher.service`）
+- 配置样例：`tools/shard-dispatcher/config.example.json`（分片清单 + 各自 secret + 每片容量）
+- 自测：`python3 tools/shard-dispatcher/selftest.py` → 本机 8/8、盒子上 8/8（不需要昇腾硬件）
