@@ -466,3 +466,26 @@ hw_decode = true  hw_decode_frames = 410
 **踩到一个会误导运维的坑**：`hw_decode` 原本只统计 libavcodec 的硬件帧下载，
 走 DVPP VDEC 时永远是 `false` —— 运维看到「配置开了硬解、接口说没硬解」就会去查错方向。
 已把它对齐成「真在硬解」的事实（`hw_decode=true`，`hw_decode_frames=vdec_out`）。
+
+### API 参数矩阵（硬解+硬编，2026-11-04 实测）
+
+| 用例 | 请求参数 | 客户端实测 | 结论 |
+|---|---|---|---|
+| 1080p → 720p | `width=1280&height=720&video_bitrate=4000000` | `hevc 1280x720 / 25.0fps / 787kbps` | ✅ 降配生效 |
+| 720p → 1080p | `width=1920&height=1080` | `hevc 1920x1080 / 25.0fps / 1413kbps` | ✅ 升配生效 |
+| 帧率降配 | `video_fps=15` | `1280x720 / 15.0fps` | ✅ |
+| 低码率 | `video_bitrate=2000000` | `1920x1080 / 25.0fps / 1621kbps` | ✅（VBR 上限，低复杂度素材实际低于目标） |
+| 倍数缩放 | `scale=0.5` | `960x540 / 25.0fps` | ✅ |
+
+五个用例 `venc_opened=1`、`refused=0`、无崩溃。
+
+⚠️ **命名/单位陷阱（我自己踩了）**：同一份文档里有两套名字，别混用：
+
+| 场景 | 尺寸/缩放参数 | 码率 |
+|---|---|---|
+| **配置键**（config.ini） | `video_width` / `video_height` / `video_scale` | `video_bitrate` |
+| **API 参数**（addTranscode） | `width` / `height` / `scale` | `video_bitrate`（单位 **bps**） |
+
+把配置键名当 API 参数传（`video_width=1280`）会被静默忽略 —— 编码器仍按源尺寸打开，
+现象是「传了不看」。码率写 `4000` 会被当成 4000bps（≈4kbps）。两处都以 `getTranscode`
+回显为准核对。

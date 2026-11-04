@@ -192,3 +192,17 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 
 **修正一个误导项**：`hw_decode` 原本只统计 libavcodec 的硬件帧下载，走 DVPP 硬解时恒 `false`
 （现象是「配置开了硬解、接口说没硬解」），已对齐为硬解时 `true`、`hw_decode_frames` 同步 `vdec_out`。
+
+## 2026-11-04 追加：API 参数矩阵（硬解+硬编）
+
+| 用例 | 请求 | 实测 |
+|---|---|---|
+| 1080p→720p | `width=1280&height=720&video_bitrate=4000000` | 1280x720 / 25.0fps / 787kbps ✅ |
+| 720p→1080p | `width=1920&height=1080` | 1920x1080 / 25.0fps / 1413kbps ✅ |
+| 帧率 15 | `video_fps=15` | 15.0fps ✅ |
+| 码率 2Mbps | `video_bitrate=2000000` | 1920x1080 / 1621kbps ✅ |
+| 倍数 0.5 | `scale=0.5` | 960x540 / 25.0fps ✅ |
+
+**踩坑（自找的）**：第一轮把配置键名当 API 参数传（`video_width`/`video_scale`），
+结果全部被静默忽略、编码器仍按源尺寸打开，差点当成产品缺陷报出去。
+正确 API 参数是 `width`/`height`/`scale`；`video_bitrate` 单位是 **bps**（写 4000 = 4kbps）。
