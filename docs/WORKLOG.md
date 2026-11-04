@@ -175,3 +175,20 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 推流后等 10 秒再拉即正常。**判定"切换后断流"前必须先排除取样时序。**
 
 未实现：跟随源分辨率变化（需重开编码器 + 重建目标轨）。
+
+## 2026-11-04 追加：DVPP 运行指标暴露到状态接口
+
+`/index/api/getTranscode` 的 `tracks[]` 新增（仅昇腾构建有值）：
+
+| 字段 | 含义 |
+|---|---|
+| `decode_backend` | `ascend` / `ffmpeg` / `none` |
+| `vdec_in` / `vdec_out` / `vdec_dropped` | 送进 VDEC / 解出来 / 取到句柄但无有效图像 |
+| `vdec_channel` / `venc_channel` | 占用通道号（-1 = 未占用） |
+| `venc_sent` / `venc_out` / `venc_retries` | 送编码器 / 回调包数 / 驱动忙重投 |
+
+实测一轮 720p 硬解+硬编：`vdec_in 420 / vdec_out 415 / dropped 3`、`venc_sent 413 = venc_out 413`、
+`retries 0`、通道 0。
+
+**修正一个误导项**：`hw_decode` 原本只统计 libavcodec 的硬件帧下载，走 DVPP 硬解时恒 `false`
+（现象是「配置开了硬解、接口说没硬解」），已对齐为硬解时 `true`、`hw_decode_frames` 同步 `vdec_out`。
