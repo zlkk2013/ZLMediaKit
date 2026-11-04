@@ -2029,6 +2029,43 @@ bool FFmpegEncoder::encodeAscend(AVFrame *frame) {
 }
 #endif // ENABLE_ASCEND_VENC
 
+#ifdef ENABLE_ASCEND_VENC
+bool FFmpegEncoder::canEncodeDevice() const {
+    if (!_ascend) {
+        return false;
+    }
+    // 滤镜/logo 必须在 host 帧上做（sws + drawtext/overlay），有它们就不能直通
+    if (!_filter_desc.empty() || !_logo_path.empty()) {
+        return false;
+    }
+    return true;
+}
+
+bool FFmpegEncoder::encodeDevice(const uint8_t *dev_nv12, int width, int height, int stride,
+                                 uint32_t pts_ms) {
+    static int rej = 0;
+    if (!canEncodeDevice() || !dev_nv12) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] enc reject: canEncodeDevice=%d data=%p\n",
+                               (int) canEncodeDevice(), (const void *) dev_nv12);
+        return false;
+    }
+    int w = _out_width > 0 ? _out_width : width;
+    int h = _out_height > 0 ? _out_height : height;
+    // 输出尺寸与设备帧不一致 ⇒ 需要缩放，只能走主机路径（sws）
+    if (w != width || h != height) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] enc reject: out=%dx%d frame=%dx%d stride=%d\n",
+                               w, h, width, height, stride);
+        return false;
+    }
+    // pts 与 encodeAscend 用同一套推进方式：严格递增、按输出帧率匀速，
+    // 不用墙上时钟（解码突发会把时间轴压缩，实测 dts 间隔 25ms 而非 40ms）
+    uint64_t pts = _ascend_pts_us;
+    _ascend_pts_us += (uint64_t) (1000000.0 / (_video_fps > 0.5f ? _video_fps : 25.0f));
+    (void) pts_ms;  // 时间轴按帧率推进，源 pts 只用于诊断（与 encodeAscend 一致）
+    return _ascend->encodeDevice(dev_nv12, width, height, stride, pts);
+}
+#endif // ENABLE_ASCEND_VENC
+
 bool FFmpegEncoder::encodeFrame(AVFrame *frame) {
 #ifdef ENABLE_ASCEND_VENC
     if (_ascend) {

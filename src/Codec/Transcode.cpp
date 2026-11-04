@@ -430,6 +430,9 @@ static enum AVPixelFormat hwDecodeGetFormat(AVCodecContext *ctx, const enum AVPi
 FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
                              const std::vector<std::string> &codec_name, bool hw_decode) {
     setupFFmpeg();
+#ifdef ENABLE_ASCEND_VENC
+    _src_track = track;   // 昇腾硬解要用它取真实宽高
+#endif
     _frame_pool.setSize(AV_NUM_DATA_POINTERS);
     const AVCodec *codec = nullptr;
     const AVCodec *codec_default = nullptr;
@@ -661,6 +664,15 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num,
             }
             if (ok) {
                 _ascend_dec = dec;
+                // 零拷贝：上层若设置了设备回调，VDEC 就跳过 D2H 直接交设备地址；
+                // 没设置（或 UV 布局不符）时 VDEC 自动回落主机路径，不影响功能。
+                auto self_dev = this;
+                dec->setOnDevFrame([self_dev](const AscendVdec::DevFrame &f) -> bool {
+                    return self_dev->_on_decode_dev
+                               ? self_dev->_on_decode_dev(f.data, f.width, f.height, f.stride,
+                                                          f.pts_ms)
+                               : false;
+                });
                 InfoL << "hw decode: 使用昇腾 DVPP VDEC (channel=" << acfg.channel
                       << ", max " << acfg.width << "x" << acfg.height << ")";
                 return; // 不再打开 libavcodec
@@ -770,6 +782,19 @@ bool FFmpegDecoder::decodeFrame(const char *data, size_t size, uint64_t dts, uin
 
 #ifdef ENABLE_ASCEND_VENC
     if (_ascend_dec) {
+        // 通道是按最大尺寸开的，这里把源轨已解析出的真实尺寸告诉它：
+        // 不改的话 VDEC 按上界输出（720p 流解成 1920x1080），下游要再缩一次，
+        // 而且尺寸对不上会让零拷贝直通失效。
+        if (_src_track) {
+            auto vtrack = static_pointer_cast<VideoTrack>(_src_track);
+            int tw = vtrack ? vtrack->getVideoWidth() : 0;
+            int th = vtrack ? vtrack->getVideoHeight() : 0;
+            // 只在本路还没送过包时设置一次：中途改输出尺寸要驱动重配缓冲，
+            // 没必要冒这个险（同一路流的尺寸本来也不会变）
+            if (tw > 0 && th > 0 && _ascend_dec->inFrames() == 0) {
+                _ascend_dec->setOutputSize(tw, th);
+            }
+        }
         // 硬解路径：ZLM 给的 data 已经是整帧 Annex-B，直接送 VDEC（FRAME 模式）
         return _ascend_dec->decode((const uint8_t *) data, size, (uint32_t) pts);
     }

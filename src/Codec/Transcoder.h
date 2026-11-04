@@ -379,6 +379,11 @@ public:
 #ifdef ENABLE_ASCEND_VENC
     /// 昇腾硬编可观测性：状态接口要读这些值，故放 public
     bool usingAscendEncode() const { return (bool) _ascend; }
+
+    /// 零拷贝：直接把**设备内存**里的 NV12 交给昇腾编码器（不经主机往返）。
+    /// 只有「没有滤镜/logo、输出尺寸与输入一致」时才成立，否则返回 false 由调用方回落。
+    bool canEncodeDevice() const;
+    bool encodeDevice(const uint8_t *dev_nv12, int width, int height, int stride, uint32_t pts_ms);
     uint32_t ascendSentFrames() const;
     uint32_t ascendOutFrames() const;
     uint32_t ascendSendRetries() const;

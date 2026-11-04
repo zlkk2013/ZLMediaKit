@@ -131,6 +131,51 @@ struct AscendVenc::Impl {
         return 1;
     }
 
+    /// 送一帧给编码器并同步排空（encode / encodeDevice 共用同一套重试与等待策略）。
+    /// 失败只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看。
+    bool sendAndDrain(hi_video_frame_info &fi, std::atomic<uint32_t> &sent,
+                      std::atomic<uint32_t> &retries) {
+        hi_user_frame_info ufi;
+        memset(&ufi, 0, sizeof(ufi));
+        ufi.user_frame = fi;
+        // ★ 必须显式设置，留 0 时一帧都不收
+        ufi.user_rc_info.frame_type = VENC_FRAME_TYPE_NONE;
+
+        // 编码器内部队列很浅，偶发需要退避重投（同一帧重投时 pts/time_ref 不能变）
+        bool ok = false;
+        for (int t = 0; t < 40; t++) {
+            auto ret = hi_mpi_venc_send_frame_ex(cfg.channel, &ufi, 0);
+            if (ret == 0) {
+                ok = true;
+                break;
+            }
+            retries++;
+            usleep(2 * 1000);
+        }
+        if (!ok) {
+            if (sent.load() < 5) {
+                fprintf(stderr, "[ascend venc] send failed after retries, ch=%d size=%dx%d\n",
+                        cfg.channel, cfg.width, cfg.height);
+            }
+            return false;
+        }
+        idx++;
+        sent++;
+        // 同线程排空：实测「另起取流线程」在本进程里拿不到数据（恒 BUF_EMPTY），
+        // 而同线程同步取流稳定拿得到。等出包：编码器出包有几毫秒延迟，
+        // 不等就会让「发送↔取流」错拍，下游解码队列积压到丢帧。
+        for (int w = 0; w < 25; w++) {
+            if (drainOnce() > 0) {
+                break;
+            }
+            usleep(1000);
+        }
+        // 把同一时刻可取的包取干净，但必须有上界：
+        // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
+        for (int k = 0; k < 4 && drainOnce() > 0; k++) {
+        }
+        return true;
+    }
 };
 
 namespace {
@@ -357,49 +402,58 @@ bool AscendVenc::encode(const uint8_t *nv12, uint64_t pts_us) {
     fi.v_frame.time_ref = im.idx * 2;
     fi.v_frame.pts = pts_us;
 
-    hi_user_frame_info ufi;
-    memset(&ufi, 0, sizeof(ufi));
-    ufi.user_frame = fi;
-    // ★ 必须显式设置，留 0 时一帧都不收
-    ufi.user_rc_info.frame_type = VENC_FRAME_TYPE_NONE;
+    return im.sendAndDrain(fi, _sent, _retries);
+}
 
-    // 编码器内部队列很浅，偶发需要退避重投（同一帧重投时 pts/time_ref 不能变）
-    bool ok = false;
-    for (int t = 0; t < 40; t++) {
-        auto ret = hi_mpi_venc_send_frame_ex(im.cfg.channel, &ufi, 0);
-        if (ret == 0) {
-            ok = true;
-            break;
-        }
-        _retries++;
-        usleep(2 * 1000);
+bool AscendVenc::encodeDevice(const uint8_t *data, int width, int height, int stride,
+                              uint64_t pts_us) {
+    // 拒因只打前几次：这是运维排查「为什么没走零拷贝」的唯一线索
+    static int rej = 0;
+    if (!_opened || !_impl) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] reject: not opened\n");
+        return false;
     }
-    if (ok) {
-        im.idx++;
-        _sent++;
-        // 同线程排空：实测「另起取流线程」在本进程里拿不到数据（恒 BUF_EMPTY），
-        // 而同线程同步取流稳定拿得到（INLINE 探针 send=1/got_packs=1）。
-        // 编码器出包有几毫秒延迟，所以要带等待重试，不能取一次空就放弃。
-        // 等出包：编码器出包有几毫秒延迟，一旦不等就会让「发送↔取流」错拍，
-        // 下游解码队列积压到丢帧（实测只剩预热那一帧能编出来）。
-        for (int w = 0; w < 25; w++) {
-            if (im.drainOnce() > 0) {
-                break;
-            }
-            usleep(1000);
-        }
-        // 把同一时刻可取的包取干净，但必须有上界：
-        // 若驱动在 release 后仍报告有包，无界循环会在这里死住（实测卡死不返回）
-        for (int k = 0; k < 4 && im.drainOnce() > 0; k++) {
-        }
-    } else {
-        // 只在头几帧打印：偶发失败有重试兜底，持续性失败才需要人看
-        if (_sent.load() < 5) {
-            fprintf(stderr, "[ascend venc] send failed after retries, ch=%d size=%dx%d\n",
-                    im.cfg.channel, im.cfg.width, im.cfg.height);
-        }
+    if (!data || width <= 0 || height <= 0 || stride < width) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] reject: bad args data=%p %dx%d stride=%d\n",
+                               (const void *) data, width, height, stride);
+        return false;
     }
-    return ok;
+    // 设备帧必须与编码器打开的尺寸一致：编码器按 cfg 建通道，尺寸不同就没法直通
+    // （要缩放/转换就得回到主机路径，那是另一条路，不能在这里悄悄做）。
+    if (width != _impl->cfg.width || height != _impl->cfg.height) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] reject: size %dx%d != cfg %dx%d\n",
+                               width, height, _impl->cfg.width, _impl->cfg.height);
+        return false;
+    }
+    auto &im = *_impl;
+    lock_guard<mutex> lck(im.send_mtx);
+    if (aclrtSetCurrentContext(env().ctx) != ACL_SUCCESS) {
+        if (rej++ < 3) fprintf(stderr, "[zero-copy] reject: setCurrentContext failed\n");
+        return false;
+    }
+
+    hi_video_frame_info fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.v_frame.width = width;
+    fi.v_frame.height = height;
+    fi.v_frame.field = HI_VIDEO_FIELD_FRAME;
+    fi.v_frame.pixel_format = HI_PIXEL_FORMAT_YUV_SEMIPLANAR_420;
+    fi.v_frame.video_format = HI_VIDEO_FORMAT_LINEAR;
+    fi.v_frame.dynamic_range = HI_DYNAMIC_RANGE_SDR8;
+    fi.v_frame.compress_mode = HI_COMPRESS_MODE_NONE;
+    fi.v_frame.color_gamut = HI_COLOR_GAMUT_BT709;
+    fi.v_frame.virt_addr[0] = (hi_u8 *) data;
+    fi.v_frame.width_stride[0] = (hi_u32) stride;
+    fi.v_frame.height_stride[0] = (hi_u32) height;
+    // DVPP 半平面输出：UV 紧跟 Y 之后同一块内存（offset = 跨度 × 高度）
+    fi.v_frame.virt_addr[1] = (hi_u8 *) data + (size_t) stride * height;
+    fi.v_frame.width_stride[1] = (hi_u32) stride;
+    fi.v_frame.height_stride[1] = (hi_u32) (height / 2);
+    // ★ time_ref 必须偶数，否则驱动判非法（0xA0088003）
+    fi.v_frame.time_ref = im.idx * 2;
+    fi.v_frame.pts = pts_us;
+
+    return im.sendAndDrain(fi, _sent, _retries);
 }
 
 void AscendVenc::flush() {

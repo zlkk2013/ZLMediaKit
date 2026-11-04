@@ -75,3 +75,43 @@
 | GPU 滤镜（缩放/OSD 在 GPU 上） | ❌ 未做：昇腾要走 VPC/DVPP，NVIDIA 要走 CUDA 滤镜链 |
 
 即：本文件关掉的是 #8 里「编解码之间不来回搬」这一半；GPU 滤镜是另一半，还没动。
+
+## 6. 生产化实现（2026-11-04 落地并真机验证）
+
+### 代码结构
+
+| 文件 | 改动 |
+|---|---|
+| `src/Transcode/AscendVenc.{h,cpp}` | 新增 `encodeDevice(data, w, h, stride, pts)`；发送/排空收口为 `sendAndDrain()`，与 `encode()` 共用重试策略 |
+| `src/Transcode/AscendVdec.{h,cpp}` | 新增 `DevFrame` + `setOnDevFrame()`：布局允许时**不拷回主机**，直接把设备地址交出去；回调返回 false 自动回落主机路径 |
+| `src/Codec/Transcode.{h,cpp}` | 解码器记住源轨，解码前把**真实宽高**告诉 VDEC；把设备帧回调接通 |
+| `src/Codec/Transcoder.{h,cpp}` | 新增 `canEncodeDevice()` / `encodeDevice()`：有滤镜/logo 或尺寸不符时明确拒绝（不静默做错事） |
+| `src/Common/TranscodeSink.{h,cpp}` | 直通准入判断 + `onDecodedDevice()`；**失败回落原路径，绝不重复编码同一帧** |
+| `src/Transcode/TranscodeApi.cpp` | `getTranscode` 输出 `zero_copy` / `zero_copy_frames` / `zero_copy_fallbacks` |
+
+准入条件（全部满足才启用，否则原路径）：
+硬解+硬编都在昇腾 · 无滤镜 · 无 logo · 尺寸不变（未给宽高，或给的等于源尺寸）· 未开自适应降帧。
+
+### 真机验证（192.168.210.89，720p）
+
+```
+A 组（应走零拷贝）: decode_backend=ascend zero_copy=True frames=404 fallbacks=0
+                    客户端 301 帧 / 12s = 25.1 fps  hevc   ✓
+B 组（有滤镜，应回落）: zero_copy=False               客户端 296 帧 / 12s  ✓
+CPU（各 4 路 720p）: 零拷贝 2.9%  vs 主机路径 10.1%   → 省 72%
+画质（逐帧亮度均值/标准差）: 零拷贝 (124.9, 71.8) vs 源 (125.2, 71.8)  ✓
+16 路回归: 有效 16/16, 聚合 399 fps, 直通正常 16/16, 无偏低
+```
+
+注意：16 路的聚合帧率与之前持平（399 vs 400 fps）——瓶颈仍是 NPU 的 VENC 单元，
+省下的是主机 CPU 与内存带宽，不是 NPU 吞吐。
+
+### 生产化过程中发现的既有 bug（顺手修了）
+
+VDEC 通道是按**最大尺寸**（1920x1080）打开的，而 VDEC 会按这个尺寸输出：
+720p 的流被解成 1920x1080 → 下游再缩回 720p，等于每帧多一次上采样+一次下采样，
+而且尺寸永远对不上，零拷贝根本没法启用。
+
+修法：`AscendVdec::setOutputSize()`，解码前用源轨 SPS 解析出的真实宽高收紧输出尺寸
+（只允许收到上界以内）。日志会打 `[ascend vdec] output size -> 1280x720`。
+这条修复对**主机路径同样有收益**（少一次全幅缩放），不只是为零拷贝服务。

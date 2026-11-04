@@ -66,6 +66,7 @@ void AscendVdec::releaseChannel(int channel) {
 struct AscendVdec::Impl {
     Config cfg;
     OnFrame cb;
+    AscendVdec::OnDevFrame dev_cb;   ///< 设备直通回调（非空时不拷回主机）
 
     hi_u8 *stream_buf = nullptr; ///< 送包用的设备缓冲
     hi_u32 stream_buf_size = 0;
@@ -73,6 +74,8 @@ struct AscendVdec::Impl {
     hi_u8 *out_buf = nullptr;    ///< 解码输出缓冲（设备内存，驱动直接往里写）
     hi_u32 out_buf_size = 0;
     hi_u32 host_buf_size = 0;
+    int out_w = 0;   ///< 实际输出宽（默认=cfg.width 上界，可由 setOutputSize 收紧）
+    int out_h = 0;
 
     vector<uint8_t> nv12;        ///< 拷回 host 后的紧凑 NV12
     bool streaming = false;
@@ -119,6 +122,25 @@ struct AscendVdec::Impl {
                         vf.virt_addr[0], vf.virt_addr[1], out_buf);
             }
             return;
+        }
+
+        // 设备直通（零拷贝）：把设备地址直接交给下游（编码器），不拷回主机。
+        // 只有「UV 就是 Y 后面那块连续内存」时才敢交出去 —— 编码器按
+        // virt_addr[0] + stride*height 取 UV，布局不符就得老老实实拷。
+        // Zero copy: hand the device address to the encoder without a host round trip.
+        // Only safe when UV is the contiguous block right after Y.
+        if (dev_cb && uv_stride == y_stride && base_uv == base_y + (size_t) y_stride * h) {
+            AscendVdec::DevFrame df;
+            df.data = base_y;
+            df.width = w;
+            df.height = h;
+            df.stride = y_stride;
+            df.pts_ms = (uint32_t) vf.pts;
+            // 返回 true 表示下游已消费（编码器内部同步排空），本帧可以立刻释放
+            if (dev_cb(df)) {
+                return;
+            }
+            // 返回 false：继续走主机路径，不算丢帧
         }
 
         // 拷贝策略：stride == width 时整块一次拷完（常见情况，一帧 2 次 memcpy）；
@@ -175,6 +197,32 @@ struct AscendVdec::Impl {
 
 AscendVdec::AscendVdec() = default;
 
+void AscendVdec::setOutputSize(int width, int height) {
+    if (!_impl || width <= 0 || height <= 0) {
+        return;
+    }
+    auto &im = *_impl;
+    if (im.out_w == width && im.out_h == height) {
+        return;
+    }
+    // 只允许收紧到上界以内：超过会写到按上界分配的缓冲之外
+    if (width > im.cfg.width || height > im.cfg.height) {
+        return;
+    }
+    im.out_w = width;
+    im.out_h = height;
+    fprintf(stderr, "[ascend vdec] output size -> %dx%d (channel=%d)\n", width, height,
+            im.cfg.channel);
+}
+
+void AscendVdec::setOnDevFrame(OnDevFrame cb) {
+    if (!_impl) {
+        _pending_dev_cb = std::move(cb);   // open() 之前设置也能生效
+        return;
+    }
+    _impl->dev_cb = std::move(cb);
+}
+
 uint32_t AscendVdec::droppedFrames() const {
     return _impl ? _impl->dropped : 0;
 }
@@ -210,6 +258,9 @@ bool AscendVdec::open(const Config &cfg, OnFrame cb, std::string &err) {
     std::unique_ptr<Impl> impl(new Impl());
     impl->cfg = cfg;
     impl->cb = cb;
+    impl->out_w = cfg.width;
+    impl->out_h = cfg.height;
+    impl->dev_cb = _pending_dev_cb;   // 零拷贝：open() 之前设置的回调在这里生效
 
     hi_vdec_chn_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -319,10 +370,10 @@ bool AscendVdec::decode(const uint8_t *annexb, size_t len, uint32_t pts_ms) {
     hi_vdec_pic_info pic;
     memset(&pic, 0, sizeof(pic));
     // 输出缓冲由驱动按 frame_buf_size 自行分配，这里只需给缓存属性
-    pic.width = (hi_u32) im.cfg.width;
-    pic.height = (hi_u32) im.cfg.height;
-    pic.width_stride = (hi_u32) im.cfg.width;
-    pic.height_stride = (hi_u32) im.cfg.height;
+    pic.width = (hi_u32) im.out_w;
+    pic.height = (hi_u32) im.out_h;
+    pic.width_stride = (hi_u32) im.out_w;
+    pic.height_stride = (hi_u32) im.out_h;
     pic.pixel_format = HI_PIXEL_FORMAT_YUV_SEMIPLANAR_420;
     pic.buffer_size = im.out_buf_size;
     pic.vir_addr = (hi_u64) im.out_buf;   // 必须给真实设备地址

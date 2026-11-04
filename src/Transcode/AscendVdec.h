@@ -36,6 +36,22 @@ public:
     /// 解码帧回调：data 是**紧凑排列的 NV12**（stride==width，Y 后紧跟 UV），只在该回调内有效
     using OnFrame = std::function<void(const uint8_t *nv12, int width, int height, uint32_t pts_ms)>;
 
+    /// 设备帧：不在主机上出现，data 指向 DVPP 输出缓冲（只在回调期间有效）
+    struct DevFrame {
+        const uint8_t *data = nullptr;  ///< Y 平面设备地址；UV 紧跟其后（offset = stride*height）
+        int width = 0;
+        int height = 0;
+        int stride = 0;
+        uint32_t pts_ms = 0;
+    };
+
+    /// 设备直通回调：返回 true = 已在设备侧消费完（本帧随即释放，不再拷回主机）；
+    /// 返回 false = 走原有主机路径（用于下游没法直通的情况，例如要缩放/滤镜/软编）。
+    using OnDevFrame = std::function<bool(const DevFrame &)>;
+
+    /// 打开设备直通。设置后在布局允许时会跳过 D2H 拷贝（零拷贝路径）。
+    void setOnDevFrame(OnDevFrame cb);
+
     struct Config {
         bool h265 = false;
         int width = 0;   ///< 码流最大宽度（用于分配缓冲，可给上界）
@@ -63,6 +79,11 @@ public:
     /// 送一帧 Annex-B ES，并把当前已就绪的帧全部取出来回调
     bool decode(const uint8_t *annexb, size_t len, uint32_t pts_ms);
 
+    /// 设置**实际输出尺寸**。通道是按最大尺寸开的（attr.pic_width 只是上界），
+    /// 若这里不改，VDEC 会按上界输出：实测 720p 流被解成 1920x1080，
+    /// 下游还得再缩回 720p —— 多一次上采样+下采样，而且挡住了零拷贝直通。
+    void setOutputSize(int width, int height);
+
     /// 送 EOS 并排空剩余帧
     void flush();
 
@@ -79,6 +100,8 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> _impl;
+    /// open() 之前设置的设备回调，open() 里转交给 Impl
+    OnDevFrame _pending_dev_cb;
     bool _opened = false;
     uint32_t _in = 0;
     uint32_t _out = 0;

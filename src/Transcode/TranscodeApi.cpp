@@ -675,6 +675,11 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             track["venc_out"] = (Json::Int64) st.venc_out;
             track["venc_retries"] = (Json::Int64) st.venc_retries;
             track["venc_channel"] = st.venc_channel;
+            // 零拷贝可观测性：enabled=是否启用直通，frames=直通编码的帧数，
+            // fallbacks=直通失败回落次数（运维判据：frames>0 且 fallbacks==0 才算真零拷贝）
+            track["zero_copy"] = st.zero_copy;
+            track["zero_copy_frames"] = (Json::Int64) st.zero_copy_frames;
+            track["zero_copy_fallbacks"] = (Json::Int64) st.zero_copy_fallbacks;
             track["hw_device"] = st.hw_device;
             track["input_frames"] = (Json::Int64) st.input_frames;
             val["tracks"].append(track);

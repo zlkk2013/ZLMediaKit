@@ -152,6 +152,20 @@ public:
 #ifdef ENABLE_ASCEND_VENC
     /// 解码后端：真正走了 DVPP VDEC 时为 true（此时 _context 为空，不走 libavcodec）
     bool usingAscendDecode() const { return (bool) _ascend_dec; }
+
+    /// 零拷贝：把解码帧的**设备地址**直接交给下游（编码器），不拷回主机。
+    /// 回调返回 true 表示已被消费（本帧随后释放）；返回 false 时自动回落主机路径。
+    /// 参数用裸值而不是 AscendVdec::DevFrame：本头文件只前置声明了 AscendVdec，
+    /// 用它 的嵌套类型会把 CANN 头文件带进一大片编译单元。
+    using OnDecodeDevice = std::function<bool(const uint8_t *data, int width, int height,
+                                              int stride, uint32_t pts_ms)>;
+    void setOnDecodeDevice(OnDecodeDevice cb) { _on_decode_dev = std::move(cb); }
+    /// 是否具备直通条件（有昇腾 VDEC 在跑）
+    bool canDevicePassthrough() const { return (bool) _ascend_dec; }
+    OnDecodeDevice _on_decode_dev;
+    /// 源轨：用来取真实宽高，让 VDEC 按真实尺寸输出（否则按上界输出，多一次缩放）
+    Track::Ptr _src_track;
+
     uint32_t ascendDecodeIn() const;
     uint32_t ascendDecodeOut() const;
     uint32_t ascendDecodeDropped() const;

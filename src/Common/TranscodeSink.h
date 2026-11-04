@@ -22,6 +22,11 @@
 #include "Extension/Frame.h"
 #include "Codec/Transcoder.h"
 #include "Poller/Timer.h"
+#ifdef ENABLE_ASCEND_VENC
+// 必须放在 namespace 之外：AscendVdec.h 自己开 mediakit 命名空间，
+// 放在里面会变成 mediakit::mediakit::AscendVdec
+#include "Transcode/AscendVdec.h"
+#endif
 
 namespace mediakit {
 
@@ -261,6 +266,12 @@ public:
         int64_t venc_out = 0;
         int64_t venc_retries = 0;
         int venc_channel = -1;
+        /** 零拷贝是否启用（VDEC 设备地址直接喂 VENC，不经主机往返） */
+        bool zero_copy = false;
+        /** 直通成功编码的帧数；>0 才说明真的走了设备直通 */
+        int64_t zero_copy_frames = 0;
+        /** 直通失败回落的次数（正常应恒为 0） */
+        int64_t zero_copy_fallbacks = 0;
     };
     std::vector<TrackStatus> trackStatus() const;
 
@@ -297,6 +308,12 @@ private:
         bool in_silence_encode = false;
         /** 该轨一帧的时长（毫秒），决定静音补帧的节奏 */
         int frame_interval_ms = 20;
+        /** 零拷贝：解码帧不落主机，直接交给编码器（仅昇腾硬解+硬编、无滤镜/缩放时启用） */
+        bool zero_copy = false;
+        /** 直通成功编码的帧数（运维判据：>0 说明真走了设备直通） */
+        size_t zero_copy_frames = 0;
+        /** 直通失败回落的次数（应为 0；持续增长说明有帧在走主机路径） */
+        size_t zero_copy_fallbacks = 0;
     };
 
     /** 建立该轨的 解码器 + 编码器；成功时 target_track 非空 */
@@ -304,6 +321,10 @@ private:
     void teardown(int index);
     bool shouldSkip() const;
     void onDecoded(int index, const FFmpegFrame::Ptr &frame);
+#ifdef ENABLE_ASCEND_VENC
+    /** 设备帧直通：返回 true 表示已在设备侧编码完（解码器随后释放该帧） */
+    bool onDecodedDevice(int index, const AscendVdec::DevFrame &frame);
+#endif
     void onEncoded(int index, const Frame::Ptr &frame);
 
     /**

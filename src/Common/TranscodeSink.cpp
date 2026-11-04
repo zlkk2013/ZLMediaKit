@@ -220,6 +220,9 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
             st.venc_channel = pr.second.encoder->ascendChannel();
         }
 #endif
+        st.zero_copy = pr.second.zero_copy;
+        st.zero_copy_frames = (int64_t) pr.second.zero_copy_frames;
+        st.zero_copy_fallbacks = (int64_t) pr.second.zero_copy_fallbacks;
         ret.emplace_back(st);
     }
     // 按 track index 排序，让接口输出稳定
@@ -455,6 +458,39 @@ bool TranscodeSink::setupTrack(const Track::Ptr &track, TrackContext &ctx) {
     ctx.decoder->setOnDecode([this, index](const FFmpegFrame::Ptr &frame) {
         onDecoded(index, frame);
     });
+#ifdef ENABLE_ASCEND_VENC
+    // 零拷贝直通：解码帧不落主机，直接交给硬编码器。
+    // 只在「硬解+硬编都在昇腾、没有滤镜/logo、不缩放、不做自适应降帧」时启用；
+    // 其余情况一律走原路径（有滤镜就必须在 host 帧上做 sws/drawtext）。
+    // 尺寸不变才可能直通：显式宽高等于源尺寸、或没给；scale=1 也算不变
+    auto vtrk = static_pointer_cast<VideoTrack>(track);
+    int sw = vtrk ? vtrk->getVideoWidth() : 0;
+    int sh = vtrk ? vtrk->getVideoHeight() : 0;
+    bool same_size = (_option.video_width <= 0 || sw <= 0 || _option.video_width == sw)
+                  && (_option.video_height <= 0 || sh <= 0 || _option.video_height == sh)
+                  && (_option.video_scale <= 0 || _option.video_scale == 1.0f);
+    if (!is_audio && _option.hw_encode && ctx.decoder->canDevicePassthrough()
+        && ctx.encoder->canEncodeDevice() && _option.video_filter.empty()
+        && _option.video_logo.empty() && same_size && !_option.adapt_fps) {
+        ctx.zero_copy = true;
+        ctx.decoder->setOnDecodeDevice([this, index](const uint8_t *data, int w, int h, int stride,
+                                                    uint32_t pts_ms) {
+            AscendVdec::DevFrame f;
+            f.data = data;
+            f.width = w;
+            f.height = h;
+            f.stride = stride;
+            f.pts_ms = pts_ms;
+            return onDecodedDevice(index, f);
+        });
+        InfoL << "transcode zero-copy: VDEC->VENC 设备直通已启用, stream=" << streamLabel();
+    } else if (!is_audio) {
+        TraceL << "transcode zero-copy 未启用（硬解=" << ctx.decoder->canDevicePassthrough()
+               << ", 可直通编码=" << ctx.encoder->canEncodeDevice()
+               << ", filter='" << _option.video_filter << "', logo='" << _option.video_logo
+               << "', scale=" << _option.video_scale << "）";
+    }
+#endif
     ctx.target_track = target;
     ctx.transcoding = true;
     ctx.audio = is_audio;
@@ -606,6 +642,39 @@ void TranscodeSink::onDecoded(int index, const FFmpegFrame::Ptr &frame) {
     // 编码一律同步：保证输出帧序与输入一致
     encoder->inputFrame(frame, false);
 }
+
+#ifdef ENABLE_ASCEND_VENC
+bool TranscodeSink::onDecodedDevice(int index, const AscendVdec::DevFrame &frame) {
+    std::shared_ptr<FFmpegEncoder> encoder;
+    {
+        lock_guard<mutex> lck(_mtx);
+        auto it = _contexts.find(index);
+        if (it == _contexts.end() || !it->second.encoder || !it->second.zero_copy) {
+            return false;
+        }
+        encoder = it->second.encoder;
+    }
+    // 编码器内部同步排空：返回 true 表示这一帧已被消费，解码器可以安全释放设备帧。
+    // The encoder drains synchronously inside encodeDevice(), so returning true means
+    // the decoder may release the device frame right away.
+    if (encoder->encodeDevice(frame.data, frame.width, frame.height, frame.stride, frame.pts_ms)) {
+        lock_guard<mutex> lck(_mtx);
+        auto it = _contexts.find(index);
+        if (it != _contexts.end()) {
+            ++it->second.in_frames;
+            ++it->second.zero_copy_frames;
+        }
+        return true;
+    }
+    // 直通不成立（尺寸不符等）：交回原有主机路径重新编码，绝不重复编码同一帧
+    lock_guard<mutex> lck(_mtx);
+    auto it = _contexts.find(index);
+    if (it != _contexts.end()) {
+        ++it->second.zero_copy_fallbacks;
+    }
+    return false;
+}
+#endif
 
 void TranscodeSink::onEncoded(int index, const Frame::Ptr &frame) {
     if (!frame) {

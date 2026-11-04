@@ -267,3 +267,21 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 
 生产化 3~5 天：`encodeDevice()` + VDEC 设备帧出参 + 管线直通快路径（无滤镜/无缩小时启用）+ 16 路回归。
 详见 `docs/TRANSCODE_ASCEND_ZEROCOPY.md`。
+
+## 2026-11-04 追加：零拷贝生产化（#8 落地）
+
+把可行性验证做成生产特性，改 6 个文件、全部走「默认关闭直通、条件满足才启用」：
+
+- `AscendVenc::encodeDevice()` + `sendAndDrain()`（与 encode 共用重试/排空）
+- `AscendVdec::setOnDevFrame()`：布局允许时跳过 D2H
+- `TranscodeSink` 准入判断 + `onDecodedDevice()`，失败回落原路径（不重复编码）
+- `getTranscode` 新增 zero_copy / zero_copy_frames / zero_copy_fallbacks 三个可观测字段
+
+真机结果（720p，2×310P3）：
+- A 组 zero_copy=true、404 帧全直通、fallbacks=0、客户端 25.1fps
+- B 组（有滤镜）正确回落、出流正常
+- CPU 4 路：2.9% vs 主机路径 10.1%（省 72%）
+- 画质与源一致；16 路 16/16 直通、聚合 399fps
+
+顺手修了一个既有 bug：VDEC 按最大尺寸（1920x1080）输出，720p 流被解成 1080p 再缩回，
+每帧多两次缩放；新增 `setOutputSize()` 用源轨真实宽高收紧。主机路径同样受益。
