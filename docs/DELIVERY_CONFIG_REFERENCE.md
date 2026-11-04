@@ -153,6 +153,18 @@ stream_rule_3=__defaultVhost__/live/cam3:h265
 `hw_decode_frames`（解码，按「有过硬件帧下载」而非「配置了开关」）。
 `hw` 参数只表示「希望用硬件」，实际可能已回落软件。
 
+**昇腾链路专用字段**（`ENABLE_ASCEND_VENC` 构建才有，其余平台为默认值）：
+
+| 字段 | 含义 | 运维怎么看 |
+|---|---|---|
+| `decode_backend` | `ascend` / `ffmpeg` / `none` | 现场最容易被「开了硬解其实回落软解」骗，先看这个 |
+| `vdec_in` / `vdec_out` / `vdec_dropped` | 送进 VDEC / 解出来 / 取到句柄但无有效图像 | `dropped` 持续增长=解码异常（正常只有启动期几个空帧） |
+| `vdec_channel` / `venc_channel` | 占用的 DVPP 通道号（-1=未占用） | 单进程 VENC 上限 16，接近上限要分片 |
+| `venc_sent` / `venc_out` / `venc_retries` | 送进编码器 / 回调出的包 / 驱动忙重投 | 两者应基本相等；`retries` 持续增长说明编码器跟不上 |
+
+⚠️ 走昇腾硬解时 `hw_decode` 已被修正为 `true`（早期它只统计 libavcodec 的硬件帧，
+DVPP 硬解永远是 false，会把运维引到错误方向）。
+
 ---
 
 ## 3. 错误码

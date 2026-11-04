@@ -665,6 +665,16 @@ Json::Value getTranscodeApi(const TranscodeApiArgs &args) {
             // 解码侧：hw_decode=true 才算真的在用硬件解码（挂设备但没下载过帧不算）
             track["hw_decode"] = st.hw_decode;
             track["hw_decode_frames"] = (Json::Int64) st.hw_decode_frames;
+            // 昇腾链路可观测性：后端名 + VDEC/VENC 计数与通道号
+            track["decode_backend"] = st.decode_backend;
+            track["vdec_in"] = (Json::Int64) st.vdec_in;
+            track["vdec_out"] = (Json::Int64) st.vdec_out;
+            track["vdec_dropped"] = (Json::Int64) st.vdec_dropped;
+            track["vdec_channel"] = st.vdec_channel;
+            track["venc_sent"] = (Json::Int64) st.venc_sent;
+            track["venc_out"] = (Json::Int64) st.venc_out;
+            track["venc_retries"] = (Json::Int64) st.venc_retries;
+            track["venc_channel"] = st.venc_channel;
             track["hw_device"] = st.hw_device;
             track["input_frames"] = (Json::Int64) st.input_frames;
             val["tracks"].append(track);

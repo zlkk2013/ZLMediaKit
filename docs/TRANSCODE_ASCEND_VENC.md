@@ -448,3 +448,21 @@ S=$(date +%s.%N); timeout 18 ffprobe ... rtsp://... ; E=$(date +%s.%N)
 
 ⚠️ 测量提醒：这个用例第一次跑出「客户端 0 包」，原因是**取样太早**（推流后 2 秒就拉，
 转码轨还没 ready）。改成推流后等 10 秒再拉即为 799 帧连续。判定「切换后断流」前先排除取样时序。
+
+### 运行指标（getTranscode 已暴露，2026-11-04）
+
+`/index/api/getTranscode` 的 `tracks[]` 新增（仅 `ENABLE_ASCEND_VENC` 构建有值）：
+
+```
+decode_backend = ascend        # ascend / ffmpeg / none
+vdec_in = 420  vdec_out = 415  vdec_dropped = 3  vdec_channel = 0
+venc_sent = 413  venc_out = 413  venc_retries = 0  venc_channel = 0
+hw_decode = true  hw_decode_frames = 410
+```
+
+实测一轮（720p，硬解+硬编）：`vdec_in 420 / vdec_out 415 / dropped 3`（启动期空帧）、
+`venc_sent 413 = venc_out 413`（无积压）、`retries 0`、通道号都是 0。
+
+**踩到一个会误导运维的坑**：`hw_decode` 原本只统计 libavcodec 的硬件帧下载，
+走 DVPP VDEC 时永远是 `false` —— 运维看到「配置开了硬解、接口说没硬解」就会去查错方向。
+已把它对齐成「真在硬解」的事实（`hw_decode=true`，`hw_decode_frames=vdec_out`）。

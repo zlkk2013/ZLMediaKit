@@ -416,6 +416,10 @@ void AscendVenc::flush() {
     }
 }
 
+int AscendVenc::channel() const {
+    return (_opened && _impl) ? _impl->cfg.channel : -1;
+}
+
 void AscendVenc::close() {
     if (!_opened || !_impl) {
         return;

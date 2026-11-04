@@ -195,6 +195,31 @@ std::vector<TranscodeSink::TrackStatus> TranscodeSink::trackStatus() const {
         // Must run AFTER st.hardware is known — computing it earlier read the default
         // (false) and always reported -1 while the log said picked=0.
         st.hw_device = st.hardware ? pr.second.hw_device : -1;
+#ifdef ENABLE_ASCEND_VENC
+        // 昇腾链路：把「解码是不是真走 NPU、通道号、丢帧」暴露到状态接口。
+        // 现场最常见的误判就是「配置开了硬解但实际回落软解」，靠这三项能一眼看出来。
+        if (pr.second.decoder) {
+            st.decode_backend = pr.second.decoder->usingAscendDecode() ? "ascend" : "ffmpeg";
+            st.vdec_in = pr.second.decoder->ascendDecodeIn();
+            st.vdec_out = pr.second.decoder->ascendDecodeOut();
+            st.vdec_dropped = pr.second.decoder->ascendDecodeDropped();
+            st.vdec_channel = pr.second.decoder->ascendDecodeChannel();
+            // 别让老的 hw_decode 字段误导运维：它原本只统计 libavcodec 的硬件帧，
+            // 走 DVPP VDEC 时永远是 false。这里对齐成「真在硬解」的事实。
+            if (pr.second.decoder->usingAscendDecode()) {
+                st.hw_decode = true;
+                st.hw_decode_frames = st.vdec_out;
+            }
+        } else {
+            st.decode_backend = "none";
+        }
+        if (pr.second.encoder && pr.second.encoder->usingAscendEncode()) {
+            st.venc_sent = pr.second.encoder->ascendSentFrames();
+            st.venc_out = pr.second.encoder->ascendOutFrames();
+            st.venc_retries = pr.second.encoder->ascendSendRetries();
+            st.venc_channel = pr.second.encoder->ascendChannel();
+        }
+#endif
         ret.emplace_back(st);
     }
     // 按 track index 排序，让接口输出稳定

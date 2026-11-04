@@ -149,6 +149,15 @@ public:
     bool hardwareDecoding() const { return _hw_frames > 0; }
     int64_t hardwareFrames() const { return _hw_frames; }
 
+#ifdef ENABLE_ASCEND_VENC
+    /// 解码后端：真正走了 DVPP VDEC 时为 true（此时 _context 为空，不走 libavcodec）
+    bool usingAscendDecode() const { return (bool) _ascend_dec; }
+    uint32_t ascendDecodeIn() const;
+    uint32_t ascendDecodeOut() const;
+    uint32_t ascendDecodeDropped() const;
+    int ascendDecodeChannel() const;
+#endif
+
 private:
     void onDecode(const FFmpegFrame::Ptr &frame);
     bool inputFrame_l(const Frame::Ptr &frame, bool live, bool enable_merge);

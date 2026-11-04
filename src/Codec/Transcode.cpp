@@ -841,6 +841,21 @@ void FFmpegDecoder::setOnDecode(FFmpegDecoder::onDec cb) {
     _cb = std::move(cb);
 }
 
+#ifdef ENABLE_ASCEND_VENC
+uint32_t FFmpegDecoder::ascendDecodeIn() const {
+    return _ascend_dec ? _ascend_dec->inFrames() : 0;
+}
+uint32_t FFmpegDecoder::ascendDecodeOut() const {
+    return _ascend_dec ? _ascend_dec->outFrames() : 0;
+}
+uint32_t FFmpegDecoder::ascendDecodeDropped() const {
+    return _ascend_dec ? _ascend_dec->droppedFrames() : 0;
+}
+int FFmpegDecoder::ascendDecodeChannel() const {
+    return _ascend_dec ? _ascend_dec->channel() : -1;
+}
+#endif
+
 void FFmpegDecoder::onDecode(const FFmpegFrame::Ptr &frame) {
     if (_cb) {
         _cb(frame);

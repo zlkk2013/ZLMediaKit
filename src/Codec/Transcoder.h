@@ -375,6 +375,16 @@ public:
         return _context && _codec;
     }
 
+public:
+#ifdef ENABLE_ASCEND_VENC
+    /// 昇腾硬编可观测性：状态接口要读这些值，故放 public
+    bool usingAscendEncode() const { return (bool) _ascend; }
+    uint32_t ascendSentFrames() const;
+    uint32_t ascendOutFrames() const;
+    uint32_t ascendSendRetries() const;
+    int ascendChannel() const;
+#endif
+
 private:
     /// 是否为视频轨（不依赖 _context：走昇腾硬编时根本没有 AVCodecContext）
     bool isVideo() const;

@@ -86,6 +86,8 @@ public:
     uint32_t sentFrames() const { return _sent; }
     uint32_t outFrames() const { return _out; }
     uint32_t sendRetries() const { return _retries; }
+    /// 占用的 DVPP VENC 通道号（-1 = 未打开）
+    int channel() const;
 
 private:
     struct Impl;

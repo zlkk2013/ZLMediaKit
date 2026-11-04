@@ -70,6 +70,10 @@ public:
 
     uint32_t inFrames() const { return _in; }
     uint32_t outFrames() const { return _out; }
+    /// 取到句柄但拿不到有效图像的次数（宽高为 0 / 平面地址为空）。运维判据：该值持续增长=解码异常
+    uint32_t droppedFrames() const;
+    /// 占用的 DVPP VDEC 通道号（-1 = 未打开）
+    int channel() const;
     bool opened() const { return _opened; }
 
 private:

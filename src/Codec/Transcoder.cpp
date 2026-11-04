@@ -1898,6 +1898,21 @@ bool FFmpegEncoder::warmup(const Track::Ptr &target) {
 }
 
 
+#ifdef ENABLE_ASCEND_VENC
+uint32_t FFmpegEncoder::ascendSentFrames() const {
+    return _ascend ? _ascend->sentFrames() : 0;
+}
+uint32_t FFmpegEncoder::ascendOutFrames() const {
+    return _ascend ? _ascend->outFrames() : 0;
+}
+uint32_t FFmpegEncoder::ascendSendRetries() const {
+    return _ascend ? _ascend->sendRetries() : 0;
+}
+int FFmpegEncoder::ascendChannel() const {
+    return _ascend ? _ascend->channel() : -1;
+}
+#endif
+
 bool FFmpegEncoder::isVideo() const {
     if (_context) {
         return _context->codec_type == AVMEDIA_TYPE_VIDEO;

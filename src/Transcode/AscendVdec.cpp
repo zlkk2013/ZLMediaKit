@@ -175,6 +175,14 @@ struct AscendVdec::Impl {
 
 AscendVdec::AscendVdec() = default;
 
+uint32_t AscendVdec::droppedFrames() const {
+    return _impl ? _impl->dropped : 0;
+}
+
+int AscendVdec::channel() const {
+    return (_opened && _impl) ? _impl->cfg.channel : -1;
+}
+
 AscendVdec::~AscendVdec() {
     close();
 }

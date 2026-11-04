@@ -248,6 +248,19 @@ public:
         int64_t hw_decode_frames = 0;
         /** 分配到的硬件设备号（-1 = 未指定/该平台不支持设备选择） */
         int hw_device = -1;
+        /** 解码后端：ascend(DVPP VDEC) / ffmpeg / none（未转码）—— 现场判断「有没有真上 NPU」 */
+        std::string decode_backend;
+        /** DVPP VDEC 统计：in=送进去的帧数，out=解出来的帧数，dropped=取到句柄但无有效图像 */
+        int64_t vdec_in = 0;
+        int64_t vdec_out = 0;
+        int64_t vdec_dropped = 0;
+        /** DVPP 通道号（-1 = 未占用）；运维排查 16 路通道上限要用 */
+        int vdec_channel = -1;
+        /** DVPP VENC 统计：sent=送进编码器，out=回调出的包，retries=驱动忙重投次数 */
+        int64_t venc_sent = 0;
+        int64_t venc_out = 0;
+        int64_t venc_retries = 0;
+        int venc_channel = -1;
     };
     std::vector<TrackStatus> trackStatus() const;
 
