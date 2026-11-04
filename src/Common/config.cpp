@@ -435,6 +435,21 @@ const string kCustomHeader = "custom_header";
 static onceToken token([]() {
     // 默认值写进 mINI：配置里缺这几项时行为仍然可预期，也不会再刷
     // "unknow config" 警告；默认值必须与 TranscodeOption 一致
+    // ---- S3/云存储默认值（关闭时行为与未引入本模块完全一致）----
+    // S3/MinIO storage defaults; with s3.enable=0 nothing changes for existing users
+    mINI::Instance()["s3.enable"] = 0;
+    mINI::Instance()["s3.endpoint"] = "";
+    mINI::Instance()["s3.region"] = "us-east-1";
+    mINI::Instance()["s3.bucket"] = "";
+    mINI::Instance()["s3.access_key"] = "";
+    mINI::Instance()["s3.secret_key"] = "";
+    mINI::Instance()["s3.session_token"] = "";
+    mINI::Instance()["s3.path_style"] = 1;
+    mINI::Instance()["s3.root_prefix"] = "";
+    mINI::Instance()["s3.record_mp4"] = 0;
+    mINI::Instance()["s3.record_hls"] = 0;
+    mINI::Instance()["s3.timeout_ms"] = 15000;
+
     // Defaults live in mINI so a config missing these keys still behaves
     // predictably and no "unknow config" warning is printed; must match
     // TranscodeOption

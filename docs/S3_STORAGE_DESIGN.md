@@ -1,0 +1,90 @@
+# S3 云存储模块设计
+
+目标：录制的音视频**直接写进 S3/MinIO（全内存流，不落磁盘）**，并能通过 ZLM 自己的 HTTP
+服务和点播能力把云上文件放出来。
+
+## 1. 需求对照
+
+| # | 需求 | 设计要点 | 状态 |
+|---|---|---|---|
+| 1 | s3/minio 内存流直写，解决录像 IO 瓶颈 | 录制侧用内存缓冲 + 分片上传（每片 8MB），不做临时文件 | 客户端已就绪，录制侧接线中 |
+| 2 | 通过 ZLM 的 HTTP 服务下载/点播云存储文件 | ZLM HTTP 路由代理对象字节（支持 Range/断点续传），不暴露密钥 | 待开发 |
+| 3 | 遍历云存储生成 HTTP 菜单页 | `ListObjectsV2` + 静态 HTML 模板（按前缀分组、可点播/下载） | 待开发 |
+| 4 | 读写全内存流、不经磁盘 | 分片上传直接从内存发；读取用 Range 拉到内存，不写临时文件 | 客户端已就绪 |
+| 5 | mp4/hls 录制到云；从云点播 mp4 为 rtsp/rtmp/flv/webrtc | 录制：MP4/HLS 写 S3；点播：对象 → MP4FileMemory → MP4Demuxer → MediaSource | 待开发 |
+| 6 | 绝大部分文件都支持云存储读写 | 以「存储后端」抽象收口，MP4/HLS/快照都走同一后端 | 设计已定 |
+
+## 2. 分层
+
+```
+┌───────────────────────────────────────────────┐
+│ 录制/回放（MP4Recorder、HlsMakerImp、点播源）   │  ← 只认「存储后端」接口
+├───────────────────────────────────────────────┤
+│ S3Storage：对象命名、分片、重试、目录遍历        │
+├───────────────────────────────────────────────┤
+│ S3Client：SigV4 签名 + HTTP/1.1（http/https）   │  ← 已完成并自测
+├───────────────────────────────────────────────┤
+│ S3Crypto：SHA-256 / HMAC-SHA256                │  ← 已用官方向量验证
+└───────────────────────────────────────────────┘
+```
+
+### 为什么自己实现客户端
+
+aws-sdk-cpp 编译产物数百 MB，离线/信创交付很难塞进去；我们只需要 PUT/分片/GET 范围读/LIST/HEAD/DELETE
+六个操作，SigV4 + HTTP/1.1 约千行可控代码。TLS 复用项目已有的 OpenSSL（`ENABLE_OPENSSL`），
+未启用时 https 端点会**明确报错**，不会静默降级成明文。
+
+### 对象命名
+
+```
+<root_prefix>/<app>/<stream>/<日期>/<文件名>
+例：zlm/record/live/cam01/2026-11-04/2026-11-04-10-00-00-0.mp4
+```
+
+与本地录制的目录结构保持一致：现场把「本地目录」换成「桶内前缀」即可，回放/菜单页不用改口径。
+
+## 3. 配置
+
+| 键 | 说明 |
+|---|---|
+| `s3.enable` | 总开关，0 时行为与本模块引入前完全一致 |
+| `s3.endpoint` | `http://127.0.0.1:9000` / `https://s3.cn-north-1.amazonaws.com.cn` |
+| `s3.region` | 默认 us-east-1 |
+| `s3.bucket` | 桶名 |
+| `s3.access_key` / `s3.secret_key` / `s3.session_token` | 凭据（session_token 支持 STS 临时凭据） |
+| `s3.path_style` | MinIO 必须 1；AWS 两种都行 |
+| `s3.root_prefix` | 对象名前缀 |
+| `s3.record_mp4` / `s3.record_hls` | 是否把录制直接写云（不落盘） |
+| `s3.timeout_ms` | 单次请求超时，默认 15000 |
+
+配置优先级：运行时 API 下发 > 配置文件。换桶/换密钥不必重启（重启会中断录制）。
+
+## 4. 已完成并验证
+
+- `src/S3/S3Crypto.*`：SHA-256 / HMAC-SHA256，**对照官方测试向量全部通过**
+  （SHA-256 空串/abc/448bit、HMAC RFC4231 case 1/2/6）。
+- `src/S3/S3Client.*`：SigV4 签名、PUT、分片 PUT、GET、Range GET、HEAD、LIST v2、DELETE、
+  预签名 URL、建桶。https 走 OpenSSL（未启用时明确报错）。
+- `tools/s3/s3_selftest.cpp`：11 项端到端自测（含 20MB/3 片分片上传与字节比对）。
+- `tools/s3/s3_mock_server.py`：**独立实现一遍 SigV4 校验**的 S3 模拟服务，
+  用它交叉验证 C++ 端签名（不是自说自话：两边各自实现同一份规范）。
+- `src/S3/S3Config.*` + `config.cpp` 默认值：配置接入与运行时下发接口。
+
+自测实测（macOS，本机 mock）：
+
+```
+OK createBucket（幂等）      OK putObject            OK getObject 内容一致
+OK headObject 大小正确       OK getObjectRange       OK listObjects 含刚写的 key
+OK putObjectMultipart 20MB/3 片  169ms (118 MB/s)
+OK 分片对象回读字节一致      OK deleteObject         OK 删除后 HEAD 应失败
+```
+
+## 5. 待办（按依赖顺序）
+
+1. `S3Storage` 门面：对象命名、失败重试、目录遍历（供录制与菜单页共用）。
+2. MP4 录制直写云：`MP4FileS3`（内存 + seek）→ 关闭时上传；按切片大小限制内存峰值。
+3. HLS 录制直写云：每片 `.ts` 一条对象 + `.m3u8` 每次更新覆盖写。
+4. HTTP 下载/播放：`/s3/<key>` 路由代理字节（Range、Content-Type、下载文件名）。
+5. 菜单页：按前缀列对象生成 HTML（尺寸/时间/时长、点播/下载链接）。
+6. 云点播：对象 → `MP4FileMemory` → `MP4Demuxer` → 媒体源（rtsp/rtmp/flv/webrtc）。
+7. 真机（昇腾 arm64 + 真实 MinIO/S3）复验 + 容量/长跑。
