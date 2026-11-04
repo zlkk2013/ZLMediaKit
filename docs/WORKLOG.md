@@ -249,3 +249,21 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 
 设计取舍：**不自动迁移**——迁移意味着断流重推，偷偷做会变成"客户端莫名断流且无人知晓"。
 调度器只标记 + 引导新流，迁移交给上层重推。
+
+## 2026-11-04 追加：#8 零拷贝可行性验证（昇腾）
+
+新增 `tools/ascend/ascend_zero_copy_probe.cpp`，对比「VDEC→host→VENC」与「VDEC→VENC 设备直通」。
+
+结果（720p，150 帧 × 4 轮）：零拷贝 **118.4 fps / 8.45 ms 每帧**，拷贝 **107.5 fps / 9.30 ms**，
+**吞吐 +9.5%、每帧省 0.85 ms**，两条路输出都解码正常、画质与源一致。
+
+四个必须记住的坑：
+1. VDEC 要调用方给输出缓冲（`pic.vir_addr`），否则 `BAD_ADDR(0xA0058011)`；
+2. **缓冲只给一块会花屏**——VDEC 要留参考帧，必须按 `frame_buf_cnt` 给一组轮转（用了 8 块）；
+3. VENC create 后必须 `set_scene_mode` + `get/set_rc_param` 往返，否则出脏数据；
+4. 零拷贝要等编码器消费完才能 `release_frame`，否则缓冲被下一帧覆盖。
+
+带宽账：720p 每帧少搬 2.76 MB，16 路 25fps ⇒ 约 1.1 GB/s。
+
+生产化 3~5 天：`encodeDevice()` + VDEC 设备帧出参 + 管线直通快路径（无滤镜/无缩小时启用）+ 16 路回归。
+详见 `docs/TRANSCODE_ASCEND_ZEROCOPY.md`。
