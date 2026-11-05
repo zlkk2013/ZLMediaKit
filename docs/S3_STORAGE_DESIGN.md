@@ -11,7 +11,7 @@
 | 2 | 通过 ZLM 的 HTTP 服务下载/点播云存储文件 | ZLM HTTP 路由代理对象字节（支持 Range/断点续传），不暴露密钥 | 待开发 |
 | 3 | 遍历云存储生成 HTTP 菜单页 | `ListObjectsV2` + 静态 HTML 模板（按前缀分组、可点播/下载） | 待开发 |
 | 4 | 读写全内存流、不经磁盘 | 分片上传直接从内存发；读取用 Range 拉到内存，不写临时文件 | **已验证：录制全过程本地零文件** |
-| 5 | mp4/hls 录制到云；从云点播 mp4 为 rtsp/rtmp/flv/webrtc | 录制：MP4/HLS 写 S3；点播：对象 → MP4FileMemory → MP4Demuxer → MediaSource | 待开发 |
+| 5 | mp4/hls 录制到云；从云点播 mp4 为 rtsp/rtmp/flv/webrtc | 录制：MP4/HLS 写 S3；点播：对象 → MP4FileMemory → MP4Demuxer → MediaSource | **录制两态已完成**；云点播待开发 |
 | 6 | 绝大部分文件都支持云存储读写 | 以「存储后端」抽象收口，MP4/HLS/快照都走同一后端 | 设计已定 |
 
 ## 2. 分层
@@ -102,7 +102,28 @@ startRecord: code=0
 
 1. ~~`S3Storage` 门面~~ **已完成**（对象命名 + 上传 + exists）。
 2. ~~MP4 录制直写云~~ **已完成并验证**。
-3. HLS 录制直写云：每片 `.ts` 一条对象 + `.m3u8` 每次更新覆盖写。
+3. ~~HLS 录制直写云~~ **已完成并验证**。
+
+### HLS 直写云存储的做法
+
+`HlsMakerImp` 里所有落盘动作只有几个出口：`makeFile()`（切片/init/m3u8）、
+`File::saveFile()`（目录级 vod.m3u8）、`File::delete_file()`（滚动删除）。
+云存储模式下改为：切片数据攒在内存（`_s3_seg_buf`），`onFlushLastSegment()` 时整片
+异步上传（`WorkThreadPool`，不阻塞 muxer 线程）；`onWriteHls()` 每次把播放列表整体覆盖写到
+同名对象（观众端永远拿到最新一份）；`init.mp4` 与目录级 `vod.m3u8` 同样写对象。
+
+对象名与本地目录结构一一对应（`<prefix>/<app>/<stream>/<日期>/<小时>/<mm-ss>_<idx>.ts`），
+所以后面做「云存储 HTTP 菜单页 / 点播」时，路径拼法与本地完全一致。
+
+实测（macOS + 模拟 S3，HLS 录制 16s）：
+
+```
+startRecord(HLS): 0
+对象数: 15   hls/live/hlss.../2026-11-05/15/37-28_0.ts ... index.m3u8
+m3u8 片段数: 4
+首个切片: h264 640x360 + aac，218KB
+本地 hls 文件数: 0        ← 不落盘
+```
 4. HTTP 下载/播放：`/s3/<key>` 路由代理字节（Range、Content-Type、下载文件名）。
 5. 菜单页：按前缀列对象生成 HTML（尺寸/时间/时长、点播/下载链接）。
 6. 云点播：对象 → `MP4FileMemory` → `MP4Demuxer` → 媒体源（rtsp/rtmp/flv/webrtc）。

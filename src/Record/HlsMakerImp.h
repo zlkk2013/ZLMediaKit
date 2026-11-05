@@ -69,6 +69,18 @@ protected:
 
 private:
     std::shared_ptr<FILE> makeFile(const std::string &file,bool setbuf = false);
+
+    /// 云存储直写：切片/播放列表/init 段都写对象，不落磁盘
+    bool s3Enabled() const { return _s3; }
+    void s3Put(const std::string &key, const std::string &data);
+    std::string s3Key(const std::string &rel) const {
+        return _s3_base.empty() ? rel : (_s3_base + "/" + rel);
+    }
+
+    bool _s3 = false;
+    std::string _s3_base;      ///< 对象前缀 <root>/<app>/<stream>
+    std::string _s3_seg_key;   ///< 当前切片的对象名
+    std::string _s3_seg_buf;   ///< 当前切片的内存缓冲
     void clearCache(bool immediately, bool eof);
     void saveCurrentDir();
 

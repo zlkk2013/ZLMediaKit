@@ -15,6 +15,9 @@
 #include "Util/util.h"
 #include "Util/uv_errno.h"
 #include "Util/File.h"
+#include "S3/S3Config.h"
+#include "S3/S3Storage.h"
+#include "Thread/WorkThreadPool.h"
 #include "Common/config.h"
 
 using namespace std;
@@ -116,7 +119,11 @@ void HlsMakerImp::saveCurrentDir() {
     }
     if (isFmp4()) {
         // 写入init.mp4文件
-        File::saveFile(_current_dir_init_file, _path_prefix + "/" + _current_dir + "init.mp4");
+        if (s3Enabled()) {
+            s3Put(s3Key(_current_dir + "init.mp4"), _current_dir_init_file);
+        } else {
+            File::saveFile(_current_dir_init_file, _path_prefix + "/" + _current_dir + "init.mp4");
+        }
     }
 
     int maxSegmentDuration = 0;
@@ -150,7 +157,12 @@ void HlsMakerImp::saveCurrentDir() {
     index_str += "#EXT-X-ENDLIST\n";
 
     /** 写入该目录的m3u8文件 **/
-    File::saveFile(index_str, _path_prefix + "/" + _current_dir + (isFmp4() ? "vod.fmp4.m3u8" : "vod.m3u8"));
+    auto vod_name = _current_dir + (isFmp4() ? "vod.fmp4.m3u8" : "vod.m3u8");
+    if (s3Enabled()) {
+        s3Put(s3Key(vod_name), index_str);
+    } else {
+        File::saveFile(index_str, _path_prefix + "/" + vod_name);
+    }
 }
 
 string HlsMakerImp::onOpenSegment(uint64_t index) {
@@ -174,7 +186,13 @@ string HlsMakerImp::onOpenSegment(uint64_t index) {
             _current_dir = std::move(current_dir);
         }
     }
-    _file = makeFile(segment_path, true);
+    if (s3Enabled()) {
+        _file = nullptr;               // 云存储模式不产生本地文件
+        _s3_seg_key = s3Key(segment_name);
+        _s3_seg_buf.clear();
+    } else {
+        _file = makeFile(segment_path, true);
+    }
 
     // 保存本切片的元数据  [AUTO-TRANSLATED:64e6f692]
     // Save metadata for this slice
@@ -206,6 +224,11 @@ void HlsMakerImp::onWriteInitSegment(const char *data, size_t len) {
         _current_dir_init_file.assign(data, len);
     }
     string init_seg_path = _path_prefix + "/init.mp4";
+    if (s3Enabled()) {
+        s3Put(s3Key("init.mp4"), std::string(data, len));
+        _path_init = init_seg_path;
+        return;
+    }
     auto file = makeFile(init_seg_path);
     if (file) {
         fwrite(data, len, 1, file.get());
@@ -216,7 +239,9 @@ void HlsMakerImp::onWriteInitSegment(const char *data, size_t len) {
 }
 
 void HlsMakerImp::onWriteSegment(const char *data, size_t len) {
-    if (_file) {
+    if (s3Enabled()) {
+        _s3_seg_buf.append(data, len);
+    } else if (_file) {
         fwrite(data, len, 1, _file.get());
     }
     if (_media_src) {
@@ -232,6 +257,15 @@ void HlsMakerImp::onWriteSegment(const char *data, size_t len) {
 
 void HlsMakerImp::onWriteHls(const std::string &data, bool include_delay) {
     auto path = include_delay ? _path_hls_delay : _path_hls;
+    if (s3Enabled()) {
+        // 播放列表每次都整体覆盖：对象名固定，观众端永远拿到最新一份
+        auto slash = path.find_last_of('/');
+        s3Put(s3Key(slash == std::string::npos ? path : path.substr(slash + 1)), data);
+        if (_media_src && !include_delay) {
+            _media_src->setIndexFile(data);
+        }
+        return;
+    }
     auto hls = makeFile(path);
     if (hls) {
         fwrite(data.data(), data.size(), 1, hls.get());
@@ -263,6 +297,18 @@ void HlsMakerImp::onFlushLastSegment(uint64_t duration_ms) {
     // 关闭并flush文件到磁盘  [AUTO-TRANSLATED:9798ec4d]
     // Close and flush file to disk
     _file = nullptr;
+    if (s3Enabled()) {
+        if (!_s3_seg_buf.empty()) {
+            s3Put(_s3_seg_key, _s3_seg_buf);
+            _s3_seg_buf.clear();
+        }
+        if (!isLive() || isKeep()) {
+            _current_dir_seg_list.push_back(
+                HlsSegmentInfo { (int) duration_ms, _info.file_name.erase(0, _current_dir.size()),
+                                 getLastSegmentDateTime() });
+        }
+        return;
+    }
     if (!isLive() || isKeep()) {
         _current_dir_seg_list.push_back(
             HlsSegmentInfo { (int)duration_ms, _info.file_name.erase(0, _current_dir.size()), getLastSegmentDateTime() });
@@ -291,6 +337,31 @@ std::shared_ptr<FILE> HlsMakerImp::makeFile(const string &file, bool setbuf) {
 void HlsMakerImp::setMediaSource(const MediaTuple& tuple) {
     static_cast<MediaTuple &>(_info) = tuple;
     _media_src = std::make_shared<HlsMediaSource>(isFmp4() ? HLS_FMP4_SCHEMA : HLS_SCHEMA, _info);
+
+    // 云存储：切片不再落本地盘，直接以对象形式写入
+    if (S3Storage::enabledForHls()) {
+        auto opt = S3ConfigManager::instance().get();
+        _s3 = true;
+        _s3_base = opt.root_prefix;
+        if (!_s3_base.empty() && _s3_base.back() == '/') {
+            _s3_base.pop_back();
+        }
+        if (!_s3_base.empty()) {
+            _s3_base += "/";
+        }
+        _s3_base += std::string(tuple.app) + "/" + std::string(tuple.stream);
+        InfoL << "HLS 写云存储: " << _s3_base << "/...";
+    }
+}
+
+void HlsMakerImp::s3Put(const std::string &key, const std::string &data) {
+    // 上传放后台线程：切片的 muxer 线程不能被网络阻塞
+    WorkThreadPool::Instance().getExecutor()->async([key, data]() {
+        std::string err;
+        if (!S3Storage::instance().upload(key, data, err)) {
+            WarnL << "云存储上传失败(切片): " << key << " err=" << err;
+        }
+    });
 }
 
 HlsMediaSource::Ptr HlsMakerImp::getMediaSource() const {
