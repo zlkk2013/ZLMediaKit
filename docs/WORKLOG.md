@@ -285,3 +285,38 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 
 顺手修了一个既有 bug：VDEC 按最大尺寸（1920x1080）输出，720p 流被解成 1080p 再缩回，
 每帧多两次缩放；新增 `setOutputSize()` 用源轨真实宽高收紧。主机路径同样受益。
+
+## 2026-11-05：S3 云存储（客户端 → 录制 → HTTP 出口）真机闭环
+
+新增 `src/S3/`（Crypto / Client / Config / Storage / HttpService），实现「录制直接写对象存储、
+再从 ZLM 自己的 HTTP 服务看回来」，中间**全程不落磁盘**。
+
+**代码**
+- `S3Crypto`：SHA-256 / HMAC-SHA256，对照官方向量全过。
+- `S3Client`：SigV4 + HTTP/1.1，PUT / 分片 PUT / GET / Range GET / HEAD / LIST v2 / DELETE /
+  预签名 / 建桶；https 走 OpenSSL，未启用时明确报错不静默降级。
+- `S3Storage`：门面（对象命名 `<prefix>/<app>/<stream>/<日期>/<文件>` + 上传 + exists）。
+- 录制接线：`MP4Recorder` 注入内存 IO，`HlsMakerImp` 切片/播放列表/init 全写对象。
+- `S3HttpService`：`/s3/<key>` 下载（Range 206 / 416）、`/s3/<prefix>/` 菜单页（逐级下钻），
+  接线点 `HttpFileManager::onAccessPath()` 最前面一处。
+
+**真机证据**（192.168.210.89 昇腾 arm64 + 真实 SeaweedFS S3，非 mock）
+- 客户端自测 11/11；20MB/3 片 350ms（57 MB/s）。
+- MP4 录制：回读 289001 字节，ffprobe 12.8s h264 1280 + aac，本地录制目录新增 0 文件。
+- HLS 录制：两份播放列表引用段全部在桶内、还原后 ffprobe 出 h264+aac，本地新增 0 文件。
+- `/s3/` 出口 18/18：菜单两级、整对象字节一致、Range 任意区间/后缀/开区间/越界(416)、
+  6MB 分块流式 sha256 一致、m3u8 与其引用切片都能经 `/s3/` 取到、404 正确。
+
+**踩坑（都记进 `docs/S3_STORAGE_DESIGN.md` 第 7、8 节）**
+1. 验 SeaweedFS 不能翻数据目录（对象在 volume 的 `.dat` 里）——必须用 S3 协议列对象/取对象，
+   否则会把「录制成功」误判成失败（上一轮就是这么卡的）。
+2. fMP4 单切片 ffprobe 无轨道（moov 在 init 段）；必须整体还原播放列表再验。
+3. 滚动窗口的播放列表只有 segNum 段，不能拿时长当判据。
+4. `Parser` 是 `mediakit::Parser`；`parser.url()` 已被 `UrlDecodePath` 处理过，不能再解一次。
+5. `sendResponse()` 会给 content-type 追加 `; charset=`（`video/mp4; charset=utf-8` 是正常的）。
+6. 大对象不走「302 到预签名 URL」：现场只有 ZLM 端口对外，S3 常在内网另一台机器。
+
+**工具**：`tools/s3/s3_selftest.cpp` 增 `--list/--head/--get/--put` 单功能模式；
+`tools/s3/box_s3_{record,hls,http}_verify.py` 三个真机验收脚本（判据全部比对真实字节）。
+
+**待做**：云点播（对象 → MP4FileMemory → MP4Demuxer → 媒体源）、快照写云、容量/长跑。

@@ -18,6 +18,7 @@
 #include "HttpSession.h"
 #include "HttpFileManager.h"
 #include "Common/MultiMediaSourceMuxer.h"
+#include "S3/S3HttpService.h"
 
 using namespace std;
 using namespace toolkit;
@@ -700,6 +701,13 @@ static string getFilePath(const Parser &parser,const MediaInfo &media_info, Sess
  * [AUTO-TRANSLATED:a79c824d]
  */
 void HttpFileManager::onAccessPath(Session &sender, Parser &parser, const HttpFileManager::invoker &cb) {
+    // 云存储出口：/s3/<key> 下载（含 Range）、/s3/<prefix>/ 菜单页。
+    // 放在最前面：这条路完全不碰本地文件系统，也就不该走 getFilePath 的本地目录校验。
+    if (S3HttpService::match(parser)) {
+        S3HttpService::onRequest(parser, cb);
+        return;
+    }
+
     auto fullUrl = "http://" + parser["Host"] + parser.fullUrl();
     MediaInfo media_info(fullUrl);
     auto file_path = getFilePath(parser, media_info, &sender);

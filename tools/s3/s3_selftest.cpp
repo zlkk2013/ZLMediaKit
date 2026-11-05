@@ -7,12 +7,20 @@
  *
  * 覆盖：小对象 PUT/GET/HEAD、范围读、LIST、分片上传（20MB 强制多片）、删除、预签名 URL。
  * 每一项都自己比对内容，失败即非 0 退出——不做「打印了就算过」的事。
+ *
+ * 另有三种「单功能」模式（给录制/点播链路做校验用，跑完即退）：
+ *   --list <prefix> [--max N]   按前缀列对象（每行 key<TAB>size<TAB>lastModified）
+ *   --get  <key>    [--out F]   下载对象到文件或 stdout
+ *   --head <key>                只取对象大小/etag
+ *   --put  <key>    --file F    上传本地文件（>8MB 自动走分片）
+ * 单功能模式不做自测、不建桶，返回值只反映这一个操作是否成功。
  */
 #include "S3/S3Client.h"
 #include "S3/S3Crypto.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -44,15 +52,23 @@ int main(int argc, char **argv) {
         else if (k == "--token") cfg.session_token = v;
     }
 
-    // 下载模式：--get <key> --out <file>（录制回读验证用）
-    std::string get_key, out_file;
+    // 单功能模式：只跑一个操作就退出（录制回读 / 点播链路校验用）
+    std::string mode, mode_arg, out_file, in_file;
+    int max_keys = 1000;
     for (int i = 1; i + 1 < argc; i += 2) {
         std::string k = argv[i], v = argv[i + 1];
-        if (k == "--get") get_key = v;
-        if (k == "--out") out_file = v;
-        if (k == "--list") get_key = "";
+        if (k == "--get" || k == "--head" || k == "--list" || k == "--put") {
+            mode = k;
+            mode_arg = v;
+        } else if (k == "--out") {
+            out_file = v;
+        } else if (k == "--file") {
+            in_file = v;
+        } else if (k == "--max") {
+            max_keys = atoi(v.c_str());
+        }
     }
-    if (!get_key.empty()) {
+    if (!mode.empty()) {
         S3Client cli(cfg);
         std::string e;
         // 必须先 valid()：它才会把 endpoint 解析进内部结构，否则会连到空的 host
@@ -60,9 +76,66 @@ int main(int argc, char **argv) {
             fprintf(stderr, "配置无效: %s\n", e.c_str());
             return 2;
         }
+
+        if (mode == "--put") {
+            if (in_file.empty()) {
+                fprintf(stderr, "缺少 --file <本地文件>\n");
+                return 2;
+            }
+            FILE *fp = fopen(in_file.c_str(), "rb");
+            if (!fp) {
+                fprintf(stderr, "打不开本地文件: %s\n", in_file.c_str());
+                return 2;
+            }
+            std::string buf;
+            char chunk[64 * 1024];
+            size_t n;
+            while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+                buf.append(chunk, n);
+            }
+            fclose(fp);
+            bool ok2 = buf.size() > (8u << 20)
+                               ? cli.putObjectMultipart(mode_arg, buf.data(), buf.size(), 8u << 20, e)
+                               : cli.putObject(mode_arg, buf.data(), buf.size(), e);
+            if (!ok2) {
+                fprintf(stderr, "上传失败: %s（HTTP %d）\n", e.c_str(), cli.lastStatus());
+                return 1;
+            }
+            fprintf(stderr, "已上传 %s → %s（%zu 字节）\n", in_file.c_str(), mode_arg.c_str(),
+                    buf.size());
+            return 0;
+        }
+
+        if (mode == "--list") {
+            std::vector<S3Object> objs;
+            if (!cli.listObjects(mode_arg, objs, max_keys, e)) {
+                fprintf(stderr, "列对象失败: %s（HTTP %d）\n", e.c_str(), cli.lastStatus());
+                return 1;
+            }
+            // 机器可读：一行一个对象，TAB 分隔，脚本直接 cut/awk 就能用
+            for (auto &o : objs) {
+                printf("%s\t%llu\t%s\n", o.key.c_str(), (unsigned long long) o.size,
+                       o.last_modified.c_str());
+            }
+            fprintf(stderr, "共 %zu 个对象（prefix='%s'）\n", objs.size(), mode_arg.c_str());
+            return 0;
+        }
+
+        if (mode == "--head") {
+            S3Object info;
+            if (!cli.headObject(mode_arg, info, e)) {
+                fprintf(stderr, "HEAD 失败: %s（HTTP %d）\n", e.c_str(), cli.lastStatus());
+                return 1;
+            }
+            printf("%s\t%llu\t%s\n", mode_arg.c_str(), (unsigned long long) info.size,
+                   info.etag.c_str());
+            return 0;
+        }
+
+        // --get
         std::string data;
-        if (!cli.getObject(get_key, data, e)) {
-            fprintf(stderr, "下载失败: %s\n", e.c_str());
+        if (!cli.getObject(mode_arg, data, e)) {
+            fprintf(stderr, "下载失败: %s（HTTP %d）\n", e.c_str(), cli.lastStatus());
             return 1;
         }
         FILE *fp = out_file.empty() ? stdout : fopen(out_file.c_str(), "wb");
@@ -72,7 +145,7 @@ int main(int argc, char **argv) {
         }
         fwrite(data.data(), 1, data.size(), fp);
         if (fp != stdout) fclose(fp);
-        fprintf(stderr, "已下载 %s → %s（%zu 字节）\n", get_key.c_str(),
+        fprintf(stderr, "已下载 %s → %s（%zu 字节）\n", mode_arg.c_str(),
                 out_file.empty() ? "stdout" : out_file.c_str(), data.size());
         return 0;
     }
