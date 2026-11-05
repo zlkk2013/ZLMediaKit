@@ -38,6 +38,7 @@
 
 #include "WebApi.h"
 #include "WebHook.h"
+#include "S3/S3Storage.h"
 #include "FFmpegSource.h"
 
 #include "Common/config.h"
@@ -2109,6 +2110,42 @@ void installWebApi() {
         val["data"]["paths"] = paths;
     });
 
+    // 云存储：截图成品同时写一份到桶里（<prefix>/snap/<url的md5>/<日期>/<时间戳>.jpg）
+    //
+    // 为什么本地还要留一份：截图是 ffmpeg 命令行产出的，必须落一次文件；
+    // 这份本地文件同时充当 getSnap 的「过期缓存」。桶里那份用于跨机器浏览/长期留存，
+    // 通过 /s3/ 菜单页即可看到（列表 + 图片预览/下载）。
+    static auto uploadSnapToS3 = [](const string &snap_path, const string &url_md5) {
+        if (!mediakit::S3Storage::enabledForSnap()) {
+            return;
+        }
+        // 对象名取自截图文件名本身（它是时间戳），这样本地缓存名与桶里对象名一一对应，
+        // 排障时能直接从文件名对上；文件名不是时间戳时退回当前时间。
+        auto slash = snap_path.find_last_of('/');
+        auto base = slash == string::npos ? snap_path : snap_path.substr(slash + 1);
+        auto dot = base.find_last_of('.');
+        if (dot != string::npos) {
+            base = base.substr(0, dot);
+        }
+        time_t ts = (time_t) atoll(base.data());
+        if (ts <= 0) {
+            ts = time(NULL);
+        }
+        char date[32];
+        struct tm tm_buf;
+        strftime(date, sizeof date, "%Y-%m-%d", localtime_r(&ts, &tm_buf));
+        auto key = mediakit::S3Storage::makeKey("snap", url_md5, date,
+                                                std::to_string((long long) ts) + ".jpg");
+        WorkThreadPool::Instance().getExecutor()->async([snap_path, key]() {
+            string err;
+            if (!mediakit::S3Storage::instance().uploadFile(key, snap_path, err)) {
+                WarnL << "截图写云存储失败: " << key << " err=" << err;
+                return;
+            }
+            InfoL << "截图已写云存储: " << key;
+        });
+    };
+
     static auto responseSnap = [](const string &snap_path,
                                   const HttpSession::KeyValue &headerIn,
                                   const HttpSession::HttpResponseInvoker &invoker,
@@ -2201,7 +2238,8 @@ void installWebApi() {
         // 启动FFmpeg进程，开始截图，生成临时文件，截图成功后替换为正式文件  [AUTO-TRANSLATED:7d589e3f]
         // Start the FFmpeg process, start taking screenshots, generate temporary files, replace them with formal files after successful screenshots
         auto new_snap_tmp = new_snap + ".tmp";
-        FFmpegSnap::makeSnap(allArgs["async"], allArgs["url"], new_snap_tmp, allArgs["timeout_sec"], [invoker, allArgs, new_snap, new_snap_tmp](bool success, const string &err_msg) {
+        auto url_md5 = MD5(allArgs["url"]).hexdigest();
+        FFmpegSnap::makeSnap(allArgs["async"], allArgs["url"], new_snap_tmp, allArgs["timeout_sec"], [invoker, allArgs, new_snap, new_snap_tmp, url_md5](bool success, const string &err_msg) {
             if (!success) {
                 // 生成截图失败，可能残留空文件  [AUTO-TRANSLATED:c96a4468]
                 // Screenshot generation failed, there may be residual empty files
@@ -2211,6 +2249,8 @@ void installWebApi() {
                 // Temporary file changed to formal file
                 File::delete_file(new_snap);
                 rename(new_snap_tmp.data(), new_snap.data());
+                // 云存储模式下同时上传一份（异步，不拖慢截图返回）
+                uploadSnapToS3(new_snap, url_md5);
             }
             responseSnap(new_snap, allArgs.parser.getHeader(), invoker, err_msg);
         });

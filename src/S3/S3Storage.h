@@ -31,6 +31,7 @@ public:
     /// 是否启用云存储录制（s3.enable && 对应的 record_xxx）
     static bool enabledForMp4();
     static bool enabledForHls();
+    static bool enabledForSnap();
 
     /**
      * 拼对象名：<root_prefix>/<app>/<stream>/<日期>/<文件名>
@@ -44,6 +45,12 @@ public:
      * @return 成功与否；失败时 err 带原因
      */
     bool upload(const std::string &key, const std::string &data, std::string &err);
+
+    /**
+     * 把本地文件整块读进内存后上传（截图这类小文件用；大文件请用 upload + 自己的缓冲）
+     * @return 成功与否；失败时 err 带原因
+     */
+    bool uploadFile(const std::string &key, const std::string &file_path, std::string &err);
 
     /// 对象是否已存在（避免重复上传同一段）
     bool exists(const std::string &key, uint64_t &size);

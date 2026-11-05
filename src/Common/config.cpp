@@ -448,6 +448,7 @@ static onceToken token([]() {
     mINI::Instance()["s3.root_prefix"] = "";
     mINI::Instance()["s3.record_mp4"] = 0;
     mINI::Instance()["s3.record_hls"] = 0;
+    mINI::Instance()["s3.record_snap"] = 0;
     mINI::Instance()["s3.timeout_ms"] = 15000;
 
     // Defaults live in mINI so a config missing these keys still behaves

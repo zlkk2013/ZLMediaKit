@@ -37,6 +37,7 @@ struct S3Options {
     std::string root_prefix;      ///< 对象名前缀，例如 "zlm/record"
     bool record_mp4 = false;      ///< 录制 mp4 直接写云存储（不落盘）
     bool record_hls = false;      ///< 录制 hls 直接写云存储（不落盘）
+    bool record_snap = false;     ///< 截图（getSnap）成品同时写一份到云存储
     int timeout_ms = 15000;
 };
 

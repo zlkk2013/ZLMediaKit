@@ -34,6 +34,11 @@ bool S3Storage::enabledForHls() {
     return opt.enable && opt.record_hls;
 }
 
+bool S3Storage::enabledForSnap() {
+    auto opt = S3ConfigManager::instance().get();
+    return opt.enable && opt.record_snap;
+}
+
 std::string S3Storage::makeKey(const std::string &app, const std::string &stream,
                                const std::string &date, const std::string &file_name) {
     auto opt = S3ConfigManager::instance().get();
@@ -63,6 +68,26 @@ bool S3Storage::upload(const std::string &key, const std::string &data, std::str
         return cli->putObject(key, data.data(), data.size(), err);
     }
     return cli->putObjectMultipart(key, data.data(), data.size(), 0, err);
+}
+
+bool S3Storage::uploadFile(const std::string &key, const std::string &file_path, std::string &err) {
+    FILE *fp = fopen(file_path.data(), "rb");
+    if (!fp) {
+        err = "打不开本地文件: " + file_path;
+        return false;
+    }
+    std::string data;
+    char buf[64 * 1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        data.append(buf, n);
+    }
+    fclose(fp);
+    if (data.empty()) {
+        err = "本地文件为空: " + file_path;
+        return false;
+    }
+    return upload(key, data, err);
 }
 
 bool S3Storage::exists(const std::string &key, uint64_t &size) {

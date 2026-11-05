@@ -31,6 +31,7 @@ const char *kPathStyle = "s3.path_style";
 const char *kRootPrefix = "s3.root_prefix";
 const char *kRecordMp4 = "s3.record_mp4";
 const char *kRecordHls = "s3.record_hls";
+const char *kRecordSnap = "s3.record_snap";
 const char *kTimeoutMs = "s3.timeout_ms";
 
 std::string jsonEscape(const std::string &s) {
@@ -72,6 +73,7 @@ void S3ConfigManager::reloadFromIni() {
     opt.root_prefix = (std::string) ini[kRootPrefix];
     opt.record_mp4 = (int) ini[kRecordMp4] != 0;
     opt.record_hls = (int) ini[kRecordHls] != 0;
+    opt.record_snap = (int) ini[kRecordSnap] != 0;
     opt.timeout_ms = (int) ini[kTimeoutMs] > 0 ? (int) ini[kTimeoutMs] : 15000;
 
     std::lock_guard<std::mutex> lck(_mtx);

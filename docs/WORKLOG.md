@@ -356,3 +356,26 @@ webrtc 标 SKIP：本机构建未注册 `/index/api/webrtc`，需要用启用 we
    要先建 `MP4FileDisk` 局部变量再赋给基类指针。
 2. 不存在对象只在服务端立即 404，播放器仍会等 `maxStreamWaitMS`；测试判据要按这个来，否则会误判「点播慢」。
 3. webrtc 的 API 是否注册取决于构建选项，不能拿「协议清单里有」当已验证。
+
+## 2026-11-05 追加：截图写云存储（需求 6 收口）
+
+`s3.record_snap=1` 时，`getSnap` 生成的 jpeg 除了回给客户端，还会异步写一份到桶：
+`<root_prefix>/snap/<url的md5>/<日期>/<时间戳>.jpg`，之后在 `/s3/` 菜单里可预览/下载。
+
+**改动**
+- `S3Options.record_snap` + 配置键 `s3.record_snap`（默认 0，关掉行为与之前完全一致）
+- `S3Storage::enabledForSnap()` / `uploadFile(key, path, err)`（截图为小文件，整块读进内存再传）
+- `server/WebApi.cpp` 的 getSnap：截图成功、rename 成正式文件后异步上传
+
+**限制（已写进文档）**：截图走的是 ffmpeg 命令行，必然落一次本地临时文件，做不到零磁盘写；
+本地那份同时是 `expire_sec` 缓存。桶里那份用于跨机浏览与长期留存。
+
+**验证**（macOS + mock S3 + 真实 ffmpeg，6/6）
+```
+getSnap 19109 字节 jpeg；桶里 record/snap/<md5>/2026-11-05/1793883109.jpg
+从桶里取回与接口返回字节一致；/s3/ 菜单列出、/s3/<key> 取回同一张图
+s3.record_snap=0 时不再写桶（1 → 1）
+```
+
+顺手修的两个自己的坑：配置写入用 `api.snapRoot`（不是自造 `[snap] root` 段）；
+`toolkit::File` 没有 `file_name`，裸写 basename 会编译失败。
