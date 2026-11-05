@@ -36,6 +36,12 @@ public:
     void openMP4(const std::string &file);
 
     /**
+     * 用一个自定义的文件IO打开mp4（云存储/内存等场景）
+     * Open mp4 with a custom file IO (cloud storage / memory)
+     */
+    void openMP4(const MP4FileIO::Ptr &file);
+
+    /**
      * @brief 关闭 mp4 文件
      * @brief Close mp4 file
      
@@ -99,7 +105,7 @@ private:
     Frame::Ptr makeFrame(uint32_t track_id, toolkit::Buffer::Ptr buf, int64_t pts, int64_t dts);
 
 private:
-    MP4FileDisk::Ptr _mp4_file;
+    MP4FileIO::Ptr _mp4_file;
     MP4FileDisk::Reader _mov_reader;
     uint64_t _duration_ms = 0;
     std::unordered_map<int, Track::Ptr> _tracks;
@@ -117,6 +123,12 @@ public:
      * @param file 多个mp4文件路径，以分号分隔; 或者包含多个mp4文件的文件夹
      */
     void openMP4(const std::string &file);
+
+    /**
+     * 用一个自定义的文件IO打开mp4（云存储/内存等场景）
+     * Open mp4 with a custom file IO (cloud storage / memory)
+     */
+    void openMP4(const MP4FileIO::Ptr &file);
 
     /**
      * @brief 批量关闭 mp4 文件
@@ -152,6 +164,9 @@ public:
     uint64_t getDurationMS() const;
 
 private:
+    /// 把某个demuxer的track克隆进总时间轴（多文件与单对象共用）
+    void registerTracks(const MP4Demuxer::Ptr &demuxer);
+
     std::map<int, Track::Ptr> _tracks;
     std::map<uint64_t, MP4Demuxer::Ptr>::iterator _it;
     std::map<uint64_t, MP4Demuxer::Ptr> _demuxers;

@@ -17,6 +17,7 @@
 #include "Common/Parser.h"
 #include "Common/MultiMediaSourceMuxer.h"
 #include "Record/MP4Reader.h"
+#include "S3/S3Vod.h"
 #include "PacketCache.h"
 
 using namespace std;
@@ -381,6 +382,10 @@ static MediaSource::Ptr find_l(const string &schema, const string &vhost_in, con
         // 播放hls不触发mp4点播(因为HLS也可以用于录像，不是纯粹的直播)  [AUTO-TRANSLATED:30b18b6d]
         // Playing hls does not trigger mp4 on-demand (because HLS can also be used for recording, not purely live)
         ret = MediaSource::createFromMP4(schema, vhost, app, id);
+        if (!ret) {
+            // 本地没有这个mp4，再试云点播（只认 app=s3vod，其余 app 一律返回空）
+            ret = S3Vod::createFromS3(schema, vhost, app, id);
+        }
     }
     return ret;
 }

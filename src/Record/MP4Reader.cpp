@@ -38,6 +38,40 @@ MP4Reader::MP4Reader(const MediaTuple &tuple, const string &file_path, const Pro
     setup(tuple, file_path, option, std::move(poller));
 }
 
+MP4Reader::MP4Reader(const MediaTuple &tuple, const MP4FileIO::Ptr &file,
+                     toolkit::EventPoller::Ptr poller) {
+    ProtocolOption option;
+    option.enable_mp4 = false;
+    option.enable_hls = false;
+    option.enable_hls_fmp4 = false;
+    option.max_track = 16;
+    setup(tuple, file, option, std::move(poller));
+}
+
+void MP4Reader::setup(const MediaTuple &tuple, const MP4FileIO::Ptr &file,
+                      const ProtocolOption &option, toolkit::EventPoller::Ptr poller) {
+    _poller = poller ? std::move(poller) : WorkThreadPool::Instance().getPoller();
+    _file = file;
+    _demuxer = std::make_shared<MultiMP4Demuxer>();
+    _demuxer->openMP4(file);
+
+    if (tuple.stream.empty()) {
+        return;
+    }
+    _muxer = std::make_shared<MultiMediaSourceMuxer>(tuple, _demuxer->getDurationMS() / 1000.0f, option);
+    auto tracks = _demuxer->getTracks(false);
+    if (tracks.empty()) {
+        throw std::runtime_error(StrPrinter << "该mp4对象没有有效的track:" << tuple.shortUrl());
+    }
+    for (auto &track : tracks) {
+        _muxer->addTrack(track);
+        if (track->getTrackType() == TrackVideo) {
+            _have_video = true;
+        }
+    }
+    _muxer->addTrackCompleted();
+}
+
 void MP4Reader::setup(const MediaTuple &tuple, const std::string &file_path, const ProtocolOption &option, toolkit::EventPoller::Ptr poller) {
     // 读写文件建议放在后台线程  [AUTO-TRANSLATED:6f09ef53]
     // It is recommended to read and write files in the background thread

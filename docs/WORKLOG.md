@@ -320,3 +320,39 @@ bash /root/multi_wall.sh 16 12 /tmp/src1080.mp4
 `tools/s3/box_s3_{record,hls,http}_verify.py` 三个真机验收脚本（判据全部比对真实字节）。
 
 **待做**：云点播（对象 → MP4FileMemory → MP4Demuxer → 媒体源）、快照写云、容量/长跑。
+
+## 2026-11-05 追加：云点播（s3vod）—— 桶里的 mp4 直接出 rtsp/rtmp/flv
+
+需求 5 的后半段。目标：**对象不下载到本地**，直接点播成媒体流。
+
+**寻址**：`rtsp://host/s3vod/<对象名>`（app 固定 `s3vod`，其余整段是对象名；ZLM 的 stream 允许带 `/`）。
+不复用 `record` app：那是本地 mp4 点播的名字，混用会让「读本地还是读云」变成隐式行为。
+
+**改动**
+- `MP4FileS3`（新）：只读的 MP4FileIO，Range 读 + 512KB 预读缓存 + seek。
+  预读是性能关键：mov 解析全是几十字节的小读，一次一请求会把 S3 打穿。
+- `MP4Demuxer`/`MultiMP4Demuxer`：新增 `openMP4(MP4FileIO::Ptr)`；`_mp4_file` 基类化；
+  抽出 `registerTracks()` 共用（多文件与单对象同一套）。
+- `MP4Reader`：新增「自定义文件 IO」构造 + setup 重载，复用原有定时/暂停/倍速/seek 逻辑。
+- `S3Vod::createFromS3()`：挂在 `MediaSource::find_l()` 本地 mp4 点播失败之后，只认 app=s3vod。
+- 菜单页加了一行「云点播地址」提示（直接从 `/s3/` 页面就能抄到 rtsp 地址）。
+
+**验证**（macOS 本机构建 + 仓库自带 mock S3，真实 MediaServer，8/8 + 1 skip）
+```
+rtsp 出 h264+aac 用时 1.5s，时长 12.0s（与源文件一致）
+rtmp 出 h264+aac 用时 1.0s
+http-flv -t 3 截到 295KB 且含 h264
+-seek 5s 取帧 18920 字节（Range 读 + seek）
+不存在对象 → rc=1（含 maxStreamWaitMS 15s 等待，与不存在的直播流一致）
+本地全程没有该 mp4 文件
+```
+webrtc 标 SKIP：本机构建未注册 `/index/api/webrtc`，需要用启用 webrtc 的构建或浏览器验。
+
+**待办**：真机（192.168.210.89）复验 —— 今天的验收脚本已备好 `tools/s3/box_s3_vod_verify.py`，
+但盒子当时不可达（本机已不在 192.168.210 网段，ping/ssh 全超时）。
+
+**踩坑**
+1. `MP4FileIO::Ptr` 基类化后，`openMP4(path)` 里不能再直接调 `openFile()`（那是 MP4FileDisk 的方法），
+   要先建 `MP4FileDisk` 局部变量再赋给基类指针。
+2. 不存在对象只在服务端立即 404，播放器仍会等 `maxStreamWaitMS`；测试判据要按这个来，否则会误判「点播慢」。
+3. webrtc 的 API 是否注册取决于构建选项，不能拿「协议清单里有」当已验证。

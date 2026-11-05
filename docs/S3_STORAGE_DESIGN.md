@@ -8,10 +8,10 @@
 | # | 需求 | 设计要点 | 状态 |
 |---|---|---|---|
 | 1 | s3/minio 内存流直写，解决录像 IO 瓶颈 | 录制侧内存缓冲 + 分片上传（每片 8MB），不做临时文件 | **MP4/HLS 均已完成并真机 E2E（真实 SeaweedFS）** |
-| 2 | 通过 ZLM 的 HTTP 服务下载/点播云存储文件 | ZLM HTTP 路由代理对象字节（支持 Range/断点续传），不暴露密钥 | **已完成并真机验证（含 Range/大对象流式）** |
+| 2 | 通过 ZLM 的 HTTP 服务下载/点播云存储文件 | ZLM HTTP 路由代理对象字节（支持 Range/断点续传），不暴露密钥 | **已完成并真机验证（含 Range/大对象流式 + `/s3/` 直出）** |
 | 3 | 遍历云存储生成 HTTP 菜单页 | `ListObjectsV2` + 静态 HTML 模板（按前缀分组、可点播/下载） | **已完成并真机验证（逐级下钻）** |
 | 4 | 读写全内存流、不经磁盘 | 分片上传直接从内存发；读取用 Range 拉到内存，不写临时文件 | **已验证：录制全过程本地零文件** |
-| 5 | mp4/hls 录制到云；从云点播 mp4 为 rtsp/rtmp/flv/webrtc | 录制：MP4/HLS 写 S3；点播：对象 → MP4FileMemory → MP4Demuxer → MediaSource | **录制两态已完成**；云点播待开发 |
+| 5 | mp4/hls 录制到云；从云点播 mp4 为 rtsp/rtmp/flv/webrtc | 录制：MP4/HLS 写 S3；点播：对象 → `MP4FileS3`（Range+seek）→ `MP4Demuxer` → MediaSource | **已完成**：录制真机验证；云点播 rtsp/rtmp/http-flv 实测可播，webrtc 待浏览器验 |
 | 6 | 绝大部分文件都支持云存储读写 | 以「存储后端」抽象收口，MP4/HLS/快照都走同一后端 | 录制侧已收口；快照待做 |
 
 ## 2. 分层
@@ -111,12 +111,18 @@ startRecord: code=0
 4. ~~HTTP 出口 `/s3/<key>`~~（Range 断点续传 + 大对象分块流式，不暴露密钥）
 5. ~~HTTP 菜单页 `/s3/<prefix>/`~~（列对象、逐级下钻、播放/下载链接）
 
+5. ~~云点播 `/s3vod/<对象名>`~~（rtsp/rtmp/http-flv 实测可播，见第 9 节）
+
 待做（按依赖顺序）：
 
-6. **云点播**：对象 → `MP4FileMemory` → `MP4Demuxer` → 媒体源，让云上的 mp4 能像点播文件一样
-   出 rtsp/rtmp/flv/webrtc（现在只能下载或浏览器直接播）。
-7. **快照（snap）写云**：`onPublish`/`onSnap` 的 jpg 也走 `S3Storage`，把需求 6 的「绝大部分文件」补齐。
-8. **容量/长跑**：多路并发录制 + 上传失败重试 + 桶满/网络抖动下的行为，与本地录制的 CPU/IO 对照。
+6. **快照（snap）写云**：`getSnap` 的 jpg 仍写 `snapRoot` 本地目录，未接入 `S3Storage`；
+   补上后需求 6「绝大部分文件」才算齐。
+7. **HLS 滚动窗口与桶的生命周期**：云端模式下 `onDelSegment` 只删本地路径、不删对象，
+   桶会持续增长 —— 需要「按 segNum 同步删」还是「靠生命周期规则」要定策略。
+8. **容量/长跑**：多路并发录制 + 上传失败重试 + 桶满/网络抖动下的行为，与本地录制的 CPU/IO 对照
+   （需求 1 的「解决 IO 瓶颈」目前只证明了「不落盘」，还没有量化收益）。
+9. **真机复验云点播**：盒子（192.168.210.89）重新可达后跑 `tools/s3/box_s3_vod_verify.py`，
+   并把 webrtc 在浏览器里验一遍。
 
 ### HLS 直写云存储的做法
 
@@ -231,3 +237,72 @@ startRecord(HLS): code=0
   一次最多列 1000 个（`--max` 可调），到上限时页面会提示进子目录。
 - **鉴权口径**：`/s3/` 与静态文件目录一致 —— ZLM 的 HTTP 端口对谁开放，`/s3/` 就对谁开放。
   需要收紧时用反代或 `http.secret`，不在这一层自造协议。
+
+## 9. 云点播（s3vod，已完成）
+
+把桶里的 mp4 变成媒体源，于是 rtsp / rtmp / http-flv / ws-flv 都能放，**对象不下载到本地**。
+
+### 寻址
+
+```
+rtsp://host/s3vod/<对象名>
+rtsp://host/s3vod/record/live/cam01/2026-11-05/2026-11-05-10-00-00-0.mp4
+rtmp://host/s3vod/<对象名>
+http://host/s3vod/<对象名>.live.flv
+```
+
+解析规则：**app 固定 `s3vod`，其余整段都是对象名**。ZLM 的 `MediaInfo` 只把第一段当 app、
+后面全部归 `stream`（`stream` 天然允许带 `/`），所以对象名里的斜杠不用转义。
+
+不复用 `record` 应用名：`record` 已经是「本地 mp4 点播」的应用名，混用会让「同一路径读本地还是读云」
+变成隐式行为，现场排障时最难查的就是这种。
+
+### 实现
+
+```
+MediaSource::find_l()  ── 本地找不到媒体源
+        │
+        ├─ createFromMP4(本地文件)  ── 有本地文件就走老路（行为不变）
+        └─ S3Vod::createFromS3()    ── app==s3vod 时才尝试
+                 ├─ HEAD 对象拿大小（不存在就返回空 → 播放器照常报流不存在）
+                 ├─ MP4FileS3：Range 读 + 500ms 级缓存块，seek 支持
+                 └─ MP4Reader(tuple, MP4FileIO::Ptr) → MultiMediaSourceMuxer 注册媒体源
+```
+
+- `MP4FileS3` 只实现 read/seek/tell，写入直接失败（云点播是只读路径）。
+- **按块预读是性能关键**：mov 解析会大量小读（几十字节读索引），一次一请求会把对象存储打穿、
+  点播首帧延迟到秒级。默认 512KB 块，顺序播放几乎全命中，随机拖动最多多读半兆。
+- 复用 `MP4Reader` 的定时器/暂停/倍速/seek 逻辑（它本来就在，只是入口只认磁盘路径）；
+  为它加了一个「自定义文件 IO」的构造与 `setup` 重载 —— 录制侧早就有 `MP4FileMemory`，
+  这次只是把同一条抽象用在读侧。
+- 所有观看者都走人后由 `MediaSourceEvent` 回收，与本地 mp4 点播一致。
+
+### 验证（macOS 本机构建 + 仓库自带 mock S3，真实 MediaServer）
+
+```
+对象: record/live/vodlocal/2026-11-05/vod.mp4（12s 640x360 h264+aac，1.1MB）
+  OK   rtsp 点播出 h264        [('h264', 640), ('aac', None)]  用时 1.5s
+  OK   rtsp 时长≈12s          12.0s
+  OK   rtmp 点播出 h264       [('h264', 640), ('aac', None)]  用时 1.0s
+  OK   http-flv 拿到数据      295030 字节（-t 3 截取）
+  OK   http-flv 含 h264
+  OK   seek 到 5s 取帧成功     18920 字节（走 Range 读 + seek）
+  SKIP webrtc 播放协商        该构建未注册 /index/api/webrtc
+  OK   不存在的对象点播失败    rc=1（含 maxStreamWaitMS 15s 等待）
+  OK   本地没有该 mp4 文件
+结果: 8/8 通过（跳过 1）
+```
+
+脚本：`tools/s3/local_s3_vod_verify.py`（本机自足，不需要真机/真 S3）、
+`tools/s3/box_s3_vod_verify.py`（真机版，盒子可达时跑；额外验「播放中本地无文件」）。
+
+### 云点播的坑
+
+- **`Parser`/`stream` 里的斜杠是合法的**：别按「路径段数」去拆对象名，`app` 只取第一段，
+  剩下拼回 `stream` 就是对象名，这是最省事的映射。
+- **不存在的对象不要打错误日志**：客户端拼错/文件过期都会走到这里，用 Info 级别，
+  否则线上日志会被「播放失败」刷屏。
+- **播放器会等 `general.maxStreamWaitMS`（默认 15s）才放弃**：这是 ZLM 对「流不存在」的通用行为，
+  不是云点播慢；对象 404 是立即查到的（日志时间戳能对上）。
+- **webrtc 依赖构建选项与 rtc 配置**：本机这份构建没注册 `/index/api/webrtc`，
+  所以只能标 SKIP —— 不要用「协议列表里有 webrtc」当成已验证。

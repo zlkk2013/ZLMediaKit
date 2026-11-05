@@ -28,8 +28,17 @@ MP4Demuxer::~MP4Demuxer() {
 void MP4Demuxer::openMP4(const string &file) {
     closeMP4();
 
-    _mp4_file = std::make_shared<MP4FileDisk>();
-    _mp4_file->openFile(file.data(), "rb+");
+    auto disk = std::make_shared<MP4FileDisk>();
+    disk->openFile(file.data(), "rb+");
+    _mp4_file = disk;
+    _mov_reader = _mp4_file->createReader();
+    getAllTracks();
+    _duration_ms = mov_reader_getduration(_mov_reader.get());
+}
+
+void MP4Demuxer::openMP4(const MP4FileIO::Ptr &file) {
+    closeMP4();
+    _mp4_file = file;
     _mov_reader = _mp4_file->createReader();
     getAllTracks();
     _duration_ms = mov_reader_getduration(_mov_reader.get());
@@ -217,7 +226,24 @@ void MultiMP4Demuxer::openMP4(const string &files_string) {
     }
     CHECK(!_demuxers.empty());
     _it = _demuxers.begin();
-    for (auto &track : _it->second->getTracks(false)) {
+    registerTracks(_it->second);
+}
+
+void MultiMP4Demuxer::openMP4(const MP4FileIO::Ptr &file) {
+    _demuxers.clear();
+    _tracks.clear();
+    auto demuxer = std::make_shared<MP4Demuxer>();
+    demuxer->openMP4(file);
+    if (demuxer->getTracks(false).empty()) {
+        throw std::runtime_error("mp4对象里没有有效的track");
+    }
+    _demuxers.emplace(0, demuxer);
+    _it = _demuxers.begin();
+    registerTracks(_it->second);
+}
+
+void MultiMP4Demuxer::registerTracks(const MP4Demuxer::Ptr &demuxer) {
+    for (auto &track : demuxer->getTracks(false)) {
         auto clone_track(track->clone());
         clone_track->setIndex(clone_track->getTrackType());
         _tracks.emplace(clone_track->getIndex(), clone_track);

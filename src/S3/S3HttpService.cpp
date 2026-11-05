@@ -10,6 +10,7 @@
 #include "S3/S3HttpService.h"
 #include "S3/S3Client.h"
 #include "S3/S3Config.h"
+#include "S3/S3Vod.h"
 
 #include "Thread/WorkThreadPool.h"
 #include "Util/util.h"
@@ -287,7 +288,7 @@ void sendObject(S3Client::Ptr cli, Parser &parser, const string &key, const S3Ht
 }
 
 /// 菜单页：按前缀列对象，文件可点播/下载，子目录可下钻
-string buildMenu(S3Client::Ptr cli, const string &prefix, string &err) {
+string buildMenu(S3Client::Ptr cli, const string &prefix, const string &host, string &err) {
     vector<S3Object> objs;
     const int kMaxKeys = 1000;
     if (!cli->listObjects(prefix, objs, kMaxKeys, err)) {
@@ -336,14 +337,18 @@ string buildMenu(S3Client::Ptr cli, const string &prefix, string &err) {
          << "td.n{text-align:right;color:#666;font-variant-numeric:tabular-nums;white-space:nowrap}"
          << "a{color:#1668dc;text-decoration:none}a:hover{text-decoration:underline}"
          << ".dir{font-weight:600}.tag{color:#999;font-size:12px;margin-left:6px}"
-         << ".empty{color:#999;padding:24px 0}</style></head><body>";
+         << ".empty{color:#999;padding:24px 0}"
+         << ".tip{color:#666;font-size:12px;margin:-8px 0 14px}"
+         << "code{background:#f5f5f5;padding:1px 5px;border-radius:3px;font-size:12px}</style></head><body>";
 
     html << "<h1>云存储菜单</h1><div class=\"sub\">前缀：/<b>" << htmlEscape(prefix)
          << "</b> · 对象 " << objs.size() << " 个";
     if ((int) objs.size() >= kMaxKeys) {
         html << "（已达上限 " << kMaxKeys << "，请进子目录查看）";
     }
-    html << "</div><table><tr><th>名称</th><th class=\"n\">大小</th><th class=\"n\">时间</th><th>操作</th></tr>";
+    html << "</div><div class=\"tip\">云点播：<code>rtsp://" << htmlEscape(host)
+         << "/" << S3Vod::APP_NAME << "/&lt;对象名&gt;</code>（rtmp / http-flv 把协议和前缀换掉即可）</div>"
+         << "<table><tr><th>名称</th><th class=\"n\">大小</th><th class=\"n\">时间</th><th>操作</th></tr>";
 
     if (!prefix.empty()) {
         auto parent = prefix;
@@ -407,7 +412,7 @@ void S3HttpService::onRequest(Parser &parser, const S3HttpService::Invoker &cb) 
     // 目录 / 根：给菜单页
     if (key.empty() || key.back() == '/') {
         string err;
-        auto html = buildMenu(cli, key, err);
+        auto html = buildMenu(cli, key, parser["Host"], err);
         if (html.empty()) {
             sendError(502, "列对象失败: " + err, cb);
             return;

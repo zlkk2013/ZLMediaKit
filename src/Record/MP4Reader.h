@@ -40,6 +40,12 @@ public:
     MP4Reader(const MediaTuple &tuple, const std::string &file_path, const ProtocolOption &option, toolkit::EventPoller::Ptr poller = nullptr);
 
     /**
+     * 从自定义文件IO点播（云存储对象等）：不落磁盘、按需 Range 读
+     * Play from a custom file IO (e.g. object storage): no local file, read by Range
+     */
+    MP4Reader(const MediaTuple &tuple, const MP4FileIO::Ptr &file, toolkit::EventPoller::Ptr poller = nullptr);
+
+    /**
      * 开始解复用MP4文件
      * @param sample_ms 每次读取文件数据量，单位毫秒，置0时采用配置文件配置
      * @param ref_self 是否让定时器引用此对象本身，如果无其他对象引用本身，在不循环读文件时，读取文件结束后本对象将自动销毁
@@ -88,6 +94,7 @@ private:
     bool seekTo(uint32_t stamp_seek);
 
     void setup(const MediaTuple &tuple, const std::string &file_path, const ProtocolOption &option, toolkit::EventPoller::Ptr poller);
+    void setup(const MediaTuple &tuple, const MP4FileIO::Ptr &file, const ProtocolOption &option, toolkit::EventPoller::Ptr poller);
 
 private:
     bool _file_repeat = false;
@@ -100,6 +107,7 @@ private:
     std::recursive_mutex _mtx;
     toolkit::Ticker _seek_ticker;
     toolkit::Timer::Ptr _timer;
+    MP4FileIO::Ptr _file;
     MultiMP4Demuxer::Ptr _demuxer;
     MultiMediaSourceMuxer::Ptr _muxer;
     toolkit::EventPoller::Ptr _poller;
