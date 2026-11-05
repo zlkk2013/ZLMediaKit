@@ -174,3 +174,42 @@ grep -iE 'warmup produced no packet|未找到解码器|filter init failed' <日�
 | 多卡真分配 | 代码已实现，**只在 macOS 验过参数面/诚实性**；真 0/1/0 分配需 NVIDIA 机器复验 |
 | VAAPI 硬件编解码 | **未接入**（需 `hw_frames_ctx` 与 render node 路径） |
 | Windows 平台 | 代码有对应分支（NVENC/cuda），**未实测** |
+| 云存储—录制直写（mp4/hls） | 昇腾 arm64 + 真实 SeaweedFS **已真机验证**（含回读 ffprobe、本地零文件） |
+| 云存储—HTTP 出口 `/s3/` | 昇腾真机 **18/18 通过**（Range/断点/6MB 流式/m3u8+切片/404） |
+| 云存储—云点播 `s3vod` | rtsp/rtmp/http-flv/seek **本机（macOS+真实 MediaServer+mock S3）验证 8/8**；**昇腾真机待复验** |
+| 云存储—webrtc 点播 | **未验证**：需启用 webrtc 的构建 + 浏览器做真实 ICE/DTLS |
+| 云存储—截图写桶 | 本机验证 6/6；**昇腾真机待复验** |
+| 云存储—HLS 滚动窗口删对象 | **未做**：云端模式只删本地文件，桶靠生命周期规则治理 |
+
+## 8. 云存储（S3/MinIO）接入与排障
+
+配置（`conf/config.ini` 的 `[s3]` 段，键名在 ini 里写作 `s3.xxx`）：`enable` / `endpoint` / `bucket` /
+`access_key` / `secret_key` / `path_style`（MinIO 填 1）/ `root_prefix`，
+以及三个「写云」开关：`record_mp4`、`record_hls`、`record_snap`。全部默认 0，关掉时行为与之前完全一致。
+
+接线后先做三步自检（**不要看日志说「没报错」，要看外部可见的副作用**）：
+
+```bash
+# 1) 录一段 10s，看桶里是否多了对象（不是看本地目录）
+curl 'http://127.0.0.1:57980/index/api/startRecord?secret=***&type=1&vhost=__defaultVhost__&app=live&stream=cam01'
+# 2) 浏览器打开菜单页，确认对象在
+curl -s 'http://127.0.0.1:57980/s3/' | head
+# 3) 直接下载一个对象，和桶里对象比对字节（sha256）
+curl -s 'http://127.0.0.1:57980/s3/record/live/cam01/2026-11-05/xxx.mp4' | shasum -a 256
+```
+
+- **下载/点播**：`/s3/<对象名>`（支持 Range 断点续传与拖动；>2MB 走 1MB 分块流式，不占内存）。
+  HLS 直接把 `/s3/<目录>/hls.m3u8` 给播放器即可（切片相对路径自动落到同一个出口）。
+- **协议点播**：`rtsp://host/s3vod/<对象名>`、`rtmp://host/s3vod/<对象名>`、
+  `http://host/s3vod/<对象名>.live.flv` —— 对象不下载到本地，按块 Range 读。
+- **菜单页**：`/s3/` 逐级浏览，含大小/时间/播放/下载链接。
+
+排障要点：
+
+| 现象 | 先查什么 |
+|---|---|
+| 桶里没有对象、日志也没报错 | `s3.enable` 与对应 `record_xxx` 是否都为 1；键要写在 `[s3]` 段里（写成 `s3.enable` 顶层键读不到） |
+| 对象有但下载 404 | 对象名（含 `root_prefix`）是否与 URL 里一致；`/s3/` 菜单里能点开就说明键对 |
+| 点播出不来流 | 对象名必须以 `.mp4` 结尾；app 必须是 `s3vod`；对象不存在时播放器会等 `general.maxStreamWaitMS`（默认 15s）才报错 |
+| HLS 桶一直在涨 | 云端模式下滚动窗口只删本地文件、不删对象（有意保留供回看），需要配桶的生命周期规则 |
+| 截图没进桶 | `s3.record_snap=1`；截图是 ffmpeg 产出，本地仍会有一个临时/缓存文件，这是正常的 |
