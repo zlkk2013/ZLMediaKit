@@ -128,3 +128,16 @@ m3u8 片段数: 4
 5. 菜单页：按前缀列对象生成 HTML（尺寸/时间/时长、点播/下载链接）。
 6. 云点播：对象 → `MP4FileMemory` → `MP4Demuxer` → 媒体源（rtsp/rtmp/flv/webrtc）。
 7. 真机（昇腾 arm64 + 真实 MinIO/S3）复验 + 容量/长跑。
+
+## 7. HTTP 出口的接续笔记（下次从这里开始）
+
+尝试过在 `HttpFileManager::onAccessPath()` 顶部挂 `/s3/` 路由，本轮未完成，已回退（仓库保持可编译）。
+踩到的对接细节（省得下次重新摸）：
+
+- `HttpFileManager::invoker` 的实际签名是
+  `void(int code, const std::string &content_type, const StrCaseMap &responseHeader, const HttpBody::Ptr &body)`，
+  不是 `(code, headers, body)` —— 顺序与参数个数都要对上，用 `HttpStringBody` 承载内存响应。
+- `Parser` **没有 `path()`**：要自己从 `parser.url()`/`fullUrl()` 里截掉 `?query` 再判断前缀。
+- `HttpFileManager.cpp` 不 include 自己的头文件，S3 的 include 要加在该文件顶部（已确认位置）。
+- 大对象不要塞进 poller 线程：>8MB 且无 Range 时直接 302 到 `presignGet()`。
+- 菜单页用 `listObjects(prefix)` + 简单 HTML 表格即可（按对象名分组、给出 `/s3/<key>` 链接）。
