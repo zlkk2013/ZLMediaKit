@@ -134,6 +134,12 @@ public:
     void openMP4(const std::string &file);
 
     /**
+     * 注入自定义读写实现（云存储录制：内存缓冲 + seek，关闭时整块上传，不落磁盘）
+     * Inject a custom file backend, e.g. an in-memory buffer uploaded on close.
+     */
+    void openMP4(MP4FileIO::Ptr file);
+
+    /**
      * 手动关闭文件(对象析构时会自动关闭)
      * Manually close the file (it will be closed automatically when the object is destructed)
      
@@ -146,7 +152,9 @@ protected:
 
 private:
     std::string _file_name;
-    MP4FileDisk::Ptr _mp4_file;
+    /// 注入的后端（为空时按 _file_name 走磁盘）
+    MP4FileIO::Ptr _file_io;
+    MP4FileIO::Ptr _mp4_file;
 };
 
 class MP4MuxerMemory : public MP4MuxerInterface{

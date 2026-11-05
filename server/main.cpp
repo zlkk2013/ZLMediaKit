@@ -19,6 +19,7 @@
 #include "Network/UdpServer.h"
 #include "Poller/EventPoller.h"
 #include "Common/config.h"
+#include "S3/S3Config.h"
 #include "Rtsp/RtspSession.h"
 #include "Rtmp/RtmpSession.h"
 #include "Shell/ShellSession.h"
@@ -296,6 +297,8 @@ int start_main(int argc,char *argv[]) {
         // 加载配置文件，如果配置文件不存在就创建一个  [AUTO-TRANSLATED:761e7479]
         // Load configuration file, create one if it doesn't exist
         loadIniConfig(g_ini_file.data());
+        // 云存储配置从 ini 快照一次（之后可用 API 运行时覆盖，换桶/换密钥无需重启）
+        mediakit::S3ConfigManager::instance().reloadFromIni();
 
         auto &secret = mINI::Instance()[API::kSecret];
         if (secret == "035c73f7-bb6b-4889-a715-d9eb2d1925cc" || secret.empty()) {
@@ -504,6 +507,7 @@ int start_main(int argc,char *argv[]) {
 #if !defined(_WIN32)
         signal(SIGHUP, [](int) {
             mediakit::loadIniConfig(g_ini_file.data());
+            mediakit::S3ConfigManager::instance().reloadFromIni();
             g_reload_certificates();
         });
 #endif

@@ -40,8 +40,16 @@ MP4Muxer::~MP4Muxer() {
 void MP4Muxer::openMP4(const string &file) {
     closeMP4();
     _file_name = file;
-    _mp4_file = std::make_shared<MP4FileDisk>();
-    _mp4_file->openFile(_file_name.data(), "wb+");
+    _file_io = nullptr;
+    auto disk = std::make_shared<MP4FileDisk>();
+    disk->openFile(_file_name.data(), "wb+");
+    _mp4_file = disk;
+}
+
+void MP4Muxer::openMP4(MP4FileIO::Ptr file) {
+    closeMP4();
+    _file_io = std::move(file);
+    _mp4_file = _file_io;
 }
 
 MP4FileIO::Writer MP4Muxer::createWriter() {
@@ -57,7 +65,11 @@ void MP4Muxer::closeMP4() {
 
 void MP4Muxer::resetTracks() {
     MP4MuxerInterface::resetTracks();
-    openMP4(_file_name);
+    if (_file_io) {
+        openMP4(_file_io);   // 云存储后端要沿用同一个内存缓冲
+    } else {
+        openMP4(_file_name);
+    }
 }
 
 /////////////////////////////////////////// MP4MuxerInterface /////////////////////////////////////////////

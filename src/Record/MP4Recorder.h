@@ -76,6 +76,9 @@ private:
     RecordInfo _info;
     MP4Muxer::Ptr _muxer;
     std::list<Track::Ptr> _tracks;
+    /// 云存储录制：这段录在内存里，关闭时整块上传（不落磁盘）
+    MP4FileMemory::Ptr _s3_file;
+    std::string _s3_key;
 };
 
 #endif ///ENABLE_MP4

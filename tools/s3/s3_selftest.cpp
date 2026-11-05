@@ -44,6 +44,39 @@ int main(int argc, char **argv) {
         else if (k == "--token") cfg.session_token = v;
     }
 
+    // 下载模式：--get <key> --out <file>（录制回读验证用）
+    std::string get_key, out_file;
+    for (int i = 1; i + 1 < argc; i += 2) {
+        std::string k = argv[i], v = argv[i + 1];
+        if (k == "--get") get_key = v;
+        if (k == "--out") out_file = v;
+        if (k == "--list") get_key = "";
+    }
+    if (!get_key.empty()) {
+        S3Client cli(cfg);
+        std::string e;
+        // 必须先 valid()：它才会把 endpoint 解析进内部结构，否则会连到空的 host
+        if (!cli.valid(e)) {
+            fprintf(stderr, "配置无效: %s\n", e.c_str());
+            return 2;
+        }
+        std::string data;
+        if (!cli.getObject(get_key, data, e)) {
+            fprintf(stderr, "下载失败: %s\n", e.c_str());
+            return 1;
+        }
+        FILE *fp = out_file.empty() ? stdout : fopen(out_file.c_str(), "wb");
+        if (!fp) {
+            fprintf(stderr, "写文件失败\n");
+            return 1;
+        }
+        fwrite(data.data(), 1, data.size(), fp);
+        if (fp != stdout) fclose(fp);
+        fprintf(stderr, "已下载 %s → %s（%zu 字节）\n", get_key.c_str(),
+                out_file.empty() ? "stdout" : out_file.c_str(), data.size());
+        return 0;
+    }
+
     printf("S3 自测: endpoint=%s bucket=%s\n", cfg.endpoint.c_str(), cfg.bucket.c_str());
     S3Client client(cfg);
     std::string err;

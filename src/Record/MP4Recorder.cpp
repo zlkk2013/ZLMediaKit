@@ -11,7 +11,11 @@
 #ifdef ENABLE_MP4
 #include <ctime>
 #include <sys/stat.h>
+#include <chrono>
+
 #include "Util/File.h"
+#include "S3/S3Config.h"
+#include "S3/S3Storage.h"
 #include "Common/config.h"
 #include "MP4Recorder.h"
 #include "Thread/WorkThreadPool.h"
@@ -57,14 +61,24 @@ void MP4Recorder::createFile() {
 
     try {
         _muxer = std::make_shared<MP4Muxer>();
-        TraceL << "Open tmp mp4 file: " << full_path_tmp;
-        _muxer->openMP4(full_path_tmp);
+        if (S3Storage::enabledForMp4()) {
+            // 云存储：整段录在内存里（MP4 需要 seek 回填 moov/mdat 大小），
+            // 关闭时一次上传——全程不产生任何磁盘文件。
+            _s3_key = S3Storage::makeKey(_info.app, _info.stream, date, file_name);
+            _s3_file = std::make_shared<MP4FileMemory>();
+            _muxer->openMP4(_s3_file);
+            _full_path_tmp.clear();
+            InfoL << "录制写云存储: " << _s3_key;
+        } else {
+            TraceL << "Open tmp mp4 file: " << full_path_tmp;
+            _muxer->openMP4(full_path_tmp);
+            _full_path_tmp = full_path_tmp;
+        }
         for (auto &track :_tracks) {
             // 添加track  [AUTO-TRANSLATED:80ae762a]
             // Add track
             _muxer->addTrack(track);
         }
-        _full_path_tmp = full_path_tmp;
     } catch (std::exception &ex) {
         WarnL << ex.what();
     }
@@ -74,9 +88,39 @@ void MP4Recorder::asyncClose() {
     auto muxer = _muxer;
     auto full_path_tmp = _full_path_tmp;
     auto info = _info;
+    auto s3_file = _s3_file;
+    auto s3_key = _s3_key;
+    _s3_file = nullptr;
+    _s3_key.clear();
     TraceL << "Start close tmp mp4 file: " << full_path_tmp;
-    WorkThreadPool::Instance().getExecutor()->async([muxer, full_path_tmp, info]() mutable {
+    WorkThreadPool::Instance().getExecutor()->async([muxer, full_path_tmp, info, s3_file,
+                                                     s3_key]() mutable {
         info.time_len = muxer->getDuration() / 1000.0f;
+        if (s3_file) {
+            // 云存储路径：关闭 muxer（把 moov 写完）→ 整块内存上传 → 触发录制事件
+            muxer->closeMP4();
+            std::string data = s3_file->getAndClearMemory();
+            if (data.size() < 1024) {
+                WarnL << "云存储录制片段过小，丢弃: " << s3_key << " size=" << data.size();
+                return;
+            }
+            std::string err;
+            auto t0 = std::chrono::steady_clock::now();
+            if (!S3Storage::instance().upload(s3_key, data, err)) {
+                // 存储故障不能让录制线程崩：只记错误，这一段报失败
+                WarnL << "云存储上传失败: " << s3_key << " err=" << err;
+                return;
+            }
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+            info.file_size = data.size();
+            auto opt = S3ConfigManager::instance().get();
+            info.file_path = "s3://" + opt.bucket + "/" + s3_key;
+            InfoL << "云存储录制完成: " << info.file_path << " size=" << data.size()
+                  << " 用时=" << ms << "ms";
+            NOTICE_EMIT(BroadcastRecordMP4Args, Broadcast::kBroadcastRecordMP4, info);
+            return;
+        }
         // 关闭mp4可能非常耗时，所以要放在后台线程执行  [AUTO-TRANSLATED:a7378a11]
         // Closing mp4 can be very time-consuming, so it should be executed in the background thread
         TraceL << "Closing tmp mp4 file: " << full_path_tmp;
